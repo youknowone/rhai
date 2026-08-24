@@ -174,9 +174,12 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_int_modulo_by_zero"
             | "error_int_power_negative"
             | "error_op_assign_int_power_negative"
+            // Not a guard but the same problem: `1 << 100` is a Rust shift
+            // past the width, which panics in a test build. The two operator
+            // censuses beside it stay in — every operand they use is in range,
+            // so `unchecked` runs them, and the arm they cover there is the
+            // one spelled out by hand rather than delegated.
             | "int_shift_edges"
-            | "int_op_assign_every_form"
-            | "int_operator_every_form"
     ) {
         return false;
     }
