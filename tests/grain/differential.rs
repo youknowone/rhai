@@ -943,7 +943,10 @@ fn one_operator_site_seeing_many_operand_pairs_agrees_with_rhai() {
     // two sides render a closure's pointer differently there (`Fn*+(..)`
     // against `Fn(..)`), which predates all of this and would be the only
     // thing this case reported.
-    #[cfg(not(feature = "no_closure"))]
+    //
+    // `no_object` takes method-call syntax with it, so `f.call()` does not
+    // parse there and the case goes with it.
+    #[cfg(all(not(feature = "no_closure"), not(feature = "no_object")))]
     sources.push(r#"fn probe(a, b) { let f = || a; let g = || b; let out = ""; for i in 0..4 { let x = if i % 2 == 0 { a } else { b }; out += `${x == a},${x == b},` } out + `${f.call()}${g.call()}` } probe(1, "a")"#.into());
 
     // Floats are a seventh arm, and the one the typed instruction runs for
