@@ -490,6 +490,11 @@ fn dropping_a_statements_value_keeps_every_join_balanced() {
 /// cannot tell. These are the shapes where "cannot tell" has to be true:
 /// operands with effects, operands that raise, and a value that is not one of
 /// those pushes and therefore keeps the stash.
+///
+/// `no_index` removes `rhai::Array`, which the evaluation log is, and with it
+/// every index step there is to order — so the whole test is that build's
+/// missing syntax rather than a case it could still make.
+#[cfg(not(feature = "no_index"))]
 #[test]
 fn a_chain_assignment_evaluates_its_value_where_rhai_does() {
     let mut engine = corpus::engine();
@@ -550,4 +555,456 @@ fn a_chain_assignment_evaluates_its_value_where_rhai_does() {
     for source in SOURCES.iter().chain(RAISING) {
         assert_eq!(run_stock(&engine, source), run_vm(&engine, source), "the VM disagreed with Rhai on `{source}`",);
     }
+}
+
+/// Every operator the typed instruction can run sits behind the same gate.
+///
+/// [`a_registered_operator_on_primitives_follows_rhais_own_gate`] pins three
+/// operators. The typed instruction has seventeen kinds and eleven
+/// op-assignment forms, and each is a separate arm of `apply_binary` /
+/// `apply_assign` — an arm that ran when it should have dispatched would be
+/// invisible to a test that only covers `+`, `<` and `+=`.
+///
+/// The float arms are here for the same reason and are the sharper case: the
+/// module runs float *arithmetic* and deliberately leaves float *comparisons*
+/// to dispatch, so a registration on `<` for floats must win at both settings
+/// while one on `+` must lose at the fast one.
+#[test]
+fn every_typed_operator_kind_sits_behind_the_same_gate() {
+    use rhai::INT;
+
+    // Answers no built-in gives, and distinct per operator so that a wrong arm
+    // shows up as a wrong number rather than a coincidence.
+    fn engine_with_operators(fast: bool) -> Engine {
+        let mut engine = corpus::engine();
+        engine.set_fast_operators(fast);
+
+        macro_rules! int_op {
+            ($($name:literal => $tag:literal),* $(,)?) => {
+                $(engine.register_fn($name, |x: INT, y: INT| x * 1000 + y * 10 + $tag);)*
+            };
+        }
+        int_op! {
+            "+" => 1, "-" => 2, "*" => 3, "/" => 4, "%" => 5, "**" => 6,
+            "<<" => 7, ">>" => 8, "&" => 9, "|" => 10, "^" => 11,
+        }
+        // The comparisons answer the opposite of the truth, which no built-in
+        // can be talked into.
+        engine.register_fn("==", |x: INT, y: INT| x != y);
+        engine.register_fn("!=", |x: INT, y: INT| x == y);
+        engine.register_fn("<", |x: INT, y: INT| x > y);
+        engine.register_fn("<=", |x: INT, y: INT| x >= y);
+        engine.register_fn(">", |x: INT, y: INT| x < y);
+        engine.register_fn(">=", |x: INT, y: INT| x <= y);
+
+        macro_rules! int_assign {
+            ($($name:literal => $tag:literal),* $(,)?) => {
+                $(engine.register_fn($name, |x: &mut INT, y: INT| *x = *x * 1000 + y * 10 + $tag);)*
+            };
+        }
+        int_assign! {
+            "+=" => 1, "-=" => 2, "*=" => 3, "/=" => 4, "%=" => 5, "**=" => 6,
+            "<<=" => 7, ">>=" => 8, "&=" => 9, "|=" => 10, "^=" => 11,
+        }
+
+        #[cfg(not(feature = "no_float"))]
+        {
+            use rhai::FLOAT;
+            engine.register_fn("+", |x: FLOAT, y: FLOAT| x * 1000.0 + y);
+            engine.register_fn("*", |x: FLOAT, y: FLOAT| x * 1000.0 + y);
+            engine.register_fn("<", |x: FLOAT, y: FLOAT| x > y);
+            engine.register_fn("==", |x: FLOAT, y: FLOAT| x != y);
+            // The mixed pairs, which reach `impl_float!` through a different
+            // arm of the same table.
+            engine.register_fn("+", |x: FLOAT, y: INT| x * 1000.0 + y as FLOAT);
+            engine.register_fn("+", |x: INT, y: FLOAT| x as FLOAT * 1000.0 + y);
+            engine.register_fn("<", |x: FLOAT, y: INT| x > y as FLOAT);
+            engine.register_fn("+=", |x: &mut FLOAT, y: FLOAT| *x = *x * 1000.0 + y);
+            engine.register_fn("+=", |x: &mut FLOAT, y: INT| *x = *x * 1000.0 + y as FLOAT);
+        }
+
+        engine
+    }
+
+    // One per registration above. Every one of these is a site where the VM
+    // emits the typed instruction.
+    const GATED: &[&str] = &[
+        "let a = 6; let b = 7; a + b",
+        "let a = 6; let b = 7; a - b",
+        "let a = 6; let b = 7; a * b",
+        "let a = 6; let b = 7; a / b",
+        "let a = 6; let b = 7; a % b",
+        "let a = 6; let b = 7; a ** b",
+        "let a = 6; let b = 2; a << b",
+        "let a = 6; let b = 2; a >> b",
+        "let a = 6; let b = 7; a & b",
+        "let a = 6; let b = 7; a | b",
+        "let a = 6; let b = 7; a ^ b",
+        "let a = 6; let b = 7; a == b",
+        "let a = 6; let b = 7; a != b",
+        "let a = 6; let b = 7; a < b",
+        "let a = 6; let b = 7; a <= b",
+        "let a = 6; let b = 7; a > b",
+        "let a = 6; let b = 7; a >= b",
+        "let a = 6; a += 7; a",
+        "let a = 6; a -= 7; a",
+        "let a = 6; a *= 7; a",
+        "let a = 6; a /= 7; a",
+        "let a = 6; a %= 7; a",
+        "let a = 6; a **= 2; a",
+        "let a = 6; a <<= 2; a",
+        "let a = 6; a >>= 2; a",
+        "let a = 6; a &= 7; a",
+        "let a = 6; a |= 7; a",
+        "let a = 6; a ^= 7; a",
+        // The branch consumers, where a wrong answer is a wrong path rather
+        // than a wrong number.
+        "let a = 6; let b = 7; if a < b { \"lt\" } else { \"ge\" }",
+        "let n = 0; let i = 0; while i < 3 { n += 1; i = i + 1 } n",
+        #[cfg(not(feature = "no_float"))]
+        "let f = 1.5; let g = 2.5; f + g",
+        #[cfg(not(feature = "no_float"))]
+        "let f = 1.5; let g = 2.5; f * g",
+        #[cfg(not(feature = "no_float"))]
+        "let f = 1.5; let i = 2; f + i",
+        #[cfg(not(feature = "no_float"))]
+        "let f = 1.5; let i = 2; i + f",
+        #[cfg(not(feature = "no_float"))]
+        "let f = 1.5; f += 2.5; f",
+        #[cfg(not(feature = "no_float"))]
+        "let f = 1.5; f += 2; f",
+    ];
+
+    // A float comparison is dispatched by the VM at *both* settings, because
+    // the checked built-in's relative-epsilon rule is not inlined — so the
+    // registration wins on both sides and the two settings agree. That makes
+    // these a control rather than a gate case: they must still match the
+    // walker, and they are not counted towards the gate being observable.
+    #[cfg(not(feature = "no_float"))]
+    const UNGATED: &[&str] = &[
+        "let f = 1.5; let g = 2.5; f < g",
+        "let f = 1.5; let g = 2.5; f == g",
+        "let f = 1.5; let i = 2; f < i",
+        // Not two primitives at all: dispatch on both settings.
+        "let a = \"x\"; let b = \"y\"; a + b",
+    ];
+    #[cfg(feature = "no_float")]
+    const UNGATED: &[&str] = &["let a = \"x\"; let b = \"y\"; a + b"];
+
+    let fast = engine_with_operators(true);
+    let slow = engine_with_operators(false);
+
+    let mut failures = Vec::new();
+    let mut observable = 0;
+
+    for (source, gated) in GATED.iter().map(|s| (s, true)).chain(UNGATED.iter().map(|s| (s, false))) {
+        let (fast_stock, fast_vm) = (run_stock(&fast, source), run_vm(&fast, source));
+        let (slow_stock, slow_vm) = (run_stock(&slow, source), run_vm(&slow, source));
+
+        if fast_stock != fast_vm {
+            failures.push(format!("\n  fast operators, `{source}`\n    rhai: {fast_stock:?}\n    vm:   {fast_vm:?}"));
+        }
+        if slow_stock != slow_vm {
+            failures.push(format!("\n  dispatched, `{source}`\n    rhai: {slow_stock:?}\n    vm:   {slow_vm:?}"));
+        }
+        if gated && fast_stock != slow_stock {
+            observable += 1;
+        }
+    }
+
+    assert!(failures.is_empty(), "{} operator sites disagreed with Rhai:{}", failures.len(), failures.join(""),);
+
+    // Agreeing above is worth nothing unless the registrations were reachable
+    // at all. Every gated source must answer differently at the two settings.
+    assert_eq!(observable, GATED.len(), "{} of {} gated sources answer the same at both settings, so the gate is not being tested there", GATED.len() - observable, GATED.len(),);
+}
+
+/// An arithmetic guard reports the same error, at the same position, wherever
+/// the operator is written.
+///
+/// The typed instruction returns the built-in's error with no position of its
+/// own, which is what Rhai does under fast operators — but "no position" is
+/// only right because *nothing else* stamps one either, and what stamps one
+/// differs by syntactic slot: a chain tail, an op-assignment and a bare
+/// expression each take a different path out of the dispatch loop.
+///
+/// Excluded under `unchecked`, which removes the guard these are made of and
+/// leaves the operator panicking in a test build instead.
+#[cfg(not(feature = "unchecked"))]
+#[test]
+fn an_arithmetic_guard_reports_the_same_error_and_position_in_every_slot() {
+    let engine = corpus::engine();
+
+    // Written without a literal at the type's limit so that `only_i32` and
+    // `only_i64` reach the same overflow.
+    const OVERFLOW: &str = "let a = 1; let n = 0; while n < 200 { a += a; n += 1 } a";
+
+    let sources: Vec<String> = vec![
+        // Bare expression, top level.
+        "1 / 0".into(),
+        "let z = 0; 7 % z".into(),
+        "2 ** -1".into(),
+        OVERFLOW.into(),
+        // Behind a `let`, which is a different consumer.
+        "let x = 1 / 0; x".into(),
+        // As an op-assignment, which takes the `store` path rather than the
+        // operator one.
+        "let a = 7; let z = 0; a /= z; a".into(),
+        "let a = 7; let z = 0; a %= z; a".into(),
+        "let a = 2; a **= -1; a".into(),
+        // Inside a script function, which is another frame.
+        "fn f(x) { x / 0 } f(1)".into(),
+        "fn f(x) { let y = 0; x %= y; x } f(7)".into(),
+        // Inside each kind of branch, so the position table entry is reached
+        // from a jump rather than from the instruction before it.
+        "if true { 1 / 0 } else { 0 }".into(),
+        "let n = 0; while n < 3 { n += 1; 1 / 0 } n".into(),
+        "let t = 0; for i in 0..3 { t += 1 / 0 } t".into(),
+        "switch 1 { 1 => 1 / 0, _ => 0 }".into(),
+        // Under an index, where the chain decides which of two failures wins.
+        #[cfg(not(feature = "no_index"))]
+        "let a = [1]; a[0] / 0".into(),
+        // `a[0] /= 0` is NOT here: it diverges on position, and has since
+        // before any of this. See
+        // `an_op_assignment_at_a_chain_tail_blames_the_chain_step`.
+        // Type mismatches, which the typed instruction must decline rather
+        // than answer.
+        "let a = 1; let b = (); a + b".into(),
+        "let a = 1; a += ()".into(),
+        #[cfg(not(feature = "no_object"))]
+        "let a = 1; a + #{ b: 1 }".into(),
+        r#"let a = 1; let b = "x"; a - b"#.into(),
+        #[cfg(not(feature = "no_float"))]
+        "let a = 1.0; let b = (); a * b".into(),
+    ];
+
+    // Caught rather than raised: the handler sees the error object, whose
+    // rendering carries the same position — so these still compare it, and are
+    // counted separately because they end in `Ok`.
+    let caught: &[&str] = &["try { 1 / 0 } catch (e) { e }", "let a = 1; try { a += () } catch (e) { e }"];
+
+    let mut failures = Vec::new();
+    let mut errors = 0;
+
+    for source in sources.iter().map(String::as_str).chain(caught.iter().copied()) {
+        let stock = run_stock(&engine, source);
+        if stock.result.is_err() {
+            errors += 1;
+        }
+        let vm = run_vm(&engine, source);
+        if stock != vm {
+            failures.push(format!("\n  `{source}`\n    rhai: {:?}\n    vm:   {:?}", stock.result, vm.result));
+        }
+    }
+
+    assert!(failures.is_empty(), "{} guard sites disagreed with Rhai on the error or its position:{}", failures.len(), failures.join(""),);
+    // The comparison above is on `Debug`, which carries the position — so a
+    // case that stopped raising would still compare equal and prove nothing.
+    assert_eq!(errors, sources.len(), "{} of {} sources stopped raising, so they no longer test a guard", sources.len() - errors, sources.len(),);
+}
+
+/// Dropping a discarded statement's unit keeps every table target honest.
+///
+/// [`dropping_a_statements_value_keeps_every_join_balanced`] covers the joins
+/// `Lowering::patched_max` records. A `switch` records its arm targets in the
+/// switch *pool* instead, which `patch_to` never sees — so a switch whose
+/// trailing instruction is a `Unit` is the shape where the guard could be
+/// looking at the wrong thing. These put one in every position that can end a
+/// discarded statement.
+#[test]
+fn a_switch_whose_tail_is_a_unit_keeps_its_table_targets() {
+    let engine = corpus::engine();
+
+    let sources: Vec<String> = vec![
+        // No default arm, so the lowering emits its own trailing `Unit` for it.
+        "let x = 9; switch x { 1 => 1 }; 42".into(),
+        "let x = 1; switch x { 1 => 1 }; 42".into(),
+        // Guards that decline, so the default is reached through the chain.
+        "let x = 1; switch x { 1 if false => 1 }; 42".into(),
+        "let x = 1; switch x { 1 if x > 100 => 1, 2 if false => 2 }; 42".into(),
+        // A range table as well as a case table.
+        "let x = 5; switch x { 0..3 => 1 }; 42".into(),
+        "let x = 5; switch x { 0..3 if false => 1 }; 42".into(),
+        // The switch is the last statement, so its value is kept rather than
+        // discarded — the other side of the same decision.
+        "let x = 9; switch x { 1 => 1 }".into(),
+        // Nested, so the inner one's tail is followed by the outer's.
+        "let x = 9; switch x { 1 => 1, _ => switch x { 2 => 2 } }; 42".into(),
+        // A discarded statement whose tail is a unit inside a loop body.
+        "let t = 0; for i in 0..3 { switch i { 9 => 1 }; t += 1 } t".into(),
+        // And the two other constructs that end in a value through a join.
+        "let x = 1; if x > 0 { } else { }; 42".into(),
+        "try { } catch (e) { }; 42".into(),
+        "let t = 0; while t < 2 { t += 1 }; 42".into(),
+    ];
+
+    let mut failures = Vec::new();
+    for source in &sources {
+        // The verifier is the instrument that would see a dangling table
+        // target, so run it before the answer is compared.
+        if let Ok(ast) = engine.compile(source) {
+            let program = Compiler::new().compile(&ast);
+            if let Err(err) = program.verify() {
+                failures.push(format!("\n  `{source}` failed verification: {err:?}"));
+                continue;
+            }
+        }
+        let stock = run_stock(&engine, source);
+        let vm = run_vm(&engine, source);
+        if stock != vm {
+            failures.push(format!("\n  `{source}`\n    rhai: {:?}\n    vm:   {:?}", stock.result, vm.result));
+        }
+    }
+
+    assert!(failures.is_empty(), "{} switch tails are wrong:{}", failures.len(), failures.join(""),);
+}
+
+/// An op-assignment at a chain tail is blamed on the chain step, not the
+/// operator — which is not what Rhai does.
+///
+/// A KNOWN DEFECT, and this test exists to make fixing it visible rather than
+/// to bless it. Reproduced at `68336226` (upstream, before any of the work in
+/// this file) and at `69d90efe`, with and without the optimizer, so it is not
+/// something the typed operator instruction or the chain-stash elision
+/// introduced.
+///
+/// The cause is that `Tail::Assign` carries no position of its own: a chain is
+/// one instruction, `Step` was given a position because a step can fail, and
+/// the tail was not. Giving it one is a format change.
+///
+/// When this test fails, the defect is fixed: delete it and put
+/// `let a = [1]; a[0] /= 0; a` back in
+/// `an_arithmetic_guard_reports_the_same_error_and_position_in_every_slot`.
+#[cfg(not(any(feature = "unchecked", feature = "no_index", feature = "no_position")))]
+#[test]
+fn an_op_assignment_at_a_chain_tail_blames_the_chain_step() {
+    let engine = corpus::engine();
+
+    for source in ["let a = [1]; a[0] /= 0; a", "let a = [1]; let z = 0; a[0] /= z; a"] {
+        let stock = run_stock(&engine, source);
+        let vm = run_vm(&engine, source);
+
+        // The same failure, so only the blame has moved.
+        let (Err(stock_err), Err(vm_err)) = (&stock.result, &vm.result) else {
+            panic!("`{source}` must still raise on both sides: {stock:?} / {vm:?}");
+        };
+        assert!(stock_err.starts_with("ErrorArithmetic(\"Division by zero"), "rhai stopped raising the guard this is about: {stock_err}",);
+        assert!(vm_err.starts_with("ErrorArithmetic(\"Division by zero"), "the VM stopped raising the guard this is about: {vm_err}",);
+        assert_ne!(stock_err, vm_err, "`{source}` now agrees on the position, so the defect is fixed — see this test's own comment",);
+    }
+}
+
+/// One operator site, many operand pairs, in one frame and across nested ones.
+///
+/// The operator memo is keyed on `(frame generation, instruction address,
+/// operand discriminant pair)` and is consulted for every pair the typed
+/// instruction declines. Three things can go wrong with a key like that and
+/// none of them shows up on a monomorphic site: a pair change at one address
+/// inside one frame, a nested frame evicting a slot its caller wrote, and an
+/// arm whose type is *not* fixed by its discriminant — a shared cell and a
+/// custom type, which is why `type_code` answers zero for both and why an
+/// answer for one must never be handed to the other.
+///
+/// Built out of script functions rather than an array, so `no_index` gets the
+/// test too.
+#[cfg(not(feature = "no_function"))]
+#[test]
+fn one_operator_site_seeing_many_operand_pairs_agrees_with_rhai() {
+    let mut engine = corpus::engine();
+    // A custom type, so the site also sees `Union::Variant` — whose type is
+    // the boxed value's rather than the arm's.
+    #[derive(Clone)]
+    struct Tag(rhai::INT);
+    engine.register_type_with_name::<Tag>("Tag");
+    engine.register_fn("tag", |n: rhai::INT| Tag(n));
+    engine.register_fn("==", |a: Tag, b: Tag| a.0 == b.0);
+    engine.register_fn("<", |a: Tag, b: Tag| a.0 < b.0);
+
+    // An operand of every arm, selected without an array so that `no_index`
+    // still has the test. Six values through one `==` is thirty-six ordered
+    // pairs at one instruction, and most of them have no built-in at all —
+    // which is an answer the memo has to remember too.
+    const PICK: &str = "fn pick(k) { if k == 0 { 1 } else if k == 1 { \"a\" } else if k == 2 { 'c' } else if k == 3 { true } else if k == 4 { () } else { tag(1) } }";
+
+    let mut sources: Vec<String> = vec![
+        format!("{PICK} let out = \"\"; for i in 0..6 {{ for j in 0..6 {{ let x = pick(i); let y = pick(j); out += `${{x == y}},` }} }} out"),
+        format!("{PICK} let out = \"\"; for i in 0..6 {{ for j in 0..6 {{ let x = pick(i); let y = pick(j); out += `${{x < y}},` }} }} out"),
+        // The same site reached from nested frames, so a callee writes the slot
+        // the caller is using — and a recursive one, so the generation has to
+        // tell two frames at the same address in the same program apart.
+        format!("{PICK} fn eq(a, b) {{ a == b }} let out = \"\"; for i in 0..6 {{ for j in 0..6 {{ out += `${{eq(pick(i), pick(j))}},` }} }} out"),
+        format!("{PICK} fn walk(i) {{ if i >= 6 {{ \"\" }} else {{ `${{pick(0) == pick(i)}},` + walk(i + 1) }} }} walk(0)"),
+    ];
+
+    // A shared cell holds whatever is inside the lock, so its discriminant
+    // says nothing about the resolution — the arm the memo must refuse.
+    //
+    // Kept inside a function so no `FnPtr` is left in the top-level scope: the
+    // two sides render a closure's pointer differently there (`Fn*+(..)`
+    // against `Fn(..)`), which predates all of this and would be the only
+    // thing this case reported.
+    #[cfg(not(feature = "no_closure"))]
+    sources.push(r#"fn probe(a, b) { let f = || a; let g = || b; let out = ""; for i in 0..4 { let x = if i % 2 == 0 { a } else { b }; out += `${x == a},${x == b},` } out + `${f.call()}${g.call()}` } probe(1, "a")"#.into());
+
+    // Floats are a seventh arm, and the one the typed instruction runs for
+    // arithmetic and declines for comparison — so the two halves of the same
+    // site take different paths.
+    #[cfg(not(feature = "no_float"))]
+    sources.push(format!("{PICK} let out = \"\"; for i in 0..6 {{ let x = pick(i); out += `${{x == 2.5}},${{x < 2.5}},` }} out"));
+
+    let mut failures = Vec::new();
+    for source in &sources {
+        let stock = run_stock(&engine, source);
+        let vm = run_vm(&engine, source);
+        // A source that fails to compile on this build would compare equal for
+        // the wrong reason and test nothing.
+        assert!(stock.result.is_ok(), "`{source}` must run: {:?}", stock.result);
+        if stock != vm {
+            failures.push(format!("\n  `{source}`\n    rhai: {:?}\n    vm:   {:?}", stock.result, vm.result));
+        }
+    }
+
+    assert!(failures.is_empty(), "{} polymorphic operator sites disagreed with Rhai:{}", failures.len(), failures.join(""),);
+}
+
+/// One `Vm` running two programs must not answer the second out of the first.
+///
+/// The operator memo is keyed on the instruction's own address, and an address
+/// only names an instruction within one program. `Vm::eval_with_scope` takes
+/// the program by reference, so the same `Vm` can be handed a second one — and
+/// two programs of the same shape put their operator at the same address. The
+/// frame generation is the field that keeps those apart; nothing else in the
+/// key does.
+///
+/// The pair below is chosen so the memo is actually consulted: two strings have
+/// no typed arm, so the instruction falls through to the resolution the memo
+/// caches. `+` and `==` resolve to different functions for that same pair.
+#[test]
+fn one_vm_running_two_programs_does_not_answer_the_second_out_of_the_first() {
+    let engine = corpus::engine();
+
+    // Byte-identical up to the operator, so the two instructions land at the
+    // same address. Asserted below rather than assumed.
+    let compile = |source: &str| {
+        let ast = engine.compile(source).expect("both sources parse");
+        Compiler::new().compile(&ast)
+    };
+    let concat = compile(r#"let a = "x"; let b = "y"; a + b"#);
+    let compare = compile(r#"let a = "x"; let b = "y"; a == b"#);
+
+    assert_eq!(concat.code().len(), compare.code().len(), "the two programs must lay out identically, or they do not collide and this proves nothing",);
+
+    let run = |vm: &mut Vm, program: &rhai::grain::Program| {
+        let mut scope = Scope::new();
+        vm.eval_with_scope(&mut scope, program).map_or_else(|err| format!("{err:?}"), |value| format!("{value:?}"))
+    };
+
+    let mut vm = Vm::new(&engine);
+    assert_eq!(run(&mut vm, &concat), "\"xy\"", "the first program is the one that fills the memo");
+    assert_eq!(run(&mut vm, &compare), "false", "the second program read the first program's operator out of the memo",);
+
+    // And the same in the other order, so a hit in either direction is caught.
+    let mut vm = Vm::new(&engine);
+    assert_eq!(run(&mut vm, &compare), "false");
+    assert_eq!(run(&mut vm, &concat), "\"xy\"", "the second program read the first program's operator out of the memo",);
 }
