@@ -399,3 +399,83 @@ fn an_integer_range_is_walked_in_place_only_while_that_is_what_it_means() {
 
     assert!(differed >= 4, "the registered iterator has to change what Rhai itself answers, or agreeing with it proves nothing (only {differed} of {} sources moved)", SOURCES.len(),);
 }
+
+/// A discarded statement value is not pushed and popped, and a `try` keeps its
+/// pair.
+///
+/// Every assignment and every declaration evaluates to unit, and a statement
+/// anywhere but last has its value thrown away, so the compiler used to emit
+/// `Op::Unit` followed immediately by `Op::Pop` — two of the eight instructions
+/// a turn of `for i in 0..n { t += i; }` ran. Dropping the `Op::Unit` instead is
+/// only sound while nothing jumps past it, and `try`'s "past the catch block"
+/// edge lands exactly there: the try block's own value arrives along it, so the
+/// catch block's unit has to stay or the two edges meet at different heights.
+///
+/// Counted rather than pattern-matched, so this says what changed without
+/// pinning the whole encoding.
+#[test]
+fn a_discarded_statement_value_is_not_pushed_at_all() {
+    use rhai::grain::bytecode::{disassemble, Op};
+
+    fn unit_then_pop(source: &str) -> usize {
+        let engine = corpus::engine();
+        let ast = engine.compile(source).expect("compiles");
+        let program = Compiler::new().compile(&ast);
+        let ops: Vec<Op> = disassemble(program.code()).map(|(_, op)| op).collect();
+        ops.windows(2).filter(|pair| matches!(pair, [Op::Unit, Op::Pop])).count()
+    }
+
+    // The two loop bodies the ns/iter probe measures: one discarded assignment
+    // per turn in the first, two in the second.
+    assert_eq!(unit_then_pop("let t = 0; for i in 0..4 { t += i; } t"), 0);
+    assert_eq!(unit_then_pop("let t = 0; let i = 0; while i < 4 { t += i; i += 1; } t"), 0,);
+    // Declarations too, and a nested block.
+    assert_eq!(unit_then_pop("let a = 1; let b = 2; { let c = 3; a = c; } a + b"), 0);
+
+    // The catch block's unit is the one that must survive.
+    assert!(unit_then_pop("let t = 0; try { t = 1; } catch (e) { t = 2; } t") > 0, "the catch block's unit is what the try block's own value meets, so it cannot be dropped",);
+}
+
+/// Nothing that used to leave a value behind stops leaving it.
+///
+/// Dropping a trailing `Op::Unit` is a stack-height change, and the shapes most
+/// able to get it wrong are the ones where control flow joins: a statement whose
+/// value a later `Op::Pop` was going to take, reached along more than one edge.
+#[test]
+fn dropping_a_statements_value_keeps_every_join_balanced() {
+    let engine = corpus::engine();
+
+    const SOURCES: &[&str] = &[
+        // An `if` as a discarded statement: both arms push, the join pops.
+        "let a = 0; if a == 0 { a = 1 } else { a = 2 } a",
+        "let a = 0; if a == 0 { a = 1 } a",
+        // Empty arms, which are a bare `Op::Unit` of their own.
+        "let a = 0; if a == 0 { } else { } a",
+        // A `try` whose two edges carry different things, in both positions.
+        "let t = 0; try { t = 1; } catch (e) { t = 2; } t",
+        "let t = 0; try { throw 1; } catch (e) { t = 2; } t",
+        "let t = 0; try { t = 1; } catch (e) { t = 2; }",
+        // A loop as a discarded statement, and a `break` carrying a value into
+        // the same join the exhausted path reaches.
+        "let t = 0; while t < 3 { t += 1; } t",
+        "let t = 0; let r = loop { t += 1; if t > 2 { break t * 10; } }; r",
+        "let t = 0; for i in 0..5 { if i == 2 { break; } t += i; } t",
+        "let t = 0; for i in 0..5 { if i == 2 { continue; } t += i; } t",
+        // A block used for its value, after statements whose values were not.
+        "let a = 1; let b = { a = 2; a + 1 }; b",
+        // Switch, whose arms all join.
+        "let a = 1; let r = 0; switch a { 0 => r = 10, 1 => r = 20, _ => r = 30 } r",
+        "let a = 1; switch a { 0 => 10, _ => 30 }",
+        // Nested loops with a `try` between them.
+        "let t = 0; for i in 0..3 { try { for j in 0..3 { if j == 1 { throw 1; } t += 1; } } catch (e) { t += 100; } } t",
+        // A statement list where every statement is a discarded unit.
+        "let a = 0; a = 1; a = 2; a = 3; a",
+        // Do-while, both spellings.
+        "let t = 0; do { t += 1; } while t < 3; t",
+        "let t = 0; do { t += 1; } until t > 2; t",
+    ];
+
+    for source in SOURCES {
+        assert_eq!(run_stock(&engine, source), run_vm(&engine, source), "the VM disagreed with Rhai on `{source}`",);
+    }
+}

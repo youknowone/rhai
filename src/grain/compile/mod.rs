@@ -318,6 +318,13 @@ struct Lowering {
     /// nesting rather than a running count.
     #[cfg(feature = "debugging")]
     stmt_depth: u16,
+    /// The furthest instruction anything emitted so far jumps to.
+    ///
+    /// Read by [`Lowering::drop_trailing_unit`], which may only drop the tail
+    /// while nothing behind it points there. Reset per chunk with the rest of
+    /// the lowering, which is what makes it comparable to an index into
+    /// `code`.
+    patched_max: u32,
     /// Set when something nested inside an expression defeated the slot model.
     ///
     /// [`Lowering::statement`] says so by returning false, but
@@ -351,12 +358,11 @@ impl Lowering {
             if keeps_scope {
                 self.emit(Op::Checkpoint);
             }
-            if !self.statement(stmt) {
-                return false;
-            }
             // A statement's value is only the program's value if it is the
             // last one; Rhai discards the rest.
-            self.emit(Op::Pop);
+            if !self.statement_discarding(stmt) {
+                return false;
+            }
         }
 
         if keeps_scope {
@@ -2166,10 +2172,9 @@ impl Lowering {
         };
 
         for stmt in leading {
-            if !self.statement(stmt) {
+            if !self.statement_discarding(stmt) {
                 return false;
             }
-            self.emit(Op::Pop);
         }
         if !self.statement(last) {
             return false;
@@ -2187,7 +2192,52 @@ impl Lowering {
         if !self.block(statements) {
             return false;
         }
-        self.emit(Op::Pop);
+        self.discard_value();
+        true
+    }
+
+    /// Lower a statement whose value is thrown away, leaving nothing behind.
+    fn statement_discarding(&mut self, stmt: &Stmt) -> bool {
+        if !self.statement(stmt) {
+            return false;
+        }
+        self.discard_value();
+        true
+    }
+
+    /// Take the value on top of the operand stack off again — by not putting
+    /// it there when that is possible, and popping it when it is not.
+    fn discard_value(&mut self) {
+        if !self.drop_trailing_unit() {
+            self.emit(Op::Pop);
+        }
+    }
+
+    /// Drop the [`Op::Unit`] a statement ended with instead of emitting the
+    /// [`Op::Pop`] that would take it off again.
+    ///
+    /// Every assignment and every declaration evaluates to unit, and a
+    /// statement anywhere but last has its value discarded — so the pair is two
+    /// instructions that undo each other. They are two of the eight a turn of
+    /// `for i in 0..n { t += i; }` runs, and four of the fourteen in
+    /// `while i < n { s += i; i += 1; }`.
+    ///
+    /// Refused unless the `Unit` is the last instruction emitted and nothing
+    /// already jumps to it or past it. `try`'s "past the catch block" edge is
+    /// patched exactly past one, and the try block's own value arrives along
+    /// that edge, so dropping the catch block's unit would leave the two edges
+    /// meeting at different stack heights.
+    fn drop_trailing_unit(&mut self) -> bool {
+        let Some(last) = self.code.len().checked_sub(1) else {
+            return false;
+        };
+        if !matches!(self.code[last], Op::Unit) {
+            return false;
+        }
+        if self.patched_max as usize >= last {
+            return false;
+        }
+        self.rewind(last);
         true
     }
 
@@ -2245,14 +2295,21 @@ impl Lowering {
 
     /// Point a previously emitted jump at an instruction already emitted.
     fn patch_to(&mut self, site: usize, target: u32) {
-        match &mut self.code[site] {
-            Op::Jump(slot)
-            | Op::JumpIfFalse { target: slot, .. }
-            | Op::JumpIfTrue { target: slot, .. }
-            | Op::SkipIfNotUnit { target: slot, .. }
-            | Op::IterNext { exit: slot, .. }
-            | Op::PushHandler { target: slot, .. } => *slot = target,
-            other => unreachable!("patched a {other:?}, which is not a jump"),
+        let Some(slot) = jump_target_mut(&mut self.code[site]) else {
+            unreachable!("patched a {:?}, which is not a jump", self.code[site]);
+        };
+        *slot = target;
+        self.note_target(target);
+    }
+
+    /// Remember the furthest instruction anything jumps to.
+    ///
+    /// `u32::MAX` is the placeholder a forward jump carries until it is
+    /// patched, and it is patched to wherever the code ends at that moment —
+    /// which is after any tail already dropped — so it names nothing yet.
+    fn note_target(&mut self, target: u32) {
+        if target != u32::MAX {
+            self.patched_max = self.patched_max.max(target);
         }
     }
 
@@ -2372,7 +2429,12 @@ impl Lowering {
         (self.residuals.len() - 1) as u32
     }
 
-    fn emit(&mut self, op: Op) {
+    fn emit(&mut self, mut op: Op) {
+        // A back edge names its target when it is emitted rather than being
+        // patched later, so this is the other half of what `patch_to` records.
+        if let Some(&mut target) = jump_target_mut(&mut op) {
+            self.note_target(target);
+        }
         // An upper bound, not the answer: no instruction pushes more than one
         // value, so one slot per instruction cannot be too small. The verifier
         // replaces it with the measured high water once lowering is done.
@@ -2388,6 +2450,23 @@ impl Lowering {
     fn emit_at(&mut self, op: Op, pos: Position) {
         self.emit(op);
         *self.positions.last_mut().expect("just emitted") = pos;
+    }
+}
+
+/// The slot naming the instruction an op jumps to, for the ops that have one.
+///
+/// One list rather than two: a jump this does not know about would neither be
+/// patchable nor keep [`Lowering::patched_max`] honest, and the second failure
+/// is silent.
+fn jump_target_mut(op: &mut Op) -> Option<&mut u32> {
+    match op {
+        Op::Jump(target)
+        | Op::JumpIfFalse { target, .. }
+        | Op::JumpIfTrue { target, .. }
+        | Op::SkipIfNotUnit { target, .. }
+        | Op::IterNext { exit: target, .. }
+        | Op::PushHandler { target, .. } => Some(target),
+        _ => None,
     }
 }
 
