@@ -431,16 +431,32 @@ impl Lowering {
             _ => return false,
         };
 
-        // Evaluate the assignment value first, so the chain can read it back
-        // after the lvalue steps have been resolved.
-
-        // The chain is a single expression, so the value is evaluated before
-        // the root and steps.
+        // Rhai evaluates the assigned value before the lvalue's own index
+        // expressions and method arguments, and `Op::Chain` wants it on top of
+        // them — so the value goes into a local here and is read back once the
+        // operands are down.
+        //
+        // Two shapes do not need the local. A chain that evaluates nothing
+        // between the two points cannot tell the difference: no operands, and a
+        // root that is a place rather than an expression. And a value that is a
+        // single infallible push cannot tell either, whatever runs in between.
+        // Both are how an indexed write is usually spelled — `a[i] = 0`,
+        // `m.x += 1` — where the stash was six instructions and a scope entry
+        // per turn, the scope entry an `Rc` allocation of its own.
+        let evaluates_between = matches!(root_spec, Root::Temporary)
+            || steps.iter().any(|step| match step {
+                ChainStep::Index(..) => true,
+                ChainStep::Property(..) => false,
+                ChainStep::Method(call, ..) => !call.args.is_empty(),
+            });
+        let stashed = value.map_or(false, |value| {
+            evaluates_between && !is_one_pushed_value(value)
+        });
 
         let rewind_mark = self.mark();
         let unwind_depth = self.slots.depth();
 
-        let value_slot = if let Some(value) = value {
+        let value_slot = if let Some(value) = value.filter(|_| stashed) {
             if self.slots.is_full() {
                 return false;
             }
@@ -537,8 +553,13 @@ impl Lowering {
             self.expression(root);
         }
 
-        if let Some(value_slot) = value_slot {
-            self.emit(Op::LoadLocal(value_slot));
+        match (value_slot, value) {
+            (Some(value_slot), _) => self.emit(Op::LoadLocal(value_slot)),
+            // Not stashed, so this is where it is evaluated — the same place
+            // the load would have been, so the operand stack `Op::Chain` reads
+            // is laid out identically either way.
+            (None, Some(value)) => self.expression(value),
+            (None, None) => (),
         }
 
         let index = self.push_chain(Chain {
@@ -2450,6 +2471,29 @@ impl Lowering {
     fn emit_at(&mut self, op: Op, pos: Position) {
         self.emit(op);
         *self.positions.last_mut().expect("just emitted") = pos;
+    }
+}
+
+/// Does this expression lower to exactly one push that cannot fail?
+///
+/// Such a value can be evaluated later than Rhai evaluates it without anything
+/// being able to tell: it reads no state, writes none, and raises nothing — so
+/// neither the answer nor which of two failures is reported can move.
+///
+/// Deliberately narrower than [`Expr::is_constant`], which also admits a
+/// constant array or map. Building one of those is what the data-size limits
+/// refuse, and a chain that would raise on both its operands and its value has
+/// to raise on the same one Rhai does.
+fn is_one_pushed_value(expr: &Expr) -> bool {
+    match expr {
+        #[cfg(not(feature = "no_float"))]
+        Expr::FloatConstant(..) => true,
+        Expr::BoolConstant(..)
+        | Expr::IntegerConstant(..)
+        | Expr::CharConstant(..)
+        | Expr::StringConstant(..)
+        | Expr::Unit(..) => true,
+        _ => false,
     }
 }
 

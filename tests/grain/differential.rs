@@ -479,3 +479,75 @@ fn dropping_a_statements_value_keeps_every_join_balanced() {
         assert_eq!(run_stock(&engine, source), run_vm(&engine, source), "the VM disagreed with Rhai on `{source}`",);
     }
 }
+
+/// An assigned value that goes straight onto the stack still lands in Rhai's
+/// evaluation order.
+///
+/// Rhai evaluates the assigned value before the lvalue's own index expressions
+/// and method arguments, and `Op::Chain` wants it on top of them — so the
+/// compiler stashes it in a local and reads it back. It stops doing that when
+/// nothing runs in between, or when the value is a single infallible push that
+/// cannot tell. These are the shapes where "cannot tell" has to be true:
+/// operands with effects, operands that raise, and a value that is not one of
+/// those pushes and therefore keeps the stash.
+#[test]
+fn a_chain_assignment_evaluates_its_value_where_rhai_does() {
+    let mut engine = corpus::engine();
+    // Records the order things were evaluated in, so the answer carries it.
+    engine.register_fn("trace", |log: &mut rhai::Array, tag: rhai::INT| -> rhai::INT {
+        log.push(Dynamic::from(tag));
+        tag
+    });
+
+    const SOURCES: &[&str] = &[
+        // Value is a literal, index has an effect: the deferred spelling.
+        "let log = []; let a = [0, 0, 0]; a[trace(log, 1)] = 7; [a, log]",
+        "let log = []; let a = [0, 0, 0]; a[trace(log, 1)] += 7; [a, log]",
+        // Value is not a literal, so the stash stays and has to still be right.
+        "let log = []; let a = [0, 0, 0]; let v = 9; a[trace(log, 1)] = v; [a, log]",
+        "let log = []; let a = [0, 0, 0]; a[trace(log, 1)] = trace(log, 2); [a, log]",
+        "let log = []; let a = [0, 0, 0]; a[trace(log, 1)] += trace(log, 2); [a, log]",
+        // Two operands, so their order matters as well as the value's.
+        "let log = []; let a = [[0, 0], [0, 0]]; a[trace(log, 1)][trace(log, 2)] = 5; [a, log]",
+        "let log = []; let a = [[0, 0], [0, 0]]; a[trace(log, 1)][trace(log, 2)] = trace(log, 3); [a, log]",
+        // The operand raises. With the value stashed it was evaluated first, so
+        // this pins that a value which cannot raise does not change the answer.
+        "let a = [0]; a[99] = 1; a",
+        // A property step evaluates nothing at all, which is the other reason
+        // the stash goes.
+        "let m = #{ x: 0 }; m.x = 7; m",
+        "let m = #{ x: 0 }; m.x += 7; m",
+        "let m = #{ x: 0 }; let v = 7; m.x = v; m",
+        "let m = #{ x: #{ y: 0 } }; m.x.y = 7; m",
+        // A method step with arguments does evaluate between.
+        "let log = []; let a = [[1, 2, 3]]; a[0].remove(trace(log, 0)); [a, log]",
+        // Mixed property and index.
+        "let log = []; let m = #{ a: [0, 0] }; m.a[trace(log, 1)] = 4; [m, log]",
+        // Every value kind that is treated as a single push.
+        r#"let a = [0]; a[0] = "s"; a"#,
+        "let a = [0]; a[0] = 'c'; a",
+        "let a = [0]; a[0] = true; a",
+        "let a = [0]; a[0] = (); a",
+        // A constant array is NOT one of them: building it is what the size
+        // limits refuse, so it keeps the stash.
+        "let a = [0]; a[0] = [1, 2, 3]; a",
+        "let a = [0]; a[0] = #{ k: 1 }; a",
+        // A string index into a map, and a bit-field, which are the two places
+        // the write goes back through a copy.
+        r#"let m = #{}; m["k"] = 1; m"#,
+        "let n = 0; n[2] = true; n",
+    ];
+
+    // Both halves raise, and which one is reported is part of the answer — so
+    // this is the group that says a value evaluated later cannot take the blame
+    // off the operand. Excluded under `unchecked`, which removes the guard the
+    // case is made of and leaves the operator panicking instead.
+    #[cfg(not(feature = "unchecked"))]
+    const RAISING: &[&str] = &["let a = [0]; a[99] = 1 / 0; a", "let a = [0]; a[0] = 1 / 0; a", "let a = [0]; a[1 / 0] = 1; a"];
+    #[cfg(feature = "unchecked")]
+    const RAISING: &[&str] = &[];
+
+    for source in SOURCES.iter().chain(RAISING) {
+        assert_eq!(run_stock(&engine, source), run_vm(&engine, source), "the VM disagreed with Rhai on `{source}`",);
+    }
+}
