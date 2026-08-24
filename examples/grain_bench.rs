@@ -192,6 +192,26 @@ fn time(mut run: impl FnMut()) -> Timing {
     }
 }
 
+/// The three-field load average, as the kernel reports it.
+///
+/// Printed with every run because a ratio taken on a busy machine is not
+/// comparable with one taken on an idle machine, and nothing in the numbers
+/// below says which one this was. Shelling out rather than linking `libc`:
+/// this runs twice per process, at the ends, so the cost is irrelevant and the
+/// dependency would not be.
+fn load_average() -> String {
+    std::process::Command::new("uptime")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .and_then(|line| {
+            line.split("load average")
+                .nth(1)
+                .map(|rest| rest.trim_start_matches([':', 's', ' ']).trim().to_string())
+        })
+        .unwrap_or_else(|| "unknown".into())
+}
+
 fn main() {
     let check = std::env::args().any(|arg| arg == "--check");
     let engine = Engine::new();
@@ -205,6 +225,7 @@ fn main() {
     let mut slow_engine = Engine::new();
     slow_engine.set_fast_operators(false);
 
+    println!("load average before: {}", load_average());
     println!(
         "{:<22} {:>11} {:>11} {:>9} {:>7} {:>8} {:>11} {:>10}",
         "", "walker", "vm", "speedup", "floor", "spread", "walker-slow", "fragments"
@@ -285,6 +306,8 @@ fn main() {
             ));
         }
     }
+
+    println!("\nload average after:  {}", load_average());
 
     if below_floor.is_empty() {
         return;
