@@ -111,6 +111,38 @@ const CASES: &[Case] = &[
         source: "let a = []; a.pad(64, 0); for i in 0..50000 { a[i % 64] += 1; } a[0]",
         iters: 50_000,
     },
+    // A comparison on a pair no typed opcode runs. Two strings resolve through
+    // `get_builtin_binary_op_fn` on every turn unless something remembers the
+    // answer, so this is the row a per-site operator memo has to move — and
+    // the row that says what one costs when it does not.
+    // The float comparison, which a typed opcode deliberately does not run: a
+    // checked build compares floats through a relative-epsilon rule that lives
+    // in one place and is going to stay there. So this row is the dispatching
+    // path, measured next to `f += 1.5` which is not.
+    Case {
+        name: "if f < 1.0 { t += 1 }",
+        source: "let t = 0; let f = 0.5; for i in 0..200000 { if f < 1.0 { t += 1; } } t",
+        iters: 200_000,
+    },
+    // Two strings, which no typed opcode runs: the comparison resolves through
+    // `get_builtin_binary_op_fn` every turn unless something remembers the
+    // answer. Its arm is reached early, so this says what a memo is worth when
+    // the resolution it skips was already cheap.
+    Case {
+        name: "if s < u { t += 1 }",
+        source: r#"let t = 0; let s = "alpha"; let u = "beta"; for i in 0..200000 { if s < u { t += 1; } } t"#,
+        iters: 200_000,
+    },
+    // A string against an integer, which is the same question asked of the
+    // expensive end of the same function: no arm matches the pair, so it falls
+    // through to the `TypeId` comparisons at the bottom before answering
+    // "different types are never equal". The answer itself is a constant, so
+    // this row is resolution cost and almost nothing else.
+    Case {
+        name: "if s == i { t += 1 }",
+        source: r#"let t = 0; let s = "alpha"; for i in 0..200000 { if s == i { t += 1; } } t"#,
+        iters: 200_000,
+    },
 ];
 
 /// One arm's samples, fastest first.
@@ -202,7 +234,11 @@ fn main() {
             ("vm", format!("{:?}", run_vm())),
             ("walker-slow", format!("{:?}", run_slow())),
         ] {
-            assert_eq!(expected, got, "{} disagreed with the walker on {}", arm, case.name);
+            assert_eq!(
+                expected, got,
+                "{} disagreed with the walker on {}",
+                arm, case.name
+            );
         }
 
         // Interleaved by run, not by arm: a thermal or scheduling drift that

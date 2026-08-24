@@ -15,7 +15,7 @@ mod verify;
 pub use chain::{Chain, Root, Step, StepFlags, Tail};
 pub use chunk::Chunk;
 pub use code::{assemble, disassemble, resolve_switch_targets, AssembleError, Code};
-pub use op::{AssignOp, Op, Receiver};
+pub use op::{AssignOp, BinOpKind, Op, Receiver};
 pub(crate) use positions::site_to_position;
 pub use positions::{Positions, TableError};
 pub use strings::{BadTable, Strings};

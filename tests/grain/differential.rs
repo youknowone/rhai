@@ -272,3 +272,79 @@ fn residual_census() {
     // stopped compiling at all would have nothing to fragment and would pass.
     assert_eq!(at_zero.len(), applicable - MAY_FRAGMENT.len(), "some scripts did not compile, so they were counted as neither",);
 }
+
+/// A host operator on primitives obeys Rhai's gate, not one of the VM's.
+///
+/// With fast operators on — the default — a binary operator on two primitives
+/// short-circuits to the built-in and a registered function of the same name
+/// never runs (`func/call.rs:1775-1799`). With it off, both sides dispatch and
+/// the registered one wins. A typed opcode is a third way of reaching the
+/// built-in, so the whole of its correctness here is that it sits behind that
+/// same gate: the VM must agree with the walker under both settings, and the
+/// two settings must not agree with each other.
+///
+/// The second half is what stops this from being a tautology. Two engines that
+/// both ignored the registration would agree at every setting and prove
+/// nothing.
+#[test]
+fn a_registered_operator_on_primitives_follows_rhais_own_gate() {
+    // Answers no built-in could: `+` multiplies, `<` is reversed, and `+=`
+    // multiplies in place. All three are registered for integers, which is
+    // precisely the pair the gate is about — Rhai has a built-in for it, so
+    // the registration only ever runs on the dispatching side.
+    fn engine_with_operators(fast: bool) -> Engine {
+        let mut engine = corpus::engine();
+        engine.set_fast_operators(fast);
+        engine.register_fn("+", |x: rhai::INT, y: rhai::INT| x * y);
+        engine.register_fn("<", |x: rhai::INT, y: rhai::INT| x > y);
+        engine.register_fn("+=", |x: &mut rhai::INT, y: rhai::INT| *x *= y);
+        engine
+    }
+
+    const SOURCES: &[&str] = &[
+        "let a = 6; let b = 7; a + b",
+        "let a = 6; let b = 7; a += b; a",
+        "let a = 6; let b = 7; if a < b { 1 } else { 0 }",
+        // Not two primitives, so the gate does not apply and dispatch runs on
+        // both settings.
+        r#"let a = "x"; let b = "y"; a + b"#,
+    ];
+
+    let fast = engine_with_operators(true);
+    let slow = engine_with_operators(false);
+
+    for source in SOURCES {
+        assert_eq!(run_stock(&fast, source), run_vm(&fast, source), "fast operators: the VM disagreed with Rhai on `{source}`",);
+        assert_eq!(run_stock(&slow, source), run_vm(&slow, source), "dispatched operators: the VM disagreed with Rhai on `{source}`",);
+    }
+
+    // The gate is observable, so agreeing above meant something.
+    for source in &SOURCES[..3] {
+        assert_ne!(run_stock(&fast, source), run_stock(&slow, source), "Rhai itself must answer `{source}` differently at the two settings, or the agreement above is vacuous",);
+        assert_ne!(run_vm(&fast, source), run_vm(&slow, source), "the VM must answer `{source}` differently at the two settings, or it is not reading the gate at all",);
+    }
+}
+
+/// A `switch` subject, a `for` range and an `if` guard are all operands too.
+///
+/// The typed operator instruction is emitted for every binary operator the VM
+/// can run, which puts it in front of consumers that are not an assignment —
+/// and a wrong result there is a wrong branch rather than a wrong number.
+#[test]
+fn a_typed_operator_feeding_a_branch_agrees_with_rhai() {
+    let engine = corpus::engine();
+
+    const SOURCES: &[&str] = &[
+        "let n = 0; for i in 0..10 { if i % 3 == 0 { n += i } } n",
+        "let n = 0; let i = 0; while i < 10 { n += i * 2 - 1; i += 1; } n",
+        "let a = 3; switch a * 2 { 6 => \"six\", _ => \"other\" }",
+        "let a = 3; let b = 0; do { b += a; a -= 1; } while a > 0; b",
+        // The operand pair changes at the same site between turns, which is
+        // what a speculative instruction has to survive.
+        r#"let out = ""; for i in 0..4 { let v = if i % 2 == 0 { i } else { "s" }; out += `${v == 2}`; } out"#,
+    ];
+
+    for source in SOURCES {
+        assert_eq!(run_stock(&engine, source), run_vm(&engine, source), "the VM disagreed with Rhai on `{source}`",);
+    }
+}

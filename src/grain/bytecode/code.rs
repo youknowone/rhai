@@ -25,7 +25,7 @@
 
 use alloc::borrow::Cow;
 
-use crate::grain::bytecode::{Op, Receiver};
+use crate::grain::bytecode::{BinOpKind, Op, Receiver};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -181,6 +181,13 @@ pub mod tag {
     pub const STATEMENT: u8 = 0x47;
     /// [`Op::StoreLocal`](super::Op::StoreLocal) as a constant.
     pub const STORE_CONST: u8 = 0x48;
+    /// [`Op::BinOp`](super::Op::BinOp).
+    ///
+    /// Deliberately the same operand layout as [`CALL_OP`], with the kind byte
+    /// where the argument count would be — an operator call always has two
+    /// arguments, so the byte was a constant. That is what lets the VM's
+    /// fallback be the `CALL_OP` arm itself rather than a copy of it.
+    pub const BIN_OP: u8 = 0x49;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -272,6 +279,7 @@ static WIDTHS: [u8; 256] = {
     widths[tag::SKIP_IF_NOT_UNIT as usize] = 5;
 
     widths[tag::CALL_OP as usize] = 6;
+    widths[tag::BIN_OP as usize] = 6;
     widths[tag::CALL_LOCAL_REF as usize] = 6;
     widths[tag::CALL_LOCAL_REF_CAPTURE as usize] = 6;
     widths[tag::CALL_NAMED_REF as usize] = 6;
@@ -516,6 +524,13 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*argc);
                 code.extend_from_slice(&small(*token as usize, "operators")?.to_le_bytes());
+            }
+
+            Op::BinOp { name, op, kind } => {
+                code.push(tag::BIN_OP);
+                code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
+                code.push(*kind as u8);
+                code.extend_from_slice(&small(*op as usize, "operators")?.to_le_bytes());
             }
 
             Op::CallRef {
@@ -820,6 +835,7 @@ fn encoded_width(op: &Op) -> usize {
             ..
         } => 7,
         Op::Call { op: Some(..), .. }
+        | Op::BinOp { .. }
         | Op::CallRef {
             receiver: Receiver::Local(..) | Receiver::Named(..),
             ..
@@ -915,6 +931,14 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             argc: code[at + 3],
             op: Some(u32::from(small(4)?)),
             capture_parent_scope: false,
+        },
+        // A kind byte naming nothing is not an instruction, which is what
+        // keeps a corrupt artifact from reaching the VM's operator table with
+        // an index it cannot answer.
+        tag::BIN_OP => Op::BinOp {
+            name: u32::from(small(1)?),
+            op: u32::from(small(4)?),
+            kind: BinOpKind::from_byte(code[at + 3])?,
         },
 
         tag @ (tag::CALL_LOCAL_REF | tag::CALL_LOCAL_REF_CAPTURE) => Op::CallRef {

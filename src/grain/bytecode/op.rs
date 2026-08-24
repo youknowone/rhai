@@ -1,5 +1,140 @@
 use crate::tokenizer::Token;
 
+/// A binary operator the VM can execute without resolving a function.
+///
+/// One of these is what [`Op::BinOp`] carries, and what an [`AssignOp`] holds
+/// alongside its tokens. It names the *operator*, never the operand types: the
+/// types are a run-time property and the instruction is speculative, so a site
+/// that turns out to hold a string or a custom type falls back to exactly the
+/// dispatch [`Op::Call`] would have done.
+///
+/// Only the operators [`get_builtin_binary_op_fn`] answers for integers and
+/// floats are here. `..`, `..=` and any operator a host registered with
+/// `Engine::register_custom_operator` have no entry and keep the dispatching
+/// instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BinOpKind {
+    /// `+`, `+=`
+    Add = 0,
+    /// `-`, `-=`
+    Subtract = 1,
+    /// `*`, `*=`
+    Multiply = 2,
+    /// `/`, `/=`
+    Divide = 3,
+    /// `%`, `%=`
+    Modulo = 4,
+    /// `**`, `**=`
+    Power = 5,
+    /// `<<`, `<<=`
+    ShiftLeft = 6,
+    /// `>>`, `>>=`
+    ShiftRight = 7,
+    /// `&`, `&=`
+    And = 8,
+    /// `|`, `|=`
+    Or = 9,
+    /// `^`, `^=`
+    Xor = 10,
+    /// `==`
+    Equals = 11,
+    /// `!=`
+    NotEquals = 12,
+    /// `>`
+    Greater = 13,
+    /// `>=`
+    GreaterEquals = 14,
+    /// `<`
+    Less = 15,
+    /// `<=`
+    LessEquals = 16,
+}
+
+impl BinOpKind {
+    /// The last value, so the encoding can reject a byte that names nothing.
+    pub const LAST: u8 = Self::LessEquals as u8;
+
+    /// Which binary operator a token is, if the VM has an implementation.
+    ///
+    /// The set is exactly what [`get_builtin_binary_op_fn`] handles for
+    /// `Union::Int` and `Union::Float` operands. Anything else — a range, a
+    /// custom operator — answers `None` and keeps dispatching.
+    #[must_use]
+    pub const fn of(token: &Token) -> Option<Self> {
+        Some(match token {
+            Token::Plus => Self::Add,
+            Token::Minus => Self::Subtract,
+            Token::Multiply => Self::Multiply,
+            Token::Divide => Self::Divide,
+            Token::Modulo => Self::Modulo,
+            Token::PowerOf => Self::Power,
+            Token::LeftShift => Self::ShiftLeft,
+            Token::RightShift => Self::ShiftRight,
+            Token::Ampersand => Self::And,
+            Token::Pipe => Self::Or,
+            Token::XOr => Self::Xor,
+            Token::EqualsTo => Self::Equals,
+            Token::NotEqualsTo => Self::NotEquals,
+            Token::GreaterThan => Self::Greater,
+            Token::GreaterThanEqualsTo => Self::GreaterEquals,
+            Token::LessThan => Self::Less,
+            Token::LessThanEqualsTo => Self::LessEquals,
+            _ => return None,
+        })
+    }
+
+    /// The same for the `x op= y` form, keyed on the op-assignment token.
+    ///
+    /// The set is what [`get_builtin_op_assignment_fn`] handles, which has no
+    /// comparison forms — there is no `<=`.
+    #[must_use]
+    pub const fn of_assign(token: &Token) -> Option<Self> {
+        Some(match token {
+            Token::PlusAssign => Self::Add,
+            Token::MinusAssign => Self::Subtract,
+            Token::MultiplyAssign => Self::Multiply,
+            Token::DivideAssign => Self::Divide,
+            Token::ModuloAssign => Self::Modulo,
+            Token::PowerOfAssign => Self::Power,
+            Token::LeftShiftAssign => Self::ShiftLeft,
+            Token::RightShiftAssign => Self::ShiftRight,
+            Token::AndAssign => Self::And,
+            Token::OrAssign => Self::Or,
+            Token::XOrAssign => Self::Xor,
+            _ => return None,
+        })
+    }
+
+    /// Recover a kind from the byte an instruction carries.
+    ///
+    /// `None` for a byte that names nothing, which is what stops a corrupt
+    /// artifact from reaching an unchecked transmute.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::Add,
+            1 => Self::Subtract,
+            2 => Self::Multiply,
+            3 => Self::Divide,
+            4 => Self::Modulo,
+            5 => Self::Power,
+            6 => Self::ShiftLeft,
+            7 => Self::ShiftRight,
+            8 => Self::And,
+            9 => Self::Or,
+            10 => Self::Xor,
+            11 => Self::Equals,
+            12 => Self::NotEquals,
+            13 => Self::Greater,
+            14 => Self::GreaterEquals,
+            15 => Self::Less,
+            16 => Self::LessEquals,
+            _ => return None,
+        })
+    }
+}
+
 /// What `x op= y` needs to reproduce Rhai's resolution order.
 ///
 /// Both the op-assignment and the plain operator are carried, because Rhai
@@ -20,6 +155,29 @@ pub struct AssignOp {
     pub op: Token,
     /// `"+"`.
     pub op_name: u32,
+    /// Which operator `op_assign` is, when the VM can execute it directly.
+    ///
+    /// Derived from `op_assign` rather than stored in an artifact, and
+    /// recomputed wherever an `AssignOp` is built. Keeping it here is what
+    /// lets `x += y` reach an integer add without matching a `Token` first —
+    /// the op-assignment instructions address this pool and would otherwise
+    /// have to decode the token on every iteration of every loop.
+    pub kind: Option<BinOpKind>,
+}
+
+impl AssignOp {
+    /// Build one, deriving [`AssignOp::kind`] from the op-assignment token.
+    #[must_use]
+    pub fn new(op_assign: Token, op_assign_name: u32, op: Token, op_name: u32) -> Self {
+        let kind = BinOpKind::of_assign(&op_assign);
+        Self {
+            op_assign,
+            op_assign_name,
+            op,
+            op_name,
+            kind,
+        }
+    }
 }
 
 /// Where [`Op::CallRef`] finds the variable it calls through.
@@ -641,6 +799,36 @@ pub enum Op {
     /// entry is the `throw` keyword's own position, not the expression's
     /// (`eval/stmt.rs:877`).
     Throw,
+
+    /// Pop two operands and apply a binary operator to them, pushing the result.
+    ///
+    /// The specialised form of [`Op::Call`] with `argc: 2` and an operator
+    /// token, and it carries the same `name` and `op` so that it can *be* that
+    /// call whenever it has to be. The difference is `kind`: the operator is
+    /// decoded from the instruction rather than from the token pool, so an
+    /// integer add reaches an integer add without a `Token` match, a
+    /// `get_builtin_binary_op_fn` type walk, or an indirect call over
+    /// `&mut [&mut Dynamic]`.
+    ///
+    /// **The types are not proven.** The compiler emits this for every binary
+    /// operator [`BinOpKind`] names, and the VM tests the operands: two
+    /// integers, or a pair the float rules cover, run in the dispatch loop;
+    /// anything else — a string, a custom type, a shared cell — takes exactly
+    /// the [`Op::Call`] path, and reports what that path reports. That is the
+    /// only way the answer can be the walker's, because a host is free to hand
+    /// the same site a string on one iteration and an integer on the next.
+    ///
+    /// Gated at run time on `Engine::fast_operators()` for the same reason
+    /// [`Op::Call`]'s built-in short-circuit is: with it off, both the walker
+    /// and the VM dispatch, and a host-registered `+` on integers wins in both.
+    BinOp {
+        /// The operator's name, for the dispatch fallback and error messages.
+        name: u32,
+        /// Index into the operator pool, for the dispatch fallback.
+        op: u32,
+        /// Which operator this is.
+        kind: BinOpKind,
+    },
 
     /// End the chunk, yielding the top of the operand stack, or unit if empty.
     Return,

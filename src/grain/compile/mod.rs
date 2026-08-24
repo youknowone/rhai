@@ -17,8 +17,8 @@ use crate::types::Span;
 use crate::{Dynamic, ImmutableString, Position, AST};
 
 use crate::grain::bytecode::{
-    assemble, resolve_switch_targets, AssignOp, Chain, Chunk, Op, Positions, Receiver, Root, Step,
-    StepFlags, Switch, SwitchCase, SwitchRange, Tail,
+    assemble, resolve_switch_targets, AssignOp, BinOpKind, Chain, Chunk, Op, Positions, Receiver,
+    Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail,
 };
 use crate::grain::compile::poolable::is_poolable;
 use crate::grain::compile::slots::Slots;
@@ -1914,10 +1914,21 @@ impl Lowering {
         // lookup takes. Keeping a unary one would be dead weight and worse:
         // `UnaryMinus` and `Minus` share the syntax `"-"`, so it is a token
         // that cannot be written to an artifact at all.
-        let op = (argc == 2)
-            .then(|| call.op_token.clone())
-            .flatten()
-            .map(|token| self.push_token(token));
+        let token = (argc == 2).then(|| call.op_token.clone()).flatten();
+        let kind = token.as_ref().and_then(BinOpKind::of);
+        let op = token.map(|token| self.push_token(token));
+
+        // The specialised instruction whenever the operator is one the VM can
+        // execute. Not because the operand types are known — they are not, and
+        // a site can see a different pair on every iteration — but because the
+        // instruction *carries* the dispatching form and falls back to it for
+        // any pair it cannot run. Emitting it is therefore never a claim about
+        // types, only about the operator. See [`Op::BinOp`].
+        if let (Some(kind), Some(op)) = (kind, op) {
+            self.emit_at(Op::BinOp { name, op, kind }, pos);
+            return;
+        }
+
         self.emit_at(
             Op::Call {
                 name,
@@ -1944,12 +1955,12 @@ impl Lowering {
         op_info
             .get_op_assignment_info()
             .map(|(_, _, op_assign, op_assign_str, op, op_str)| {
-                let entry = AssignOp {
-                    op_assign: op_assign.clone(),
-                    op_assign_name: self.push_name(op_assign_str.into()),
-                    op: op.clone(),
-                    op_name: self.push_name(op_str.into()),
-                };
+                let entry = AssignOp::new(
+                    op_assign.clone(),
+                    self.push_name(op_assign_str.into()),
+                    op.clone(),
+                    self.push_name(op_str.into()),
+                );
                 self.push_assign_op(entry)
             })
     }

@@ -176,12 +176,13 @@ pub(super) fn read(bytes: &[u8]) -> Result<Program<'_>, ReadError> {
 
     let mut assign_ops = Vec::new();
     for _ in 0..cursor.uvarint()? {
-        assign_ops.push(AssignOp {
-            op_assign: get_token(&mut cursor)?,
-            op_assign_name: cursor.index()?,
-            op: get_token(&mut cursor)?,
-            op_name: cursor.index()?,
-        });
+        // Field order is the wire order; `AssignOp::new` derives the kind
+        // rather than reading one, so the record is what it always was.
+        let op_assign = get_token(&mut cursor)?;
+        let op_assign_name = cursor.index()?;
+        let op = get_token(&mut cursor)?;
+        let op_name = cursor.index()?;
+        assign_ops.push(AssignOp::new(op_assign, op_assign_name, op, op_name));
     }
 
     let mut chains = Vec::new();

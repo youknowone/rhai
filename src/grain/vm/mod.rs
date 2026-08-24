@@ -11,9 +11,11 @@ use std::prelude::v1::*;
 #[cfg(not(all(feature = "no_index", feature = "no_object")))]
 use crate::eval::calc_data_sizes;
 use crate::eval::{Caches, GlobalRuntimeState};
+use crate::func::native::FnBuiltin;
 use crate::func::{get_builtin_binary_op_fn, get_builtin_op_assignment_fn};
 use crate::packages::string_basic::print_with_func;
-use crate::types::dynamic::{AccessMode, DynamicWriteLock};
+use crate::tokenizer::Token;
+use crate::types::dynamic::{AccessMode, DynamicWriteLock, Union};
 use crate::types::fn_ptr::FnPtrType;
 use crate::types::StringsInterner;
 // `Variant` is only re-exported from the crate root under `internals`, so it
@@ -27,12 +29,15 @@ use crate::Map;
 use crate::{types::dynamic::Variant, CallFnOptions};
 use crate::{
     Dynamic, Engine, EvalAltResult, EvalContext, FnArgsVec, FnPtr, ImmutableString,
-    NativeCallContext, Position, Scope, FUNC_TO_STRING, INT,
+    NativeCallContext, Position, RhaiResultOf, Scope, FUNC_TO_STRING, INT,
 };
 
+mod arith;
 mod callback;
 
-use crate::grain::bytecode::{code, AssignOp, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail};
+use crate::grain::bytecode::{
+    code, AssignOp, BinOpKind, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail,
+};
 use crate::grain::program::{Program, SharedModule, SharedProgram};
 
 /// Rhai's own `RhaiResult`, which it does not re-export.
@@ -135,6 +140,172 @@ fn positioned(err: Box<EvalAltResult>, pos: Position) -> Box<EvalAltResult> {
 /// (`func/call.rs:1798`). The VM's own fast path skips it for the same reason.
 fn dispatch_failure(err: Box<EvalAltResult>, pos: Position) -> Box<EvalAltResult> {
     positioned(err, pos)
+}
+
+/// How many operator sites the memo below holds at once.
+///
+/// Direct-mapped and small on purpose. A memo is worth having because a site
+/// that ran once will almost certainly run again with the same operand types,
+/// not because a chunk's operators are numerous — and a table big enough to
+/// hold all of them would cost more to clear per frame than it saves.
+const OPERATOR_MEMO_SLOTS: usize = 16;
+
+/// What an operator site resolved to, the last time it ran.
+///
+/// The point is [`get_builtin_binary_op_fn`], which walks `(&x.0, &y.0, op)`
+/// and then the operator token to hand back a function pointer. That walk
+/// answers the same thing every time a site sees the same pair of operand
+/// types, and a monomorphic site is the common one — so it is done once and
+/// remembered against the instruction's own address.
+///
+/// [`Op::BinOp`](crate::grain::bytecode::Op::BinOp) is what removed the
+/// *integer* sites from this population: they never reach a resolution at all.
+/// What is left is strings, characters, booleans, float comparisons and the
+/// mixed pairs, which is exactly what this exists for.
+#[derive(Clone, Copy)]
+struct OperatorMemo {
+    /// Which frame wrote it. See [`Vm::operator_generation`].
+    generation: u64,
+    /// The instruction's own address, within the program that frame is running.
+    at: u32,
+    /// The operand pair it was resolved against, as [`type_code`] answers.
+    /// Never zero in a live entry: a zero byte is what says "do not memoise".
+    operands: u16,
+    /// What the resolution said — including that there was no built-in, which
+    /// is worth remembering for the same reason the positive answer is.
+    resolved: Option<FnBuiltin>,
+}
+
+impl OperatorMemo {
+    /// An entry no lookup can hit: generation zero is what a frame never has,
+    /// because [`Vm::operator_generation`] is incremented before it is read.
+    const EMPTY: Self = Self {
+        generation: 0,
+        at: 0,
+        operands: 0,
+        resolved: None,
+    };
+}
+
+/// Which of `Union`'s arms a value is, or zero for the two that do not decide
+/// a resolution by themselves.
+///
+/// [`get_builtin_binary_op_fn`] dispatches on the arm for every pair it names,
+/// and on `Dynamic::type_id` for the rest. Those agree — the arm fixes the
+/// type — for every arm but two: a trait object's type is the boxed value's,
+/// and a shared cell's is whatever is inside the lock. Neither may be
+/// memoised against a discriminant, so neither gets a code.
+#[inline]
+#[must_use]
+fn type_code(value: &Dynamic) -> u8 {
+    match value.0 {
+        Union::Unit(..) => 1,
+        Union::Bool(..) => 2,
+        Union::Str(..) => 3,
+        Union::Char(..) => 4,
+        Union::Int(..) => 5,
+        #[cfg(not(feature = "no_float"))]
+        Union::Float(..) => 6,
+        #[cfg(feature = "decimal")]
+        Union::Decimal(..) => 7,
+        #[cfg(not(feature = "no_index"))]
+        Union::Array(..) => 8,
+        #[cfg(not(feature = "no_index"))]
+        Union::Blob(..) => 9,
+        #[cfg(not(feature = "no_object"))]
+        Union::Map(..) => 10,
+        Union::FnPtr(..) => 11,
+        #[cfg(not(feature = "no_time"))]
+        Union::TimeStamp(..) => 12,
+        _ => 0,
+    }
+}
+
+/// The built-in for this operator and this operand pair, from the memo if it
+/// is there and from Rhai if it is not.
+///
+/// A free function rather than a method because the operands are borrowed out
+/// of `Vm::stack` and the memo is a different field of the same `Vm`.
+#[inline]
+fn resolve_operator(
+    memo: &mut [OperatorMemo; OPERATOR_MEMO_SLOTS],
+    generation: u64,
+    at: usize,
+    token: &Token,
+    lhs: &Dynamic,
+    rhs: &Dynamic,
+) -> Option<FnBuiltin> {
+    let operands = (u16::from(type_code(lhs)) << 8) | u16::from(type_code(rhs));
+
+    // One of the two arms whose answer is not its discriminant. Resolve it and
+    // remember nothing, which is what keeps the memo from ever being consulted
+    // for a value whose type it cannot see.
+    if operands & 0x00ff == 0 || operands & 0xff00 == 0 {
+        return get_builtin_binary_op_fn(token, lhs, rhs);
+    }
+
+    let slot = &mut memo[at & (OPERATOR_MEMO_SLOTS - 1)];
+    if slot.generation == generation && slot.at as usize == at && slot.operands == operands {
+        return slot.resolved;
+    }
+
+    let resolved = get_builtin_binary_op_fn(token, lhs, rhs);
+    *slot = OperatorMemo {
+        generation,
+        at: at as u32,
+        operands,
+        resolved,
+    };
+    resolved
+}
+
+/// The operator applied to the operands themselves, for the pairs the dispatch
+/// loop runs without resolving anything.
+///
+/// `None` is not a refusal — it is "this pair is not one of them", and the
+/// caller goes on to do exactly what it would have done without this. So the
+/// arms here decide speed and the arms missing from here decide nothing.
+///
+/// The integer pair is tested first because it has to be: the float rules
+/// cover float/int and int/float but never int/int, and widening two integers
+/// would answer a question Rhai answers with integer arithmetic.
+#[inline]
+fn apply_binary(kind: BinOpKind, lhs: &Dynamic, rhs: &Dynamic) -> Option<RhaiResultOf<Dynamic>> {
+    if let (Union::Int(x, ..), Union::Int(y, ..)) = (&lhs.0, &rhs.0) {
+        return arith::int_binary(kind, *x, *y);
+    }
+
+    #[cfg(not(feature = "no_float"))]
+    if let (Some((x, x_is_float)), Some((y, y_is_float))) =
+        (arith::as_float_operand(lhs), arith::as_float_operand(rhs))
+    {
+        if x_is_float || y_is_float {
+            return arith::float_binary(kind, x, y).map(Ok);
+        }
+    }
+
+    None
+}
+
+/// The same for `x op= y`, applied in place.
+///
+/// The pairs are the op-assignment table's rather than the operator table's,
+/// and they are not the same set: `f += 1` is there and `i += 1.5` is not —
+/// an integer target with a float operand has no built-in op-assignment and
+/// expands into `i = i + 1.5`, which is a different answer and Rhai's.
+#[inline]
+fn apply_assign(kind: BinOpKind, target: &mut Dynamic, rhs: &Dynamic) -> Option<RhaiResultOf<()>> {
+    match (&mut target.0, &rhs.0) {
+        (Union::Int(x, ..), Union::Int(y, ..)) => arith::int_assign(kind, x, *y),
+        #[cfg(not(feature = "no_float"))]
+        (Union::Float(x, ..), Union::Float(y, ..)) => arith::float_assign(kind, x, **y).map(Ok),
+        #[cfg(not(feature = "no_float"))]
+        #[allow(clippy::cast_precision_loss)]
+        (Union::Float(x, ..), Union::Int(y, ..)) => {
+            arith::float_assign(kind, x, *y as crate::FLOAT).map(Ok)
+        }
+        _ => None,
+    }
 }
 
 /// A scope entry, addressed the way whatever wants it was written.
@@ -401,6 +572,20 @@ pub struct Vm<'e> {
     ///
     /// Set by [`Vm::run_chain`], taken by the next [`Vm::record_fault`].
     pending_slot: Option<u32>,
+    /// What each operator site last resolved to. See [`OperatorMemo`].
+    operator_memo: [OperatorMemo; OPERATOR_MEMO_SLOTS],
+    /// A number identifying the frame currently running.
+    ///
+    /// Incremented on entry to [`Vm::run_frame`] and read into a local, so an
+    /// entry the memo holds belongs to exactly one frame and no other. That is
+    /// what makes an address safe to key on: two frames can be at the same
+    /// address in two different programs, and a nested call can evict a slot
+    /// its caller wrote — but neither can be mistaken for a hit, because the
+    /// generation never repeats.
+    ///
+    /// Clearing the table would do the same job and would cost every call the
+    /// memset. A counter costs an increment.
+    operator_generation: u64,
     /// Steps waiting for the statement that asked for them to end.
     ///
     /// Rhai keeps this in a `defer` per AST node (`eval/stmt.rs:271`): a `next`
@@ -489,6 +674,8 @@ impl<'e> Vm<'e> {
             owns_trace: true,
             chain_step: 0,
             pending_slot: None,
+            operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
+            operator_generation: 0,
             #[cfg(feature = "debugging")]
             pending_steps: Vec::new(),
         }
@@ -534,6 +721,10 @@ impl<'e> Vm<'e> {
             owns_trace: false,
             chain_step: 0,
             pending_slot: None,
+            // A memo names an address in a frame of this `Vm`, and a crossing
+            // has none yet.
+            operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
+            operator_generation: 0,
             // A step belongs to the statement that asked for it, and that
             // statement is running in the `Vm` this crossing came from.
             #[cfg(feature = "debugging")]
@@ -1849,6 +2040,28 @@ impl<'e> Vm<'e> {
         if !self.engine.fast_operators() {
             return None;
         }
+
+        // `AssignOp::kind` is the `+=` token already decoded, pooled beside the
+        // token itself. An integer target and an integer operand reach the
+        // integer add from here with no resolution at all — no token match, no
+        // walk over the operand pair, no indirect call over
+        // `&mut [&mut Dynamic]`, and no downcast on the far side of it.
+        //
+        // A pair with no entry answers `None` and falls through to the
+        // resolution below, which answers what it always did. The set of pairs
+        // is the op-assignment table's, not the operator table's — see
+        // `apply_assign`.
+        if let Some(kind) = op.kind {
+            if let Some(done) = apply_assign(kind, target, rhs) {
+                return Some(done.map_err(|mut err| {
+                    if err.position().is_none() {
+                        err.set_position(pos());
+                    }
+                    err
+                }));
+            }
+        }
+
         let (func, need_context) = get_builtin_op_assignment_fn(&op.op_assign, target, rhs)?;
         let context = need_context.then(|| (self.engine, "", None, &self.global, pos()).into());
         Some(
@@ -3406,6 +3619,11 @@ impl<'e> Vm<'e> {
         }
 
         let code = program.code();
+        // What this frame's operator memo entries are stamped with. Nothing
+        // else can carry it, so nothing else can be read back. See
+        // [`Vm::operator_generation`].
+        self.operator_generation = self.operator_generation.wrapping_add(1);
+        let generation = self.operator_generation;
         // The chunk's entry the first time round, a catch block's address when
         // resumed after one.
         let mut pc = start;
@@ -3787,14 +4005,64 @@ impl<'e> Vm<'e> {
                     }
                 }
 
-                code::tag::CALL | code::tag::CALL_CAPTURE | code::tag::CALL_OP => {
+                code::tag::CALL
+                | code::tag::CALL_CAPTURE
+                | code::tag::CALL_OP
+                | code::tag::BIN_OP => {
+                    // The typed operator, ahead of every pool read: an
+                    // instruction that runs here touches its own bytes, the top
+                    // two operands and nothing else.
+                    //
+                    // Gated on `fast_operators()` for the reason the built-in
+                    // short-circuit below is, and it is the same gate: with it
+                    // off, Rhai dispatches a binary operator on a primitive
+                    // and so must this (`func/call.rs:1775-1799`).
+                    //
+                    // A pair this cannot run — a string, a custom type, a
+                    // shared cell — falls through into the dispatch below and
+                    // is answered by it. See
+                    // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
+                    if tag == code::tag::BIN_OP && self.engine.fast_operators() {
+                        let top = self.stack.len();
+                        let under = top.checked_sub(2).ok_or_else(|| {
+                            malformed("operator with too few operands".to_string())
+                        })?;
+                        // An unknown kind byte is not an error here: the
+                        // dispatch below reads the operator out of the pool
+                        // and answers whatever it answers, which is what a
+                        // verified program's byte can never make it do.
+                        if let Some(kind) = BinOpKind::from_byte(code[pc + 3]) {
+                            let applied = {
+                                let (lhs, rhs) = self.stack.split_at(top - 1);
+                                apply_binary(kind, &lhs[under], &rhs[0])
+                            };
+                            if let Some(value) = applied {
+                                // No position stamped on the way out: under
+                                // `fast_operators` Rhai returns a built-in's
+                                // error untouched, which is why `1 / 0` has
+                                // none. See `dispatch_failure`.
+                                let value = value?;
+                                self.stack.truncate(under);
+                                self.stack.push(value);
+                                pc += width;
+                                continue;
+                            }
+                        }
+                    }
+
                     let name_index = u32::from(small(1)?);
                     let name = program
                         .name(name_index)
                         .ok_or_else(|| malformed(format!("no name {name_index}")))?;
                     let capture = tag == code::tag::CALL_CAPTURE;
-                    let argc = code[pc + 3] as usize;
-                    let op = if tag == code::tag::CALL_OP {
+                    // The kind byte sits where an argument count would, because
+                    // an operator's count is always two.
+                    let argc = if tag == code::tag::BIN_OP {
+                        2
+                    } else {
+                        code[pc + 3] as usize
+                    };
+                    let op = if tag == code::tag::CALL_OP || tag == code::tag::BIN_OP {
                         let index = u32::from(small(4)?);
                         Some(
                             program
@@ -3819,6 +4087,7 @@ impl<'e> Vm<'e> {
                     // on a primitive, which Rhai's fast path also bypasses
                     // (`func/call.rs:1775-1799`).
                     if let (Some(token), 2, true) = (op, argc, self.engine.fast_operators()) {
+                        let memo = &mut self.operator_memo;
                         let (lhs, rhs) = self.stack.split_at_mut(first + 1);
                         let lhs = &mut lhs[first];
                         let rhs = &mut rhs[0];
@@ -3826,7 +4095,7 @@ impl<'e> Vm<'e> {
                         // Custom types go to dispatch first, so a registered
                         // function still wins for them.
                         let builtin = (!lhs.is_variant() && !rhs.is_variant())
-                            .then(|| get_builtin_binary_op_fn(token, lhs, rhs))
+                            .then(|| resolve_operator(memo, generation, pc, token, lhs, rhs))
                             .flatten();
                         if let Some((func, need_context)) = builtin {
                             let context = need_context

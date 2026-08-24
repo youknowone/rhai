@@ -1,5 +1,5 @@
 use crate::grain::bytecode::code::{self, tag};
-use crate::grain::bytecode::{Chain, Chunk, Op, Receiver, Root, Step, Switch, Tail};
+use crate::grain::bytecode::{BinOpKind, Chain, Chunk, Op, Receiver, Root, Step, Switch, Tail};
 use crate::grain::format::Caps;
 use crate::grain::program::Function;
 #[cfg(feature = "no_std")]
@@ -476,6 +476,7 @@ fn required_caps(op: &Op, pools: &Pools) -> Caps {
         | Op::PopHandler
         | Op::SkipIfNotUnit { .. }
         | Op::Call { .. }
+        | Op::BinOp { .. }
         | Op::Rotate(..)
         | Op::CheckSize { .. }
         | Op::InterpolateStart
@@ -566,6 +567,10 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
 
         // Arguments in, result out.
         Op::Call { argc, .. } => (*argc as usize, *argc as usize, 1),
+
+        // The same, with the count fixed: an operator takes two operands
+        // whichever way the instruction ends up running.
+        Op::BinOp { .. } => (2, 2, 1),
 
         // A named receiver's value is argument zero like any other, and so is
         // `this` — which is pushed first rather than last, but the depth is the
@@ -659,6 +664,21 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         }
         tag::CALL_OP => {
             bounded(index(1), "name", pools.names)?;
+            bounded(index(4), "operator", pools.tokens)
+        }
+        // The kind byte is checked here rather than only where the instruction
+        // decodes, because this pass walks every instruction and the reachable
+        // walk does not — and because the VM dispatches on the byte itself.
+        tag::BIN_OP => {
+            bounded(index(1), "name", pools.names)?;
+            let kind = u32::from(code[at + 3]);
+            if BinOpKind::from_byte(code[at + 3]).is_none() {
+                return Err(VerifyError::BadIndex {
+                    at,
+                    what: "operator kind",
+                    index: kind,
+                });
+            }
             bounded(index(4), "operator", pools.tokens)
         }
         tag::ASSIGN_LOCAL => bounded(index(3), "name", pools.names),

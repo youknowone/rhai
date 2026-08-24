@@ -161,7 +161,23 @@ pub fn applies_to_this_build(name: &str) -> bool {
     // Rhai's own built-in rather than raising — there is no behaviour left for
     // the two sides to agree on, and the case would take the process with it.
     #[cfg(feature = "unchecked")]
-    if matches!(name, "error_divide_by_zero" | "error_temp_root_index_runs_first") {
+    if matches!(
+        name,
+        "error_divide_by_zero"
+            | "error_temp_root_index_runs_first"
+            // The guards are what these cases are, and `unchecked` removes
+            // them: the operator overflows or shifts past the width in Rust
+            // rather than raising, which is a panic in a test build and not a
+            // behaviour two sides could agree on.
+            | "error_int_add_overflow"
+            | "error_int_multiply_overflow"
+            | "error_int_modulo_by_zero"
+            | "error_int_power_negative"
+            | "error_op_assign_int_power_negative"
+            | "int_shift_edges"
+            | "int_op_assign_every_form"
+            | "int_operator_every_form"
+    ) {
         return false;
     }
     // No shared prefix to key on: a float literal is incidental to most of
@@ -169,7 +185,17 @@ pub fn applies_to_this_build(name: &str) -> bool {
     #[cfg(feature = "no_float")]
     if matches!(
         name,
-        "float_arithmetic" | "mixed_numeric" | "interpolation_of_every_type" | "switch_float_in_range" | "error_operator_undefined_for_types" | "error_op_assign_undefined_for_types"
+        "float_arithmetic"
+            | "mixed_numeric"
+            | "interpolation_of_every_type"
+            | "switch_float_in_range"
+            | "error_operator_undefined_for_types"
+            | "error_op_assign_undefined_for_types"
+            | "float_op_assign_every_form"
+            | "float_int_mixed_operators"
+            | "float_int_mixed_op_assign"
+            | "int_float_mixed_op_assign"
+            | "int_float_comparisons"
     ) {
         return false;
     }
@@ -375,6 +401,25 @@ pub const CASES: &[Case] = &[
     case("decimal_arithmetic", "let a = parse_decimal(\"42\"); let b = 1; a + b"),
     case("comparison_chain", "let a = 5; a > 1 && a < 10 || a == 5"),
     case("bitwise", "let a = 0b1010; (a & 0b0110) | (a ^ 0b1111) << 2"),
+    // Every integer operator that has a built-in, in both spellings. The VM
+    // runs these without resolving a function, so each one is a place the two
+    // sides can disagree about what the operator means.
+    case("int_operator_every_form", "let a = 7; let b = 3; ((a + b) - (a - b)) * (a * b) / (a / b) % (a % b) + (a ** 2) + (a << b) + (a >> 1) + (a & b) + (a | b) + (a ^ b)"),
+    case("int_op_assign_every_form", "let a = 1234; a += 7; a -= 3; a *= 5; a /= 2; a %= 97; a **= 2; a <<= 3; a >>= 1; a &= 0xff; a |= 0x30; a ^= 0x0f; a"),
+    case("int_comparison_every_form", "let a = 3; let b = 4; (a == b) == false && (a != b) && (a < b) && (a <= b) && (a > b) == false && (a >= b) == false"),
+    // Shifts by a negative and by more than the width, which the checked
+    // built-in defines rather than leaving to the hardware.
+    case("int_shift_edges", "let a = 1; let b = -3; (a << b) + (a >> b) + (a << 100) + (a >> 100)"),
+    // The float arms, and the mixed pairs the float rules cover but the
+    // op-assignment table does not: `f += 1` is a built-in and `i += 1.5` is
+    // not, so the second falls back to `i = i + 1.5` and changes the local's
+    // type. A typed opcode that treated the two alike would be wrong here and
+    // nowhere else.
+    case("float_op_assign_every_form", "let f = 1.5; f += 2.0; f -= 0.25; f *= 3.0; f /= 1.5; f %= 2.0; f **= 2.0; f"),
+    case("float_int_mixed_operators", "let f = 1.5; let i = 2; (f + i) * (i + f) - (f - i) / (i - f)"),
+    case("float_int_mixed_op_assign", "let f = 1.5; f += 2; f *= 3; f -= 1; f"),
+    case("int_float_mixed_op_assign", "let i = 1; i += 1.5; i"),
+    case("int_float_comparisons", "let i = 1; let f = 1.0; (i == f) && (f >= i) && (i < 2.0) && (2.5 > i)"),
     case("string_ops", r#"let s = "hello"; s + " " + "world" + s.len"#),
     case("string_interpolation", r#"let n = 42; `answer is ${n} and ${n * 2}`"#),
     // Every segment type goes through a different arm of Rhai's rendering:
@@ -680,6 +725,16 @@ pub const CASES: &[Case] = &[
     // reaches `ErrorFunctionNotFound` through a named call elsewhere, which is
     // a different dispatch path and positions itself differently.
     case("error_operator_undefined_for_types", "let a = 1.0; a + #{ b: 1 }"),
+    // The arithmetic guards, which are the reason an integer operator is a
+    // fallible one — and which `unchecked` removes, so these do not run there.
+    // Every one of them reports `ErrorArithmetic` with no position at all,
+    // because a built-in operator's error comes back untouched under
+    // `fast_operators` (`func/call.rs:1798`).
+    case("error_int_add_overflow", "let a = 1; let n = 0; while n < 200 { a += a; n += 1; } a"),
+    case("error_int_multiply_overflow", "let a = 3; let n = 0; while n < 64 { a = a * a; n += 1; } a"),
+    case("error_int_modulo_by_zero", "let z = 0; 7 % z"),
+    case("error_int_power_negative", "let a = 2; let b = -1; a ** b"),
+    case("error_op_assign_int_power_negative", "let a = 2; let b = -1; a **= b; a"),
     // A chain step that fails, one per kind. Rhai blames the step rather than
     // the chain, and a chain is one instruction with one position-table entry,
     // so these are what make each step carry its own.
