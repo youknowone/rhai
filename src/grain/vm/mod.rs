@@ -3916,9 +3916,7 @@ impl<'e> Vm<'e> {
                     // every holder. `store` is the same path a chain's tail
                     // and a named assignment take, so `x op= y` resolves
                     // identically wherever the target lives.
-                    let name = program
-                        .name(var_name)
-                        .ok_or_else(|| malformed(format!("no name {var_name}")))?;
+                    //
                     // The guard is only needed for a cell a closure captured,
                     // and `x += 1` in a loop is the hot path — so the check
                     // for one is a discriminant test rather than the downcast
@@ -3946,6 +3944,15 @@ impl<'e> Vm<'e> {
                         continue;
                     }
 
+                    // The name is only ever read from here: `place` puts it in
+                    // the `ErrorDataRace` a contended cell raises. Resolving it
+                    // above would put a pool read in front of every `x += 1`
+                    // for the sake of a branch almost nothing takes, and the
+                    // verifier has already bounded the index (`check_indices`),
+                    // so nothing is being checked later that was checked before.
+                    let name = program
+                        .name(var_name)
+                        .ok_or_else(|| malformed(format!("no name {var_name}")))?;
                     let mut target = place(entry, name, pos())?;
                     self.store(program, op, &mut target, rhs, pos())?;
                 }
