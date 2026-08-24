@@ -649,11 +649,30 @@ pub struct Module {
     /// Default to 8 bytes (64 slots) which should be enough for dynamic functions in a module.
     dynamic_functions_filter: BloomFilterU64<8>,
     /// Iterator functions, keyed by the type producing the iterator.
-    type_iterators: BTreeMap<TypeId, Shared<FnIterator>>,
+    type_iterators: BTreeMap<TypeId, TypeIterator>,
     /// Flattened collection of iterator functions, including those in sub-modules.
-    all_type_iterators: BTreeMap<TypeId, Shared<FnIterator>>,
+    all_type_iterators: BTreeMap<TypeId, TypeIterator>,
     /// Flags.
     flags: ModuleFlags,
+}
+
+/// A registered type iterator, and whether it walks the type the way the type
+/// itself does.
+///
+/// `natural` is set by [`Module::set_iterable`] and [`Module::set_iterator`],
+/// which build the sequence out of the type's own [`IntoIterator`]/[`Iterator`]
+/// and wrap each item with `Dynamic::from`. It is not set by
+/// [`Module::set_iter`] or [`Module::set_iter_result`], whose closure can
+/// produce anything at all.
+///
+/// It is there so that a consumer which already knows what a type iterates can
+/// walk it directly instead of calling through a `Box<dyn Iterator>` — and can
+/// tell when it must not, because something registered its own meaning for the
+/// type. The grain VM does this for an exclusive integer range.
+#[derive(Clone)]
+pub(crate) struct TypeIterator {
+    func: Shared<FnIterator>,
+    natural: bool,
 }
 
 impl Default for Module {
@@ -2479,7 +2498,7 @@ impl Module {
             path: &mut Vec<&'a str>,
             variables: &mut StraightHashMap<Dynamic>,
             functions: &mut StraightHashMap<RhaiFunc>,
-            type_iterators: &mut BTreeMap<TypeId, Shared<FnIterator>>,
+            type_iterators: &mut BTreeMap<TypeId, TypeIterator>,
         ) -> bool {
             let mut contains_indexed_global_functions = false;
 
@@ -2646,11 +2665,26 @@ impl Module {
         type_id: TypeId,
         func: impl Fn(Dynamic) -> Box<dyn Iterator<Item = RhaiResultOf<Dynamic>>> + SendSync + 'static,
     ) -> &mut Self {
-        let func = Shared::new(func);
+        self.set_iter_entry(type_id, func, false)
+    }
+
+    /// Set a type iterator into the [`Module`], saying whether it is the
+    /// type's own iteration. Every other setter funnels through here.
+    #[inline]
+    fn set_iter_entry(
+        &mut self,
+        type_id: TypeId,
+        func: impl Fn(Dynamic) -> Box<dyn Iterator<Item = RhaiResultOf<Dynamic>>> + SendSync + 'static,
+        natural: bool,
+    ) -> &mut Self {
+        let entry = TypeIterator {
+            func: Shared::new(func),
+            natural,
+        };
         if self.is_indexed() {
-            self.all_type_iterators.insert(type_id, func.clone());
+            self.all_type_iterators.insert(type_id, entry.clone());
         }
-        self.type_iterators.insert(type_id, func);
+        self.type_iterators.insert(type_id, entry);
         self
     }
 
@@ -2661,9 +2695,11 @@ impl Module {
         T: Variant + Clone + IntoIterator,
         <T as IntoIterator>::Item: Variant + Clone,
     {
-        self.set_iter(TypeId::of::<T>(), |obj: Dynamic| {
-            Box::new(obj.cast::<T>().into_iter().map(Dynamic::from))
-        })
+        self.set_iter_entry(
+            TypeId::of::<T>(),
+            |obj: Dynamic| Box::new(obj.cast::<T>().into_iter().map(Dynamic::from).map(Ok)),
+            true,
+        )
     }
 
     /// Set a fallible type iterator into the [`Module`].
@@ -2685,9 +2721,11 @@ impl Module {
         T: Variant + Clone + Iterator,
         <T as Iterator>::Item: Variant + Clone,
     {
-        self.set_iter(TypeId::of::<T>(), |obj: Dynamic| {
-            Box::new(obj.cast::<T>().map(Dynamic::from))
-        })
+        self.set_iter_entry(
+            TypeId::of::<T>(),
+            |obj: Dynamic| Box::new(obj.cast::<T>().map(Dynamic::from).map(Ok)),
+            true,
+        )
     }
 
     /// Set a iterator type into the [`Module`] as a fallible type iterator.
@@ -2707,14 +2745,31 @@ impl Module {
     #[inline]
     #[must_use]
     pub(crate) fn get_qualified_iter(&self, id: TypeId) -> Option<&FnIterator> {
-        self.all_type_iterators.get(&id).map(|f| &**f)
+        self.all_type_iterators.get(&id).map(|e| &*e.func)
+    }
+
+    /// Whether this module's qualified iterator for a type is the type's own
+    /// iteration — `None` when it has none, so a search can tell "no entry"
+    /// from "an entry that does something else".
+    #[cfg(not(feature = "no_module"))]
+    #[cfg(feature = "grain")]
+    pub(crate) fn qualified_iter_is_natural(&self, id: TypeId) -> Option<bool> {
+        self.all_type_iterators.get(&id).map(|e| e.natural)
     }
 
     /// Get the specified type iterator.
     #[inline]
     #[must_use]
     pub(crate) fn get_iter(&self, id: TypeId) -> Option<&FnIterator> {
-        self.type_iterators.get(&id).map(|f| &**f)
+        self.type_iterators.get(&id).map(|e| &*e.func)
+    }
+
+    /// Whether this module's iterator for a type is the type's own iteration —
+    /// `None` when it has none, so a search can tell "no entry" from "an entry
+    /// that does something else".
+    #[cfg(feature = "grain")]
+    pub(crate) fn iter_is_natural(&self, id: TypeId) -> Option<bool> {
+        self.type_iterators.get(&id).map(|e| e.natural)
     }
 }
 

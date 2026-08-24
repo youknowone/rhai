@@ -1,3 +1,4 @@
+use core::any::TypeId;
 use core::mem;
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
@@ -436,9 +437,46 @@ fn chain_op<'p>(
 /// enough to wrap the counter is an error rather than a wrap
 /// (`eval/stmt.rs:729`).
 struct Iteration {
-    items: Box<dyn Iterator<Item = VmResult>>,
+    items: Items,
     /// The index of the item last handed out, starting one below the first.
     count: INT,
+}
+
+/// What a running `for` loop pulls its items from.
+///
+/// Almost always the iterator the registry handed over, which is a
+/// `Box<dyn Iterator>`: one heap allocation and a registry search to build, and
+/// one indirect call per turn. `for i in 0..n` is common enough for the
+/// exclusive integer range to walk itself instead — but only when nothing has
+/// registered its own meaning for the type. See [`Vm::iter_init`].
+enum Items {
+    /// An exclusive integer range, walked in place.
+    IntRange {
+        /// The next value to hand out; at or past `end` when exhausted.
+        next: INT,
+        end: INT,
+    },
+    /// Whatever the registry built.
+    Boxed(Box<dyn Iterator<Item = VmResult>>),
+}
+
+impl Items {
+    #[inline]
+    fn next(&mut self) -> Option<VmResult> {
+        match self {
+            // `next < end` before the increment, so the increment cannot
+            // overflow however close `end` is to `INT::MAX`.
+            Self::IntRange { next, end } => {
+                if *next >= *end {
+                    return None;
+                }
+                let value = *next;
+                *next += 1;
+                Some(Ok(Dynamic::from_int(value)))
+            }
+            Self::Boxed(items) => items.next(),
+        }
+    }
 }
 
 /// A scope entry as a place to write, seeing through a shared cell.
@@ -2529,6 +2567,24 @@ impl<'e> Vm<'e> {
         let iterable = iterable.flatten();
         let type_id = iterable.type_id();
 
+        // An exclusive integer range walks itself, but only if the entry the
+        // search below would have found is the type's own iteration — anything
+        // registered through `Module::set_iter` decides what the type means and
+        // has to be called. Asked once per loop, and only for a range.
+        if type_id == TypeId::of::<crate::ExclusiveRange>() && self.int_range_is_natural() {
+            let range = iterable
+                .try_cast::<crate::ExclusiveRange>()
+                .expect("the type id says it is an exclusive range");
+            self.iterators.push(Iteration {
+                items: Items::IntRange {
+                    next: range.start,
+                    end: range.end,
+                },
+                count: -1,
+            });
+            return Ok(());
+        }
+
         let func = self
             .engine
             .global_modules
@@ -2548,10 +2604,39 @@ impl<'e> Vm<'e> {
         let func = func.ok_or_else(|| Box::new(EvalAltResult::ErrorFor(pos)))?;
 
         self.iterators.push(Iteration {
-            items: func(iterable),
+            items: Items::Boxed(func(iterable)),
             count: -1,
         });
         Ok(())
+    }
+
+    /// Does the exclusive integer range still iterate the way its own
+    /// [`Iterator`] does?
+    ///
+    /// The same three places [`Vm::iter_init`] searches, in the same order,
+    /// stopping at the first that has an entry rather than the first that has a
+    /// natural one — a registration shadowing the built-in one is exactly the
+    /// case this has to say no to.
+    fn int_range_is_natural(&self) -> bool {
+        let type_id = TypeId::of::<crate::ExclusiveRange>();
+
+        let natural = self
+            .engine
+            .global_modules
+            .iter()
+            .find_map(|module| module.iter_is_natural(type_id));
+
+        #[cfg(not(feature = "no_module"))]
+        let natural = natural
+            .or_else(|| self.global.iter_is_natural(type_id))
+            .or_else(|| {
+                self.engine
+                    .global_sub_modules
+                    .values()
+                    .find_map(|module| module.qualified_iter_is_natural(type_id))
+            });
+
+        natural == Some(true)
     }
 
     /// Called only by [`call_syntactic_or_stacked`] after it has checked for a

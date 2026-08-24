@@ -274,6 +274,22 @@ impl GlobalRuntimeState {
             .rev()
             .find_map(|m| m.get_qualified_iter(id))
     }
+    /// Whether the iterator [`Self::get_iter`] would find is the type's own
+    /// iteration — `None` when there is none, so a search can tell "no entry"
+    /// from "an entry that does something else".
+    ///
+    /// Same traversal as [`Self::get_iter`], so the two always answer about the
+    /// same entry.
+    #[cfg(not(feature = "no_module"))]
+    #[cfg(feature = "grain")]
+    #[inline]
+    #[must_use]
+    pub fn iter_is_natural(&self, id: std::any::TypeId) -> Option<bool> {
+        self.modules
+            .iter()
+            .rev()
+            .find_map(|m| m.qualified_iter_is_natural(id))
+    }
     /// Get the current source.
     #[inline(always)]
     #[must_use]

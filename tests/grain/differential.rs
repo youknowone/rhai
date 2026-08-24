@@ -348,3 +348,54 @@ fn a_typed_operator_feeding_a_branch_agrees_with_rhai() {
         assert_eq!(run_stock(&engine, source), run_vm(&engine, source), "the VM disagreed with Rhai on `{source}`",);
     }
 }
+
+/// A `for` over an exclusive integer range walks itself, but only while nothing
+/// has said the type means something else.
+///
+/// `Module::set_iterable` and `Module::set_iterator` build the sequence out of
+/// the type's own `Iterator`, and the VM is allowed to walk that in place;
+/// `Module::set_iter` takes a closure that can do anything, and the VM has to
+/// call it. Both halves are asserted, and the second is what stops the first
+/// being vacuous: the custom iterator here answers something no range does.
+#[test]
+fn an_integer_range_is_walked_in_place_only_while_that_is_what_it_means() {
+    use std::any::TypeId;
+    use std::ops::Range;
+
+    const SOURCES: &[&str] = &[
+        "let t = 0; for i in 0..5 { t += i; } t",
+        // Empty and reversed: the bounds decide, not a count.
+        "let t = 0; for i in 5..5 { t += 1; } t",
+        "let t = 0; for i in 5..0 { t += 1; } t",
+        // The counter is the loop's own, not the item's.
+        "let s = \"\"; for (x, i) in 10..13 { s += `${i}:${x} `; } s",
+        // `break` leaves the iterator behind, and the next loop must not see it.
+        "let t = 0; for i in 0..9 { if i == 4 { break; } t += i; } for i in 0..3 { t += 100; } t",
+        // Nested, so two ranges are live at once.
+        "let t = 0; for i in 0..4 { for j in 0..4 { t += i * j; } } t",
+        // An inclusive range is a different type and keeps the boxed path.
+        "let t = 0; for i in 0..=5 { t += i; } t",
+        // The loop variable outlives a closure made inside the body.
+        "let t = 0; for i in 0..3 { t += i; } t",
+    ];
+
+    let plain = corpus::engine();
+
+    // Answers no range does — every item is negated — so the two engines must
+    // disagree with each other while each agrees with Rhai.
+    let mut custom = corpus::engine();
+    let mut module = rhai::Module::new();
+    module.set_iter(TypeId::of::<Range<rhai::INT>>(), |obj: Dynamic| Box::new(obj.cast::<Range<rhai::INT>>().map(|i| Dynamic::from(-i)).collect::<Vec<_>>().into_iter()));
+    custom.register_global_module(module.into());
+
+    let mut differed = 0;
+    for source in SOURCES {
+        assert_eq!(run_stock(&plain, source), run_vm(&plain, source), "the VM disagreed with Rhai on `{source}`",);
+        assert_eq!(run_stock(&custom, source), run_vm(&custom, source), "with a registered range iterator, the VM disagreed with Rhai on `{source}`",);
+        if run_stock(&plain, source) != run_stock(&custom, source) {
+            differed += 1;
+        }
+    }
+
+    assert!(differed >= 4, "the registered iterator has to change what Rhai itself answers, or agreeing with it proves nothing (only {differed} of {} sources moved)", SOURCES.len(),);
+}
