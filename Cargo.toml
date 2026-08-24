@@ -160,6 +160,12 @@ required-features = ["grain"]
 name = "grain_dump"
 required-features = ["grain"]
 
+# Per-iteration cost of the same loop bodies, in nanoseconds. Run with
+# `--release`; it has no `--check` mode and exits zero.
+[[example]]
+name = "grain_nsiter"
+required-features = ["grain"]
+
 # The grain harnesses, as one binary. `tests/mod.rs` wraps them in an inline
 # `mod grain`, which is what puts their module paths inside `tests/grain/`.
 [[test]]

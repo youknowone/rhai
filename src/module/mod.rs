@@ -672,6 +672,10 @@ pub struct Module {
 #[derive(Clone)]
 pub(crate) struct TypeIterator {
     func: Shared<FnIterator>,
+    /// Only the grain VM asks, so with that feature off the field is recorded
+    /// and never read — which is a warning rather than a reason to make the
+    /// field itself conditional and split every setter in two.
+    #[cfg_attr(not(feature = "grain"), allow(dead_code))]
     natural: bool,
 }
 
