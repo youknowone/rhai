@@ -496,6 +496,7 @@ fn required_caps(op: &Op, pools: &Pools) -> Caps {
         | Op::SkipIfNotUnit { .. }
         | Op::Call { .. }
         | Op::BinOp { .. }
+        | Op::BinOpFrom { .. }
         | Op::Rotate(..)
         | Op::CheckSize { .. }
         | Op::InterpolateStart
@@ -576,6 +577,10 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // Both halves of what it fuses are gone from the operand stack: the
         // value is read out of a slot and written into another.
         Op::AssignLocalFrom { .. } => (0, 0, 0),
+
+        // Its operands are named by the instruction, so only the result is on
+        // the stack. The dispatch fallback pushes them and takes them back.
+        Op::BinOpFrom { .. } => (0, 0, 1),
 
         Op::JumpIfFalse { .. } | Op::JumpIfTrue { .. } | Op::Switch(..) => (1, 1, 0),
 
@@ -704,6 +709,24 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
                 });
             }
             bounded(index(4), "operator", pools.tokens)
+        }
+        // The operands are a slot, which is checked against the scope when it
+        // runs, and either a second slot or a constant index.
+        tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_CONST => {
+            bounded(index(1), "name", pools.names)?;
+            let kind = u32::from(code[at + 3]);
+            if BinOpKind::from_byte(code[at + 3]).is_none() {
+                return Err(VerifyError::BadIndex {
+                    at,
+                    what: "operator kind",
+                    index: kind,
+                });
+            }
+            bounded(index(4), "operator", pools.tokens)?;
+            if code[at] == tag::BIN_OP_FROM_CONST {
+                bounded(index(8), "constant", pools.consts)?;
+            }
+            Ok(())
         }
         tag::ASSIGN_LOCAL | tag::ASSIGN_LOCAL_FROM => bounded(index(3), "name", pools.names),
         tag::ASSIGN_LOCAL_FROM_OP => {

@@ -25,7 +25,7 @@
 
 use alloc::borrow::Cow;
 
-use crate::grain::bytecode::{BinOpKind, Op, Receiver};
+use crate::grain::bytecode::{BinOpKind, BinOperand, Op, Receiver};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -200,6 +200,13 @@ pub mod tag {
     /// The same operand layout as [`ITER_NEXT`] with the destination slot
     /// after it, so the three share a dispatch arm.
     pub const ITER_NEXT_STORE: u8 = 0x4c;
+    /// [`Op::BinOpFrom`](super::Op::BinOpFrom) with both operands in slots.
+    ///
+    /// The same operand layout as [`BIN_OP`] with the two operands after it,
+    /// so all three share a dispatch arm and one fallback.
+    pub const BIN_OP_FROM_LOCAL: u8 = 0x4d;
+    /// [`Op::BinOpFrom`](super::Op::BinOpFrom) with a constant on the right.
+    pub const BIN_OP_FROM_CONST: u8 = 0x4e;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -302,6 +309,9 @@ static WIDTHS: [u8; 256] = {
     widths[tag::ITER_NEXT_STORE as usize] = 7;
 
     widths[tag::ASSIGN_LOCAL_FROM_OP as usize] = 9;
+
+    widths[tag::BIN_OP_FROM_LOCAL as usize] = 10;
+    widths[tag::BIN_OP_FROM_CONST as usize] = 10;
 
     widths
 };
@@ -742,6 +752,28 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&target(*exit)?.to_le_bytes());
             }
 
+            Op::BinOpFrom {
+                name,
+                op,
+                kind,
+                lhs,
+                rhs,
+            } => {
+                code.push(match rhs {
+                    BinOperand::Local(..) => tag::BIN_OP_FROM_LOCAL,
+                    BinOperand::Const(..) => tag::BIN_OP_FROM_CONST,
+                });
+                code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
+                code.push(*kind as u8);
+                code.extend_from_slice(&small(*op as usize, "operators")?.to_le_bytes());
+                code.extend_from_slice(&lhs.to_le_bytes());
+                let rhs = match rhs {
+                    BinOperand::Local(slot) => *slot,
+                    BinOperand::Const(index) => small(*index as usize, "constants")?,
+                };
+                code.extend_from_slice(&rhs.to_le_bytes());
+            }
+
             Op::IterNextStore { exit, slot } => {
                 code.push(tag::ITER_NEXT_STORE);
                 code.extend_from_slice(&target(*exit)?.to_le_bytes());
@@ -886,6 +918,7 @@ fn encoded_width(op: &Op) -> usize {
         | Op::AssignLocalFrom { op: None, .. }
         | Op::IterNextStore { .. } => 7,
         Op::AssignLocalFrom { op: Some(..), .. } => 9,
+        Op::BinOpFrom { .. } => 10,
     }
 }
 
@@ -1082,6 +1115,18 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             exit: u32_at(code, at + 1)?,
             indexed: true,
         },
+        tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_CONST => Op::BinOpFrom {
+            name: u32::from(small(1)?),
+            kind: BinOpKind::from_byte(code[at + 3])?,
+            op: u32::from(small(4)?),
+            lhs: small(6)?,
+            rhs: if code[at] == tag::BIN_OP_FROM_LOCAL {
+                BinOperand::Local(small(8)?)
+            } else {
+                BinOperand::Const(u32::from(small(8)?))
+            },
+        },
+
         tag::ITER_NEXT_STORE => Op::IterNextStore {
             exit: u32_at(code, at + 1)?,
             slot: small(5)?,
@@ -1271,6 +1316,20 @@ mod tests {
             Op::AssignThis { op: None },
             Op::AssignThis { op: Some(6) },
             Op::Rotate(3),
+            Op::BinOpFrom {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Add,
+                lhs: 4,
+                rhs: BinOperand::Local(5),
+            },
+            Op::BinOpFrom {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                lhs: 4,
+                rhs: BinOperand::Const(6),
+            },
             // Its exit is an instruction index here and an address after
             // assembly, like every other jump — index 0 is `Const(7)`, which
             // is at 0.

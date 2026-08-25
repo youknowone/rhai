@@ -180,6 +180,21 @@ impl AssignOp {
     }
 }
 
+/// Where a fused binary operator reads an operand.
+///
+/// The two loads in front of an operator are the commonest instruction pair
+/// there is — `i < n`, `a + b`, `n - 1` — and both of them push a value the
+/// operator takes straight off again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinOperand {
+    /// Local slot `.0`, read as [`Op::LoadLocal`] reads one: cloned out,
+    /// flattening any shared cell.
+    Local(u16),
+
+    /// Constant `.0` from the pool, read as [`Op::Const`] reads one.
+    Const(u32),
+}
+
 /// Where [`Op::CallRef`] finds the variable it calls through.
 ///
 /// The two differ in how the variable is reached, not in what happens to it:
@@ -870,6 +885,31 @@ pub enum Op {
         op: u32,
         /// Which operator this is.
         kind: BinOpKind,
+    },
+
+    /// Apply a binary operator to a local and a second operand named by the
+    /// instruction, pushing the result.
+    ///
+    /// [`Op::BinOp`] with the two loads that fed it folded in. It carries the
+    /// same `name`, `op` and `kind` and falls back to exactly the same
+    /// dispatch, because the operands are still not proven — it pushes them
+    /// and takes the [`Op::Call`] path whenever the typed arms decline.
+    ///
+    /// The left operand is always a local: an operator with a constant on the
+    /// left and something else on the right is rare enough that a tag for it
+    /// would be dead weight, and a constant on both sides is folded before
+    /// lowering ever sees it.
+    BinOpFrom {
+        /// The operator's name, for the dispatch fallback and error messages.
+        name: u32,
+        /// Index into the operator pool, for the dispatch fallback.
+        op: u32,
+        /// Which operator this is.
+        kind: BinOpKind,
+        /// The left operand's local slot.
+        lhs: u16,
+        /// Where the right operand comes from.
+        rhs: BinOperand,
     },
 
     /// End the chunk, yielding the top of the operand stack, or unit if empty.

@@ -1041,28 +1041,44 @@ fn artifact_size_census() {
 /// is not what the compiler wrote; the reader is where it stops.
 #[test]
 fn an_operator_of_no_known_kind_is_refused() {
-    let engine = Engine::new();
-    let ast = engine.compile("let a = 7; let b = 3; a * b").expect("must parse");
-    let program = Compiler::new().compile(&ast);
-    let bytes = program.write().expect("must be writable");
+    // Both typed forms, which carry the kind byte at the same offset: the one
+    // that takes its operands off the stack, and the one that names them. The
+    // second source keeps a plain `Op::BinOp` because its right-hand operand
+    // is another operator's result rather than a local or a constant.
+    for source in [
+        "let a = 7; let b = 3; a * b",
+        "let a = 7; let b = 3; a * (b + 1)",
+    ] {
+        let engine = Engine::new();
+        let ast = engine.compile(source).expect("must parse");
+        let program = Compiler::new().compile(&ast);
+        let bytes = program.write().expect("must be writable");
 
-    // Where the instruction is, and where the code section sits in the
-    // artifact. Both are found rather than assumed, so a layout change makes
-    // this fail loudly rather than testing nothing.
-    let code = program.code().to_vec();
-    let at = rhai::grain::bytecode::disassemble(&code)
-        .find_map(|(at, op)| matches!(op, rhai::grain::bytecode::Op::BinOp { .. }).then_some(at))
-        .expect("`a * b` must compile to a typed operator");
-    let section = bytes
-        .windows(code.len())
-        .position(|window| window == code.as_slice())
-        .expect("the code section must appear in the artifact verbatim");
+        // Where the instruction is, and where the code section sits in the
+        // artifact. Both are found rather than assumed, so a layout change
+        // makes this fail loudly rather than testing nothing.
+        let code = program.code().to_vec();
+        let at = rhai::grain::bytecode::disassemble(&code)
+            .find_map(|(at, op)| {
+                matches!(
+                    op,
+                    rhai::grain::bytecode::Op::BinOp { .. }
+                        | rhai::grain::bytecode::Op::BinOpFrom { .. }
+                )
+                .then_some(at)
+            })
+            .unwrap_or_else(|| panic!("{source} must compile to a typed operator"));
+        let section = bytes
+            .windows(code.len())
+            .position(|window| window == code.as_slice())
+            .expect("the code section must appear in the artifact verbatim");
 
-    assert!(Program::read(&bytes).is_ok(), "the untouched artifact must load, or the corruption below proves nothing",);
+        assert!(Program::read(&bytes).is_ok(), "the untouched artifact must load, or the corruption below proves nothing",);
 
-    // The kind byte sits where an argument count would, three bytes in.
-    let mut corrupt = bytes;
-    corrupt[section + at + 3] = 0xff;
-    let error = Program::read(&corrupt).expect_err("an unknown operator kind must be refused");
-    println!("refused with: {error}");
+        // The kind byte sits where an argument count would, three bytes in.
+        let mut corrupt = bytes;
+        corrupt[section + at + 3] = 0xff;
+        let error = Program::read(&corrupt).expect_err("an unknown operator kind must be refused");
+        println!("{source} refused with: {error}");
+    }
 }

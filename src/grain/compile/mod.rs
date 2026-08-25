@@ -17,7 +17,8 @@ use crate::types::Span;
 use crate::{Dynamic, ImmutableString, Position, AST};
 
 use crate::grain::bytecode::{
-    assemble, resolve_switch_targets, AssignOp, BinOpKind, Chain, Chunk, Op, Positions, Receiver,
+    assemble, resolve_switch_targets, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Op, Positions,
+    Receiver,
     Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail,
 };
 use crate::grain::compile::poolable::is_poolable;
@@ -2014,6 +2015,7 @@ impl Lowering {
             return;
         }
 
+        let mark = self.mark();
         for arg in call.args.iter() {
             self.expression(arg);
         }
@@ -2033,6 +2035,25 @@ impl Lowering {
         // any pair it cannot run. Emitting it is therefore never a claim about
         // types, only about the operator. See [`Op::BinOp`].
         if let (Some(kind), Some(op)) = (kind, op) {
+            // Both operands pushed by one instruction each and taken off again
+            // by this one — `i < n`, `a + b`, `n - 1`. Read off the instruction
+            // instead. Recognised on the emitted code rather than on the tree,
+            // so an operand that lowers to anything else is left alone, and
+            // nothing can jump between them because no label has been taken
+            // since `mark`.
+            if let Some((lhs, rhs)) = self.fold_pushed_operands(mark) {
+                self.emit_at(
+                    Op::BinOpFrom {
+                        name,
+                        op,
+                        kind,
+                        lhs,
+                        rhs,
+                    },
+                    pos,
+                );
+                return;
+            }
             self.emit_at(Op::BinOp { name, op, kind }, pos);
             return;
         }
@@ -2391,6 +2412,21 @@ impl Lowering {
         };
         self.rewind(mark);
         Some(src)
+    }
+
+    /// Take back the two pushes emitted since `mark` when they are a local
+    /// read and a local read or a constant, naming what they read.
+    ///
+    /// The same trade as [`Self::fold_pushed_local`], for the operand pair in
+    /// front of a binary operator.
+    fn fold_pushed_operands(&mut self, mark: usize) -> Option<(u16, BinOperand)> {
+        let pair = match self.code.get(mark..)? {
+            [Op::LoadLocal(lhs), Op::LoadLocal(rhs)] => (*lhs, BinOperand::Local(*rhs)),
+            [Op::LoadLocal(lhs), Op::Const(rhs)] => (*lhs, BinOperand::Const(*rhs)),
+            _ => return None,
+        };
+        self.rewind(mark);
+        Some(pair)
     }
 
     fn here(&self) -> u32 {

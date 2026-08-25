@@ -4168,7 +4168,48 @@ impl<'e> Vm<'e> {
                 code::tag::CALL
                 | code::tag::CALL_CAPTURE
                 | code::tag::CALL_OP
-                | code::tag::BIN_OP => {
+                | code::tag::BIN_OP
+                | code::tag::BIN_OP_FROM_LOCAL
+                | code::tag::BIN_OP_FROM_CONST => {
+                    // A fused operator names its operands instead of taking
+                    // them off the stack; pushed here so that everything below
+                    // — the typed arms and the dispatch they fall through to —
+                    // finds them where it always did. The two instructions this
+                    // replaces did exactly this and cost two more trips round
+                    // the dispatch loop for it.
+                    let typed = match tag {
+                        code::tag::BIN_OP_FROM_LOCAL | code::tag::BIN_OP_FROM_CONST => {
+                            let slot = small(6)?;
+                            let index = base + slot as usize;
+                            if index >= scope.len() {
+                                return Err(malformed(format!(
+                                    "local slot {slot} is out of scope"
+                                )));
+                            }
+                            let lhs = scope.get_mut_by_index(index).flatten_clone();
+                            let rhs = if tag == code::tag::BIN_OP_FROM_LOCAL {
+                                let slot = small(8)?;
+                                let index = base + slot as usize;
+                                if index >= scope.len() {
+                                    return Err(malformed(format!(
+                                        "local slot {slot} is out of scope"
+                                    )));
+                                }
+                                scope.get_mut_by_index(index).flatten_clone()
+                            } else {
+                                let index = u32::from(small(8)?);
+                                program
+                                    .constant(index)
+                                    .ok_or_else(|| malformed(format!("no constant {index}")))?
+                                    .clone()
+                            };
+                            self.stack.push(lhs);
+                            self.stack.push(rhs);
+                            true
+                        }
+                        _ => tag == code::tag::BIN_OP,
+                    };
+
                     // The typed operator, ahead of every pool read: an
                     // instruction that runs here touches its own bytes, the top
                     // two operands and nothing else.
@@ -4182,7 +4223,7 @@ impl<'e> Vm<'e> {
                     // shared cell — falls through into the dispatch below and
                     // is answered by it. See
                     // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
-                    if tag == code::tag::BIN_OP && self.engine.fast_operators() {
+                    if typed && self.engine.fast_operators() {
                         let top = self.stack.len();
                         let under = top.checked_sub(2).ok_or_else(|| {
                             malformed("operator with too few operands".to_string())
@@ -4217,12 +4258,8 @@ impl<'e> Vm<'e> {
                     let capture = tag == code::tag::CALL_CAPTURE;
                     // The kind byte sits where an argument count would, because
                     // an operator's count is always two.
-                    let argc = if tag == code::tag::BIN_OP {
-                        2
-                    } else {
-                        code[pc + 3] as usize
-                    };
-                    let op = if tag == code::tag::CALL_OP || tag == code::tag::BIN_OP {
+                    let argc = if typed { 2 } else { code[pc + 3] as usize };
+                    let op = if typed || tag == code::tag::CALL_OP {
                         let index = u32::from(small(4)?);
                         Some(
                             program
