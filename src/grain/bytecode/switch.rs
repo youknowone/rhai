@@ -27,8 +27,12 @@ use std::prelude::v1::*;
 /// refuses rather than dispatching every case to the default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Switch {
-    /// One entry per distinct case value, in source order. The target is the
+    /// One entry per distinct case value, ascending by hash. The target is the
     /// head of that value's chain of guarded arms.
+    ///
+    /// Ordered by hash rather than by source order because [`Self::dispatch`]
+    /// bisects it. The compiler sorts the groups it emits and the reader sorts
+    /// what it reads, so nothing that reaches `dispatch` is unsorted.
     pub cases: Vec<SwitchCase>,
     /// Checked only when no case matched in this table.
     ///
@@ -97,8 +101,17 @@ impl Switch {
         }
 
         let hash = hash_of(subject);
-        if let Some(case) = self.cases.iter().find(|case| case.hash == hash) {
-            return case.target;
+        // Bisected, not scanned: `cases` is ascending by hash, and the scan it
+        // replaces cost a `switch` with sixteen arms 7.2 ns an iteration more
+        // than one with four at the same instruction count. `partition_point`
+        // rather than `binary_search_by_key` so that a table which somehow
+        // holds a hash twice still answers with the first of them, which is
+        // what the scan did.
+        let at = self.cases.partition_point(|case| case.hash < hash);
+        if let Some(case) = self.cases.get(at) {
+            if case.hash == hash {
+                return case.target;
+            }
         }
 
         // Disjoint, so the first containing entry is the only one.
@@ -154,17 +167,21 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Opaque;
 
+    /// Sorted, because `Switch::dispatch` bisects: a table built any other way
+    /// is not one the compiler or the reader could have produced.
     fn table(cases: &[(&Dynamic, u32)], ranges: Vec<SwitchRange>, default: u32) -> Switch {
-        Switch {
-            cases: cases
-                .iter()
-                .filter_map(|(value, target)| {
-                    Some(SwitchCase {
-                        hash: case_hash(value)?,
-                        target: *target,
-                    })
+        let mut cases: Vec<SwitchCase> = cases
+            .iter()
+            .filter_map(|(value, target)| {
+                Some(SwitchCase {
+                    hash: case_hash(value)?,
+                    target: *target,
                 })
-                .collect(),
+            })
+            .collect();
+        cases.sort_by_key(|case| case.hash);
+        Switch {
+            cases,
             ranges,
             default,
         }

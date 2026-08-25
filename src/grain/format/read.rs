@@ -397,6 +397,13 @@ fn get_switches(cursor: &mut Cursor) -> Result<Vec<Switch>, ReadError> {
             });
         }
 
+        // `Switch::dispatch` bisects the cases, so they have to be ascending
+        // by hash. A writer of ours already sorted them; a corrupt or foreign
+        // artifact may not have, and an unsorted table would send subjects to
+        // arms they do not name. Sorted stably, so a table holding one hash
+        // twice keeps the entry a scan would have found first.
+        cases.sort_by_key(|case| case.hash);
+
         let mut ranges = Vec::new();
         for _ in 0..cursor.uvarint()? {
             ranges.push(SwitchRange {

@@ -591,12 +591,10 @@ impl Lowering {
             return false;
         }
         let unwind_depth = self.slots.depth();
-        let value_name = ImmutableString::from("$SWITCH_VALUE$");
-        let value_name_index = self.push_name(value_name.clone());
-        let value_slot = self.slots.declare(value_name);
 
         // Sorted because Rhai's map iterates in whatever order its hasher put
-        // the entries in, and an artifact should not depend on that.
+        // the entries in, and an artifact should not depend on that — and
+        // because `Switch::dispatch` bisects the table it ends up in.
         let mut groups: Vec<(u64, Vec<usize>)> = sw
             .cases
             .iter()
@@ -608,15 +606,46 @@ impl Lowering {
         // cut into disjoint pieces here instead. See [`cases::split`].
         let ranges = cases::split(&sw.ranges);
 
+        // Whether anything after the first table can still want the subject.
+        // Only two things can: a range arm, and a guard that declines. With no
+        // ranges and no guards the first `Op::Switch` decides every outcome —
+        // hit or default — so the subject is dead the moment it is dispatched
+        // on, and can be taken straight off the operand stack.
+        //
+        // A guard is exactly an arm whose condition is not a literal: an arm
+        // written without `if` parses as `Expr::BoolConstant(true)`
+        // (`parser.rs:1187`), and `arm_chain` only emits a fallback jump for a
+        // group it had to test something in.
+        //
+        // Deciding it up front rather than after `arm_chain` costs a scan of
+        // the arms and saves three instructions on every execution: the
+        // `let` that stashed it, the load in front of the table, and the
+        // unwind that took it back off the scope.
+        let guarded = sw
+            .expressions
+            .iter()
+            .any(|arm| !matches!(arm.lhs, Expr::BoolConstant(..)));
+        let stash = guarded || !ranges.is_empty();
+
+        let value_slot = if stash {
+            let value_name = ImmutableString::from("$SWITCH_VALUE$");
+            let value_name_index = self.push_name(value_name.clone());
+            Some((value_name_index, self.slots.declare(value_name)))
+        } else {
+            None
+        };
+
         self.expression(subject);
 
-        // Store the subject's value because if all the arms decline,
-        // the ranges still needs it.
-        self.emit(Op::DeclareLocal {
-            name: value_name_index,
-            is_const: false,
-        });
-        self.emit(Op::LoadLocal(value_slot));
+        // Stored only when something after the table can still need it: if all
+        // the arms decline, the ranges still need the subject.
+        if let Some((value_name_index, value_slot)) = value_slot {
+            self.emit(Op::DeclareLocal {
+                name: value_name_index,
+                is_const: false,
+            });
+            self.emit(Op::LoadLocal(value_slot));
+        }
 
         // The first table is for the hashed case values.
         let cases_table = self.push_switch();
@@ -639,12 +668,19 @@ impl Lowering {
 
         // Dispatch to the ranges table if no case value matches or all the guards decline.
         // The default arm is only reached when all ranges fail.
-        let ranges_dispatch = self.here();
-        self.emit(Op::LoadLocal(value_slot));
+        //
+        // Absent when the subject was not stashed, which is the same condition:
+        // nothing jumps here, and an empty ranges table would send everything
+        // that fell through to the default anyway.
+        let ranges_dispatch = value_slot.map(|(.., value_slot)| {
+            let at = self.here();
+            self.emit(Op::LoadLocal(value_slot));
 
-        // The second table is for the ranges.
-        let ranges_table = self.push_switch();
-        self.emit(Op::Switch(ranges_table));
+            // The second table is for the ranges.
+            let ranges_table = self.push_switch();
+            self.emit(Op::Switch(ranges_table));
+            (at, ranges_table)
+        });
 
         // One chain per distinct list of ranges, shared by every table entry
         let mut range_chains: Vec<(&[usize], Entry)> = Vec::new();
@@ -656,6 +692,11 @@ impl Lowering {
             let entry = self.arm_chain(sw, blocks, &mut to_body, &mut to_default);
             range_chains.push((blocks, entry));
         }
+
+        debug_assert!(
+            stash || to_ranges.is_empty(),
+            "an unguarded switch emitted a jump to a ranges table it has not got"
+        );
 
         // Bodies, one per arm something can reach. An arm behind a constant
         // false guard, or one whose range the parser dropped for being empty,
@@ -676,7 +717,8 @@ impl Lowering {
 
         let mut body_at: Vec<(usize, u32)> = Vec::with_capacity(wanted.len());
         let mut to_end: Vec<usize> = Vec::with_capacity(wanted.len());
-        for block in wanted {
+        let last_body = wanted.len().wrapping_sub(1);
+        for (nth, block) in wanted.into_iter().enumerate() {
             body_at.push((block, self.here()));
             // An arm body is an ordinary expression, and a block one goes
             // through the same path as `let y = { .. }`.
@@ -684,6 +726,13 @@ impl Lowering {
             if self.defeated {
                 self.unwind_to(unwind_depth);
                 return false;
+            }
+            // The body emitted last falls straight into the end of the
+            // statement, so it needs no jump to get there. Only when there is
+            // an `_` arm, though: without one, the unit that stands in for it
+            // is emitted after the bodies and has to be jumped over.
+            if nth == last_body && sw.def_case.is_some() {
+                continue;
             }
             to_end.push(self.emit_jump());
         }
@@ -705,7 +754,13 @@ impl Lowering {
             }
         };
 
-        // Unwind at the end of the switch.
+        // Where a case miss goes: the ranges table when there is one, and the
+        // default directly when there is not.
+        let case_fallback = ranges_dispatch.map_or(default_at, |(at, ..)| at);
+
+        // Unwind at the end of the switch. Nothing to unwind when the subject
+        // was never stashed, in which case this is only the address the arms
+        // converge on.
         let unwind_at = self.here();
         self.unwind_to(unwind_depth);
 
@@ -713,7 +768,7 @@ impl Lowering {
             self.patch_to(site, unwind_at);
         }
         for site in to_ranges {
-            self.patch_to(site, ranges_dispatch);
+            self.patch_to(site, case_fallback);
         }
         for site in to_default {
             self.patch_to(site, default_at);
@@ -731,7 +786,7 @@ impl Lowering {
             match entry {
                 Entry::Body(block) => at(block),
                 Entry::At(target) => target,
-                Entry::Default => ranges_dispatch,
+                Entry::Default => case_fallback,
             }
         };
 
@@ -757,19 +812,21 @@ impl Lowering {
                 })
                 .collect(),
             ranges: Vec::new(),
-            default: ranges_dispatch,
+            default: case_fallback,
         };
-        self.switches[ranges_table as usize] = Switch {
-            cases: Vec::new(),
-            ranges: ranges
-                .iter()
-                .map(|(range, blocks)| SwitchRange {
-                    target: range_target(blocks),
-                    ..*range
-                })
-                .collect(),
-            default: default_at,
-        };
+        if let Some((.., ranges_table)) = ranges_dispatch {
+            self.switches[ranges_table as usize] = Switch {
+                cases: Vec::new(),
+                ranges: ranges
+                    .iter()
+                    .map(|(range, blocks)| SwitchRange {
+                        target: range_target(blocks),
+                        ..*range
+                    })
+                    .collect(),
+                default: default_at,
+            };
+        }
 
         true
     }
