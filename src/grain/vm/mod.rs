@@ -3754,9 +3754,18 @@ impl<'e> Vm<'e> {
             // these, which is what a device runs — the address travels back
             // with the error instead, and the host resolves it.
             //
-            // A closure rather than a value: most instructions never ask, and
-            // the ones that do mostly ask only on the way to an error.
-            let pos = || program.position(pc);
+            // A macro rather than a value: most instructions never ask, and the
+            // ones that do mostly ask only on the way to an error. A macro
+            // rather than a closure because a closure whose address is taken
+            // even once is materialised on the stack, and the dispatch loop was
+            // paying four instructions per instruction to build its environment
+            // whether or not the instruction ever asked for a position. The one
+            // site that needs a callable builds one there.
+            macro_rules! pos {
+                () => {
+                    program.position(pc)
+                };
+            }
 
             // Every transfer of control goes through this, and a backward one
             // is charged an operation.
@@ -3777,7 +3786,7 @@ impl<'e> Vm<'e> {
                 ($target:expr) => {{
                     let target: usize = $target;
                     if target <= pc {
-                        self.engine.track_operation(&mut self.global, pos())?;
+                        self.engine.track_operation(&mut self.global, pos!())?;
                     }
                     pc = target;
                 }};
@@ -3822,7 +3831,7 @@ impl<'e> Vm<'e> {
                         AccessMode::ReadWrite
                     });
                     // Through the cell, not over it — see `place`.
-                    *place(scope.get_mut_by_index(index), "", pos())? = value;
+                    *place(scope.get_mut_by_index(index), "", pos!())? = value;
                 }
 
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
@@ -3831,7 +3840,7 @@ impl<'e> Vm<'e> {
                         .name(index)
                         .ok_or_else(|| malformed(format!("no name {index}")))?;
                     let flatten = tag == code::tag::LOAD_NAMED;
-                    let value = self.load_named(name, scope, flatten, pos())?;
+                    let value = self.load_named(name, scope, flatten, pos!())?;
                     self.stack.push(value);
                 }
 
@@ -3854,7 +3863,7 @@ impl<'e> Vm<'e> {
                     // Flattened before assigning, as Rhai does, so a shared
                     // cell is copied out rather than aliased into the target.
                     let rhs = self.pop()?.flatten();
-                    self.assign_named(program, op, name, rhs, scope, pos())?;
+                    self.assign_named(program, op, name, rhs, scope, pos!())?;
                 }
 
                 code::tag::DECLARE_LOCAL | code::tag::DECLARE_CONST => {
@@ -3907,7 +3916,7 @@ impl<'e> Vm<'e> {
                             .ok_or_else(|| malformed(format!("no name {var_name}")))?;
                         return Err(Box::new(EvalAltResult::ErrorAssignmentToConstant(
                             name.to_string(),
-                            pos(),
+                            pos!(),
                         )));
                     }
 
@@ -3933,13 +3942,13 @@ impl<'e> Vm<'e> {
                     if !is_shared!(entry) {
                         let mut rhs = rhs;
                         if let Some(done) =
-                            op.and_then(|op| self.store_builtin(op, entry, &mut rhs, pos))
+                            op.and_then(|op| self.store_builtin(op, entry, &mut rhs, move || program.position(pc)))
                         {
                             done?;
                             pc += width;
                             continue;
                         }
-                        self.store(program, op, entry, rhs, pos())?;
+                        self.store(program, op, entry, rhs, pos!())?;
                         pc += width;
                         continue;
                     }
@@ -3953,15 +3962,15 @@ impl<'e> Vm<'e> {
                     let name = program
                         .name(var_name)
                         .ok_or_else(|| malformed(format!("no name {var_name}")))?;
-                    let mut target = place(entry, name, pos())?;
-                    self.store(program, op, &mut target, rhs, pos())?;
+                    let mut target = place(entry, name, pos!())?;
+                    self.store(program, op, &mut target, rhs, pos!())?;
                 }
 
                 code::tag::LOAD_THIS | code::tag::LOAD_THIS_SHARED => {
                     let value = self
                         .this
                         .as_ref()
-                        .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(pos())))?;
+                        .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(pos!())))?;
                     // Rhai's read is `this_ptr.cloned()` and does not flatten
                     // (`eval/expr.rs:272`); its consumers do. Which tag this is
                     // is which consumer asked.
@@ -3974,7 +3983,7 @@ impl<'e> Vm<'e> {
 
                 code::tag::REQUIRE_THIS => {
                     if self.this.is_none() {
-                        return Err(Box::new(EvalAltResult::ErrorUnboundThis(pos())));
+                        return Err(Box::new(EvalAltResult::ErrorUnboundThis(pos!())));
                     }
                 }
 
@@ -4002,20 +4011,20 @@ impl<'e> Vm<'e> {
                     let mut this = self
                         .this
                         .take()
-                        .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(pos())))?;
+                        .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(pos!())))?;
 
                     let outcome = if this.is_read_only() {
                         // Named for an expression that has no name, which is
                         // what Rhai reports too (`eval/stmt.rs:118-122`).
                         Err(Box::new(EvalAltResult::ErrorAssignmentToConstant(
                             String::new(),
-                            pos(),
+                            pos!(),
                         )))
                     } else {
                         // Written through, not over: a shared receiver has to
                         // keep its cell, as a captured local does.
-                        match place(&mut this, "", pos()) {
-                            Ok(mut target) => self.store(program, op, &mut target, rhs, pos()),
+                        match place(&mut this, "", pos!()) {
+                            Ok(mut target) => self.store(program, op, &mut target, rhs, pos!()),
                             Err(err) => Err(err),
                         }
                     };
@@ -4081,7 +4090,7 @@ impl<'e> Vm<'e> {
                     // the guard's own position (`eval/stmt.rs:487-490`).
                     let holds = condition
                         .as_bool()
-                        .map_err(|actual| self.mismatch::<bool>(actual, pos()))?;
+                        .map_err(|actual| self.mismatch::<bool>(actual, pos!()))?;
                     if holds == (tag == code::tag::JUMP_IF_TRUE) {
                         transfer!(target);
                         continue;
@@ -4191,7 +4200,7 @@ impl<'e> Vm<'e> {
                             .flatten();
                         if let Some((func, need_context)) = builtin {
                             let context = need_context
-                                .then(|| (self.engine, name, None, &self.global, pos()).into());
+                                .then(|| (self.engine, name, None, &self.global, pos!()).into());
                             let value = func(context, &mut [lhs, rhs])?;
                             self.stack.truncate(first);
                             self.stack.push(value);
@@ -4209,7 +4218,7 @@ impl<'e> Vm<'e> {
                         first,
                         scope,
                         capture,
-                        pos(),
+                        pos!(),
                     )?;
                     self.stack.truncate(first);
                     self.stack.push(value);
@@ -4256,7 +4265,7 @@ impl<'e> Vm<'e> {
                         scope,
                         base,
                         capture,
-                        pos(),
+                        pos!(),
                     )?;
                     self.stack.push(value);
                 }
@@ -4338,7 +4347,7 @@ impl<'e> Vm<'e> {
                 code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
                     let index = small(1)?;
                     let map = tag == code::tag::CHECK_MAP_SIZE;
-                    self.check_size(index, map, pos())?;
+                    self.check_size(index, map, pos!())?;
                 }
 
                 code::tag::SWITCH => {
@@ -4382,7 +4391,7 @@ impl<'e> Vm<'e> {
                             .ok_or_else(|| malformed(format!("no name {name_index}")))?;
                         // The resolver gets first refusal, and a name it
                         // answers is not shared at all (`eval/stmt.rs:998`).
-                        if self.resolve_var(name, scope, pos())?.is_some() {
+                        if self.resolve_var(name, scope, pos!())?.is_some() {
                             pc += width;
                             continue;
                         }
@@ -4398,7 +4407,7 @@ impl<'e> Vm<'e> {
                             .iter_raw()
                             .position(|(entry, ..)| entry == name)
                             .map(|from_top| depth - 1 - from_top);
-                        Some(found.ok_or_else(|| missing(name, pos()))?)
+                        Some(found.ok_or_else(|| missing(name, pos!()))?)
                     };
 
                     if let Some(index) = entry {
@@ -4440,12 +4449,12 @@ impl<'e> Vm<'e> {
                     let name = self.pop()?;
                     let name = name
                         .into_immutable_string()
-                        .map_err(|actual| self.mismatch::<ImmutableString>(actual, pos()))?;
+                        .map_err(|actual| self.mismatch::<ImmutableString>(actual, pos!()))?;
                     // Validates that the name is an identifier, as Rhai's own
                     // `Fn(..)` does (`func/call.rs:1215`).
                     let pointer = FnPtr::new(name).map_err(|mut err| {
                         if err.position().is_none() {
-                            err.set_position(pos());
+                            err.set_position(pos!());
                         }
                         err
                     })?;
@@ -4462,7 +4471,7 @@ impl<'e> Vm<'e> {
                     let mut pointer = self.stack[at]
                         .clone()
                         .try_cast::<FnPtr>()
-                        .ok_or_else(|| self.mismatch::<FnPtr>(self.stack[at].type_name(), pos()))?;
+                        .ok_or_else(|| self.mismatch::<FnPtr>(self.stack[at].type_name(), pos!()))?;
                     for value in self.stack.drain(at + 1..) {
                         pointer.add_curry(value);
                     }
@@ -4486,7 +4495,7 @@ impl<'e> Vm<'e> {
                         _ => None,
                     };
                     let value =
-                        self.call_fn_ptr(program, argc, method, receiver, scope, base, pos())?;
+                        self.call_fn_ptr(program, argc, method, receiver, scope, base, pos!())?;
                     self.stack.push(value);
                 }
 
@@ -4496,7 +4505,7 @@ impl<'e> Vm<'e> {
 
                 code::tag::INTERPOLATE_APPEND => {
                     let segment = self.pop()?;
-                    self.append_segment(segment, pos())?;
+                    self.append_segment(segment, pos!())?;
                 }
 
                 code::tag::INTERPOLATE_END => {
@@ -4516,7 +4525,7 @@ impl<'e> Vm<'e> {
                     let chain = program
                         .chain(index)
                         .ok_or_else(|| malformed(format!("no chain {index}")))?;
-                    let value = self.run_chain(program, chain, index, scope, base, pos())?;
+                    let value = self.run_chain(program, chain, index, scope, base, pos!())?;
                     self.stack.push(value);
                 }
 
@@ -4532,7 +4541,7 @@ impl<'e> Vm<'e> {
                     scope.rewind(target);
                 }
 
-                code::tag::TICK => self.engine.track_operation(&mut self.global, pos())?,
+                code::tag::TICK => self.engine.track_operation(&mut self.global, pos!())?,
 
                 code::tag::CHECKPOINT => self.unwind_floor = scope.len(),
 
@@ -4543,7 +4552,7 @@ impl<'e> Vm<'e> {
                     #[cfg(feature = "debugging")]
                     {
                         let depth = small(1)?;
-                        self.at_statement(scope, depth, pos())?;
+                        self.at_statement(scope, depth, pos!())?;
                     }
                 }
 
@@ -4570,7 +4579,7 @@ impl<'e> Vm<'e> {
 
                 code::tag::ITER_INIT => {
                     let iterable = self.pop()?;
-                    self.iter_init(iterable, pos())?;
+                    self.iter_init(iterable, pos!())?;
                 }
 
                 code::tag::ITER_DROP => {
@@ -4596,7 +4605,7 @@ impl<'e> Vm<'e> {
                     iteration.count = iteration.count.checked_add(1).ok_or_else(|| {
                         Box::new(EvalAltResult::ErrorArithmetic(
                             format!("for-loop counter overflow: {}", iteration.count),
-                            pos(),
+                            pos!(),
                         ))
                     })?;
                     let count = iteration.count;
@@ -4606,7 +4615,7 @@ impl<'e> Vm<'e> {
                     // (`eval/stmt.rs:749`).
                     let value = item.map_err(|mut err| {
                         if err.position().is_none() {
-                            err.set_position(pos());
+                            err.set_position(pos!());
                         }
                         err
                     })?;
@@ -4627,14 +4636,14 @@ impl<'e> Vm<'e> {
                     // Through the cell: a closure made in an earlier iteration
                     // shares this slot, and Rhai writes into it rather than
                     // replacing it (`eval/stmt.rs:752`).
-                    *place(scope.get_mut_by_index(index), "", pos())? = value;
+                    *place(scope.get_mut_by_index(index), "", pos!())? = value;
                 }
 
                 code::tag::THROW => {
                     // Flattened, as Rhai does, so a shared cell is thrown as
                     // its value rather than as the cell.
                     let value = self.pop()?.flatten();
-                    return Err(Box::new(EvalAltResult::ErrorRuntime(value, pos())));
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(value, pos!())));
                 }
 
                 code::tag::RETURN => {
