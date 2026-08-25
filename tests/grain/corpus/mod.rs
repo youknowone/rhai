@@ -220,6 +220,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
             name,
             "block_as_argument"
                 | "error_a_skipped_function_cannot_see_the_caller"
+                | "error_op_assign_to_a_constant_parameter_from_a_local"
                 | "error_wrong_arity"
                 | "for_over_captured_array"
                 | "for_return_from_body"
@@ -409,6 +410,16 @@ pub const CASES: &[Case] = &[
     // sides can disagree about what the operator means.
     case("int_operator_every_form", "let a = 7; let b = 3; ((a + b) - (a - b)) * (a * b) / (a / b) % (a % b) + (a ** 2) + (a << b) + (a >> 1) + (a & b) + (a | b) + (a ^ b)"),
     case("int_op_assign_every_form", "let a = 1234; a += 7; a -= 3; a *= 5; a /= 2; a %= 97; a **= 2; a <<= 3; a >>= 1; a &= 0xff; a |= 0x30; a ^= 0x0f; a"),
+    // `x op= y` with `y` a local is one instruction, so both ends of it need a
+    // shared cell to be run over: writing into one rather than replacing it,
+    // and reading one out flattened rather than aliasing it.
+    case("closure_op_assign_through_a_shared_target", "let t = 1; let u = 2; { let g = || t; } t += u; t"),
+    case("closure_op_assign_from_a_shared_source", "let t = 1; let u = 2; { let g = || u; } t += u; t"),
+    // The target's access mode is checked before the value is stored and after
+    // the source is read. Assigning to a `const` by name is a parse error, so
+    // the run-time check is reached through a parameter Rhai passes as a
+    // constant instead.
+    case("error_op_assign_to_a_constant_parameter_from_a_local", "fn bump(p) { let d = 1; p += d; p } const K = 1; bump(K)"),
     case("int_comparison_every_form", "let a = 3; let b = 4; (a == b) == false && (a != b) && (a < b) && (a <= b) && (a > b) == false && (a >= b) == false"),
     // Shifts by a negative and by more than the width, which the checked
     // built-in defines rather than leaving to the hardware.
@@ -481,6 +492,12 @@ pub const CASES: &[Case] = &[
     // Iterating a shared cell walks a snapshot, because Rhai flattens the
     // iterable before asking for an iterator (`eval/stmt.rs:677`).
     case("for_over_captured_array", "let a = [1, 2, 3]; { let f = || a; } let s = 0; for x in a { s += x; } s"),
+    // The loop variable is written *through* its cell, so a closure made on one
+    // turn sees the value the last turn wrote — which is the whole reason the
+    // write is not a plain slot store.
+    // `call(f)` rather than `f.call()`: method-call syntax is `no_object`'s to
+    // remove, and this case is about the loop variable, not about the syntax.
+    case("closure_captures_the_for_loop_variable_cell", "let r = 0; { let f = (); for x in 0..3 { if x == 0 { f = || x; } } r = call(f); } r"),
     // --- switch -----------------------------------------------------------
     case("switch_literal", "let x = 2; switch x { 1 => \"one\", 2 => \"two\", _ => \"other\" }"),
     case("switch_range", "let x = 42; switch x { 0..=9 => \"small\", 10..=99 => \"medium\", _ => \"large\" }"),

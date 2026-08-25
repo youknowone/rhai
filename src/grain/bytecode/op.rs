@@ -311,6 +311,28 @@ pub enum Op {
         /// Index into the op-assignment pool; absent for a plain `=`.
         op: Option<u32>,
     },
+    /// Assign local slot `src`'s value to local slot `slot`, optionally
+    /// through an operator.
+    ///
+    /// [`Op::AssignLocal`] with the [`Op::LoadLocal`] that fed it folded in.
+    /// `x op= y` where `y` is a plain local read pushes a value and pops it
+    /// again on the very next instruction, and both halves of that pair are
+    /// among the most frequent instructions there are — so the pair is one
+    /// instruction, and the operand stack is not touched at all.
+    ///
+    /// The source is read exactly as [`Op::LoadLocal`] reads it: cloned out,
+    /// flattening any shared cell.
+    AssignLocalFrom {
+        /// The slot being assigned to.
+        slot: u16,
+        /// Names the variable in `ErrorAssignmentToConstant`.
+        var_name: u32,
+        /// Index into the op-assignment pool; absent for a plain `=`.
+        op: Option<u32>,
+        /// The slot the value is read from.
+        src: u16,
+    },
+
     /// Pop and declare it as a new local, extending the scope by one.
     ///
     /// Slots are assigned in declaration order, so the new local always lands
@@ -774,6 +796,26 @@ pub enum Op {
         /// `for (x, i) in seq`: the count is pushed under the item, so the two
         /// `StoreShared`s that follow pop them in declaration order.
         indexed: bool,
+    },
+
+    /// Advance the current iterator straight into local slot `slot`, or drop
+    /// the iterator and jump to `exit`.
+    ///
+    /// [`Op::IterNext`] with the [`Op::StoreShared`] that always follows it
+    /// folded in. Every `for` loop over a single variable runs both on every
+    /// turn, and the item they hand between them goes onto the operand stack
+    /// and straight off it again.
+    ///
+    /// Not emitted for `for (x, i) in seq`: that pushes a count as well, so
+    /// the pair is not a pair.
+    ///
+    /// Its table entry is [`Op::IterNext`]'s — the iterable's position, which
+    /// is what a fallible iterator's error is filled in with.
+    IterNextStore {
+        /// Where to jump to once the iterator is exhausted.
+        exit: u32,
+        /// The slot the item is written into.
+        slot: u16,
     },
 
     /// Discard the current iterator.

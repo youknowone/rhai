@@ -368,6 +368,24 @@ fn verify_chunk(
             // The one instruction whose edges differ in more than where they
             // go: falling through carries the item it pushed and still holds
             // the iterator, while the exit edge has neither.
+            // Fused with the store that took its item, so the fall-through
+            // edge carries nothing extra — only the iterator count differs
+            // between the two edges.
+            Op::IterNextStore { exit, .. } => {
+                go(
+                    exit,
+                    State {
+                        operands: depth,
+                        iters: state
+                            .iters
+                            .checked_sub(1)
+                            .ok_or(VerifyError::IteratorUnderflow { at })?,
+                        handlers: state.handlers,
+                    },
+                )?;
+                work_list.push((next, next_state));
+            }
+
             Op::IterNext { exit, indexed } => {
                 go(
                     exit,
@@ -464,6 +482,7 @@ fn required_caps(op: &Op, pools: &Pools) -> Caps {
         | Op::DeclareLocal { .. }
         | Op::Pop
         | Op::AssignLocal { .. }
+        | Op::AssignLocalFrom { .. }
         | Op::AssignNamed { .. }
         | Op::JumpIfFalse { .. }
         | Op::JumpIfTrue { .. }
@@ -485,6 +504,7 @@ fn required_caps(op: &Op, pools: &Pools) -> Caps {
         | Op::Throw
         | Op::IterInit
         | Op::IterNext { .. }
+        | Op::IterNextStore { .. }
         | Op::IterDrop
         | Op::Return
         | Op::LoadShared(..)
@@ -552,6 +572,10 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // Pops the value, leaves nothing: the statement's unit value is a
         // separate `Op::Unit`.
         Op::AssignLocal { .. } | Op::AssignNamed { .. } | Op::AssignThis { .. } => (1, 1, 0),
+
+        // Both halves of what it fuses are gone from the operand stack: the
+        // value is read out of a slot and written into another.
+        Op::AssignLocalFrom { .. } => (0, 0, 0),
 
         Op::JumpIfFalse { .. } | Op::JumpIfTrue { .. } | Op::Switch(..) => (1, 1, 0),
 
@@ -624,7 +648,7 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // The iterable goes onto the iterator stack, not back onto this one.
         Op::IterInit => (1, 1, 0),
         // Its two edges disagree, so the successor match does the work.
-        Op::IterNext { .. } | Op::IterDrop => (0, 0, 0),
+        Op::IterNext { .. } | Op::IterNextStore { .. } | Op::IterDrop => (0, 0, 0),
 
         // Consumes whatever is left, so depth afterwards is not meaningful.
         Op::Return => (0, 0, 0),
@@ -681,7 +705,11 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
             }
             bounded(index(4), "operator", pools.tokens)
         }
-        tag::ASSIGN_LOCAL => bounded(index(3), "name", pools.names),
+        tag::ASSIGN_LOCAL | tag::ASSIGN_LOCAL_FROM => bounded(index(3), "name", pools.names),
+        tag::ASSIGN_LOCAL_FROM_OP => {
+            bounded(index(3), "name", pools.names)?;
+            bounded(index(7), "op-assignment", pools.assign_ops)
+        }
         tag::LOAD_NAMED
         | tag::LOAD_SHARED_NAMED
         | tag::ASSIGN_NAMED

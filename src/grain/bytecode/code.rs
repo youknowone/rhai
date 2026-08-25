@@ -188,6 +188,18 @@ pub mod tag {
     /// arguments, so the byte was a constant. That is what lets the VM's
     /// fallback be the `CALL_OP` arm itself rather than a copy of it.
     pub const BIN_OP: u8 = 0x49;
+    /// [`Op::AssignLocalFrom`](super::Op::AssignLocalFrom) with a plain `=`.
+    ///
+    /// The same operand layout as [`ASSIGN_LOCAL`] with the source slot after
+    /// it, so the two share a dispatch arm.
+    pub const ASSIGN_LOCAL_FROM: u8 = 0x4a;
+    /// [`Op::AssignLocalFrom`](super::Op::AssignLocalFrom) through an operator.
+    pub const ASSIGN_LOCAL_FROM_OP: u8 = 0x4b;
+    /// [`Op::IterNextStore`](super::Op::IterNextStore).
+    ///
+    /// The same operand layout as [`ITER_NEXT`] with the destination slot
+    /// after it, so the three share a dispatch arm.
+    pub const ITER_NEXT_STORE: u8 = 0x4c;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -286,6 +298,10 @@ static WIDTHS: [u8; 256] = {
     widths[tag::CALL_NAMED_REF_CAPTURE as usize] = 6;
 
     widths[tag::ASSIGN_LOCAL_OP as usize] = 7;
+    widths[tag::ASSIGN_LOCAL_FROM as usize] = 7;
+    widths[tag::ITER_NEXT_STORE as usize] = 7;
+
+    widths[tag::ASSIGN_LOCAL_FROM_OP as usize] = 9;
 
     widths
 };
@@ -469,6 +485,26 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(
                     &small(*assign_op as usize, "op-assignments")?.to_le_bytes(),
                 );
+            }
+
+            Op::AssignLocalFrom {
+                slot,
+                var_name,
+                op,
+                src,
+            } => {
+                code.push(match op {
+                    Some(..) => tag::ASSIGN_LOCAL_FROM_OP,
+                    None => tag::ASSIGN_LOCAL_FROM,
+                });
+                code.extend_from_slice(&slot.to_le_bytes());
+                code.extend_from_slice(&small(*var_name as usize, "names")?.to_le_bytes());
+                code.extend_from_slice(&src.to_le_bytes());
+                if let Some(assign_op) = op {
+                    code.extend_from_slice(
+                        &small(*assign_op as usize, "op-assignments")?.to_le_bytes(),
+                    );
+                }
             }
 
             Op::DeclareLocal { name, is_const } => {
@@ -706,6 +742,12 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&target(*exit)?.to_le_bytes());
             }
 
+            Op::IterNextStore { exit, slot } => {
+                code.push(tag::ITER_NEXT_STORE);
+                code.extend_from_slice(&target(*exit)?.to_le_bytes());
+                code.extend_from_slice(&slot.to_le_bytes());
+            }
+
             Op::StoreShared(slot) => {
                 code.push(tag::STORE_SHARED);
                 code.extend_from_slice(&slot.to_le_bytes());
@@ -840,7 +882,10 @@ fn encoded_width(op: &Op) -> usize {
             receiver: Receiver::Local(..) | Receiver::Named(..),
             ..
         } => 6,
-        Op::AssignLocal { op: Some(..), .. } => 7,
+        Op::AssignLocal { op: Some(..), .. }
+        | Op::AssignLocalFrom { op: None, .. }
+        | Op::IterNextStore { .. } => 7,
+        Op::AssignLocalFrom { op: Some(..), .. } => 9,
     }
 }
 
@@ -878,6 +923,19 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             slot: small(1)?,
             var_name: u32::from(small(3)?),
             op: Some(u32::from(small(5)?)),
+        },
+
+        tag::ASSIGN_LOCAL_FROM => Op::AssignLocalFrom {
+            slot: small(1)?,
+            var_name: u32::from(small(3)?),
+            op: None,
+            src: small(5)?,
+        },
+        tag::ASSIGN_LOCAL_FROM_OP => Op::AssignLocalFrom {
+            slot: small(1)?,
+            var_name: u32::from(small(3)?),
+            op: Some(u32::from(small(7)?)),
+            src: small(5)?,
         },
 
         tag::LOAD_NAMED => Op::LoadNamed(u32::from(small(1)?)),
@@ -1024,6 +1082,10 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             exit: u32_at(code, at + 1)?,
             indexed: true,
         },
+        tag::ITER_NEXT_STORE => Op::IterNextStore {
+            exit: u32_at(code, at + 1)?,
+            slot: small(5)?,
+        },
         tag::STORE_SHARED => Op::StoreShared(small(1)?),
         tag::POP_HANDLER => Op::PopHandler,
         tag::PUSH_HANDLER => Op::PushHandler {
@@ -1102,6 +1164,18 @@ mod tests {
                 slot: 1,
                 var_name: 2,
                 op: Some(5),
+            },
+            Op::AssignLocalFrom {
+                slot: 1,
+                var_name: 2,
+                op: None,
+                src: 6,
+            },
+            Op::AssignLocalFrom {
+                slot: 1,
+                var_name: 2,
+                op: Some(5),
+                src: 6,
             },
             Op::DeclareLocal {
                 name: 8,
@@ -1197,6 +1271,10 @@ mod tests {
             Op::AssignThis { op: None },
             Op::AssignThis { op: Some(6) },
             Op::Rotate(3),
+            // Its exit is an instruction index here and an address after
+            // assembly, like every other jump — index 0 is `Const(7)`, which
+            // is at 0.
+            Op::IterNextStore { exit: 0, slot: 4 },
             Op::UnwindTo(6),
             Op::Tick,
             Op::Statement { depth: 2 },

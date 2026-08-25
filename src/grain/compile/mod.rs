@@ -1133,10 +1133,20 @@ impl Lowering {
                 let slot = self.slots.resolve(&v.1).expect("checked by the guard");
                 let var_name = self.push_name(v.1.clone());
 
+                let mark = self.mark();
                 self.expression(&binary.rhs);
                 let op = self.op_assignment(op_info);
 
-                self.emit_at(Op::AssignLocal { slot, var_name, op }, op_info.position());
+                let assign = match self.fold_pushed_local(mark) {
+                    Some(src) => Op::AssignLocalFrom {
+                        slot,
+                        var_name,
+                        op,
+                        src,
+                    },
+                    None => Op::AssignLocal { slot, var_name, op },
+                };
+                self.emit_at(assign, op_info.position());
                 self.emit(Op::Unit);
                 true
             }
@@ -1320,18 +1330,32 @@ impl Lowering {
 
                 let top = self.here();
                 let exit = self.code.len();
-                self.emit_at(
-                    Op::IterNext {
-                        exit: u32::MAX,
-                        indexed: counter_slot.is_some(),
-                    },
-                    flow.expr.position(),
-                );
-                // The item is on top, the count under it, so these pop in the
-                // order the two locals were declared.
-                self.emit(Op::StoreShared(var_slot));
-                if let Some(slot) = counter_slot {
-                    self.emit(Op::StoreShared(slot));
+                match counter_slot {
+                    // `for (x, i) in seq` pushes a count as well, so the item
+                    // and the count come off the operand stack in the order
+                    // the two locals were declared.
+                    Some(slot) => {
+                        self.emit_at(
+                            Op::IterNext {
+                                exit: u32::MAX,
+                                indexed: true,
+                            },
+                            flow.expr.position(),
+                        );
+                        self.emit(Op::StoreShared(var_slot));
+                        self.emit(Op::StoreShared(slot));
+                    }
+                    // One variable, so the item goes onto the operand stack
+                    // and straight off it again on the next instruction —
+                    // every turn of every ordinary `for` loop. Fused, it never
+                    // goes there at all.
+                    None => self.emit_at(
+                        Op::IterNextStore {
+                            exit: u32::MAX,
+                            slot: var_slot,
+                        },
+                        flow.expr.position(),
+                    ),
                 }
                 self.emit_at(Op::Tick, flow.body.position());
 
@@ -2348,6 +2372,27 @@ impl Lowering {
         self.positions.truncate(mark);
     }
 
+    /// Take back a lone local read emitted since `mark`, naming the slot it
+    /// read, so the instruction about to be emitted can do it itself.
+    ///
+    /// `x op= y` where `y` is a plain local read pushes a value and pops it
+    /// again on the next instruction. Recognised on the emitted code rather
+    /// than on the tree, so whatever `expression` decided a bare variable is
+    /// decides this too — a shared capture lowers to `Op::LoadShared` and is
+    /// left alone.
+    ///
+    /// Safe to take back because nothing can jump between the two: no label
+    /// has been taken since `mark`, so no jump can name the instruction that
+    /// followed the read.
+    fn fold_pushed_local(&mut self, mark: usize) -> Option<u16> {
+        let src = match self.code.get(mark..)? {
+            [Op::LoadLocal(src)] => *src,
+            _ => return None,
+        };
+        self.rewind(mark);
+        Some(src)
+    }
+
     fn here(&self) -> u32 {
         u32::try_from(self.code.len()).expect("chunk length is bounded")
     }
@@ -2566,6 +2611,7 @@ fn jump_target_mut(op: &mut Op) -> Option<&mut u32> {
         | Op::JumpIfTrue { target, .. }
         | Op::SkipIfNotUnit { target, .. }
         | Op::IterNext { exit: target, .. }
+        | Op::IterNextStore { exit: target, .. }
         | Op::PushHandler { target, .. } => Some(target),
         _ => None,
     }

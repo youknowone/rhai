@@ -501,6 +501,33 @@ fn place<'a>(
         .ok_or_else(|| Box::new(EvalAltResult::ErrorDataRace(name.to_string(), pos)))
 }
 
+/// Write a `for` loop variable into its slot, through a shared cell if one is
+/// there.
+///
+/// A closure made in an earlier iteration shares this slot, and Rhai writes
+/// into it rather than replacing it (`eval/stmt.rs:752`) so that every closure
+/// holding the cell sees the last value.
+///
+/// The guard is only needed for a cell a closure captured, so the check for one
+/// is a discriminant test rather than the downcast chain `write_lock` walks —
+/// the same shape [`Op::AssignLocal`](crate::grain::bytecode::Op::AssignLocal)
+/// uses, and for the same reason: this runs on every turn of every `for` loop.
+/// It also means the position is resolved only on the branch that can report
+/// one.
+#[inline]
+fn store_shared(
+    entry: &mut Dynamic,
+    value: Dynamic,
+    pos: impl Fn() -> Position,
+) -> Result<(), Box<EvalAltResult>> {
+    if is_shared!(entry) {
+        *place(entry, "", pos())? = value;
+    } else {
+        *entry = value;
+    }
+    Ok(())
+}
+
 /// Turn the two control-flow errors back into the value they carry.
 ///
 /// Rhai unwinds `return` and `exit` as errors rather than returning them;
@@ -3886,29 +3913,61 @@ impl<'e> Vm<'e> {
                     }
                 }
 
-                code::tag::ASSIGN_LOCAL | code::tag::ASSIGN_LOCAL_OP => {
+                code::tag::ASSIGN_LOCAL
+                | code::tag::ASSIGN_LOCAL_OP
+                | code::tag::ASSIGN_LOCAL_FROM
+                | code::tag::ASSIGN_LOCAL_FROM_OP => {
                     let slot = small(1)?;
                     let var_name = u32::from(small(3)?);
-                    let op = if tag == code::tag::ASSIGN_LOCAL_OP {
-                        let index = u32::from(small(5)?);
-                        Some(
+                    // The fused forms carry the source slot where the plain
+                    // ones end, so the operator index moves along by it.
+                    let from = match tag {
+                        code::tag::ASSIGN_LOCAL_FROM | code::tag::ASSIGN_LOCAL_FROM_OP => {
+                            Some(small(5)?)
+                        }
+                        _ => None,
+                    };
+                    let op = match tag {
+                        code::tag::ASSIGN_LOCAL_OP => Some(u32::from(small(5)?)),
+                        code::tag::ASSIGN_LOCAL_FROM_OP => Some(u32::from(small(7)?)),
+                        _ => None,
+                    };
+                    let op = match op {
+                        Some(index) => Some(
                             program
                                 .assign_op(index)
                                 .ok_or_else(|| malformed(format!("no op-assignment {index}")))?,
-                        )
-                    } else {
-                        None
+                        ),
+                        None => None,
+                    };
+
+                    // Rhai flattens the right-hand side before assigning
+                    // (`eval/stmt.rs:324`), so a shared cell is copied out
+                    // rather than aliased into the target. A fused form reads
+                    // it out of the slot the `Op::LoadLocal` it swallowed would
+                    // have pushed from, which flattens for the same reason.
+                    //
+                    // Before the target's own bounds check rather than after,
+                    // which is the order the two instructions ran in. Both of
+                    // those errors describe an artifact the verifier has
+                    // already refused, so only their order could differ.
+                    let rhs = match from {
+                        Some(src) => {
+                            let index = base + src as usize;
+                            if index >= scope.len() {
+                                return Err(malformed(format!(
+                                    "local slot {src} is out of scope"
+                                )));
+                            }
+                            scope.get_mut_by_index(index).flatten_clone()
+                        }
+                        None => self.pop()?.flatten(),
                     };
 
                     let index = base + slot as usize;
                     if index >= scope.len() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
-
-                    // Rhai flattens the right-hand side before assigning
-                    // (`eval/stmt.rs:324`), so a shared cell is copied out
-                    // rather than aliased into the target.
-                    let rhs = self.pop()?.flatten();
 
                     if scope.get_mut_by_index(index).is_read_only() {
                         let name = program
@@ -4586,7 +4645,9 @@ impl<'e> Vm<'e> {
                     self.iterators.pop();
                 }
 
-                code::tag::ITER_NEXT | code::tag::ITER_NEXT_INDEXED => {
+                code::tag::ITER_NEXT
+                | code::tag::ITER_NEXT_INDEXED
+                | code::tag::ITER_NEXT_STORE => {
                     let exit = wide(1)? as usize;
                     let iteration = self
                         .iterators
@@ -4620,6 +4681,23 @@ impl<'e> Vm<'e> {
                         err
                     })?;
 
+                    if tag == code::tag::ITER_NEXT_STORE {
+                        // The `Op::StoreShared` this swallowed, which is where
+                        // the loop variable is written on every turn.
+                        let slot = small(5)?;
+                        let index = base + slot as usize;
+                        if index >= scope.len() {
+                            return Err(malformed(format!("local slot {slot} is out of scope")));
+                        }
+                        store_shared(
+                            scope.get_mut_by_index(index),
+                            value.flatten(),
+                            move || program.position(pc),
+                        )?;
+                        pc += width;
+                        continue;
+                    }
+
                     if tag == code::tag::ITER_NEXT_INDEXED {
                         self.stack.push(Dynamic::from(count));
                     }
@@ -4633,10 +4711,7 @@ impl<'e> Vm<'e> {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     let value = self.pop()?;
-                    // Through the cell: a closure made in an earlier iteration
-                    // shares this slot, and Rhai writes into it rather than
-                    // replacing it (`eval/stmt.rs:752`).
-                    *place(scope.get_mut_by_index(index), "", pos!())? = value;
+                    store_shared(scope.get_mut_by_index(index), value, move || program.position(pc))?;
                 }
 
                 code::tag::THROW => {
