@@ -479,6 +479,16 @@ impl<'a, 's, 'ps, 'g, 'c, 't> EvalContext<'a, 's, 'ps, 'g, 'c, 't> {
 }
 
 /// Call a function (native Rust or scripted) inside the [evaluation context][`EvalContext`].
+///
+/// The level this takes is the *crossing*, not the callee: everything that
+/// reaches here arrived from outside the evaluator — a native calling back
+/// through [`NativeCallContext`](crate::NativeCallContext), a `FnPtr`, a
+/// `call_fn` from the host — and
+/// Rhai counts that boundary as a frame of its own. The callee's own level is
+/// taken by [`Engine::exec_fn_call`] below, which is where the walker enters
+/// with no boundary to count (`func/call.rs` `make_function_call`).
+///
+/// An evaluator therefore wants [`dispatch_fn`], not this.
 pub(crate) fn _call_fn_raw(
     engine: &Engine,
     global: &mut GlobalRuntimeState,
@@ -494,6 +504,43 @@ pub(crate) fn _call_fn_raw(
 ) -> RhaiResult {
     defer! { let orig_level = global.level; global.level += 1 }
 
+    dispatch_fn(
+        engine,
+        global,
+        caches,
+        scope,
+        fn_name,
+        args,
+        native_only,
+        is_ref_mut,
+        is_method_call,
+        pos,
+        site,
+    )
+}
+
+/// The same call, made by something that *is* an evaluator rather than
+/// something reentering one.
+///
+/// Only the boundary above is missing, and only because there is no boundary:
+/// a caller that is already running a program takes the callee's level through
+/// the dispatch, exactly as the walker's own call sites do. Taking two would
+/// spend `max_call_levels` at twice the walker's rate and stop a program the
+/// walker runs.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_fn(
+    engine: &Engine,
+    global: &mut GlobalRuntimeState,
+    caches: &mut Caches,
+    scope: &mut Scope,
+    fn_name: impl AsRef<str>,
+    args: &mut [&mut Dynamic],
+    native_only: bool,
+    is_ref_mut: bool,
+    is_method_call: bool,
+    pos: Position,
+    site: Option<&CallSite>,
+) -> RhaiResult {
     let fn_name = fn_name.as_ref();
     let args_len = args.len();
 

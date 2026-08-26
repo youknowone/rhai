@@ -160,3 +160,67 @@ fn ticking_does_not_disturb_a_bounded_loop() {
 
     assert_eq!(format!("{vm:?}"), format!("{walker:?}"));
 }
+
+/// A call costs the same call level here as it does in the walker.
+///
+/// `max_call_levels` is a budget a host sets against the *walker*, so a VM that
+/// spends it faster stops a program the host's setting was chosen to allow.
+/// Reaching Rhai's dispatch through `_call_fn_raw` spent two levels for one
+/// call: that entry exists for a native reentering the evaluator and takes the
+/// crossing as a frame of its own, on top of the one `exec_fn_call` takes for
+/// the callee. The walker has no crossing to count and enters at
+/// `exec_fn_call` (`func/call.rs` `make_function_call`), so the VM enters the
+/// same way, through `dispatch_fn`.
+///
+/// The callee is a script function in a *registered module* rather than one in
+/// the program, because only `call_script_fn` checks the budget
+/// (`func/script.rs:42`) and only a callee the compiler did not lower is
+/// reached through the dispatch at all — `Op::Call` answers its own functions
+/// without leaving the VM, and a native never checks the budget however many
+/// levels it spends.
+///
+/// Measured as the smallest budget each side runs at rather than asserted at a
+/// number, for `a_callback_costs_more_call_levels`'s reason: the number belongs
+/// to Rhai's dispatch and would drift. What has to hold is that it is one
+/// number and not two.
+#[test]
+#[cfg(not(any(feature = "unchecked", feature = "no_function", feature = "no_module")))]
+fn a_dispatched_call_costs_the_walkers_call_levels() {
+    // Recursive, so the budget is reached by the callee rather than by
+    // anything around it, and computed rather than constant so the optimizer
+    // cannot fold the call away.
+    const LIBRARY: &str = "fn down(n) { if n <= 0 { 0 } else { down(n - 1) } }";
+    const SOURCE: &str = "let n = 3; down(n)";
+
+    let engine_with_library = |levels: usize| {
+        let mut engine = Engine::new();
+        let ast = engine.compile(LIBRARY).expect("the library parses");
+        let module = rhai::Module::eval_ast_as_new(Scope::new(), &ast, &engine).expect("the library builds");
+        engine.register_global_module(module.into());
+        engine.set_max_call_levels(levels);
+        engine
+    };
+
+    let cheapest = |run: &dyn Fn(&Engine) -> bool| {
+        let budgets = 1..=32;
+        budgets.into_iter().find(|levels| run(&engine_with_library(*levels))).unwrap_or(usize::MAX)
+    };
+
+    let walker = cheapest(&|engine| {
+        let ast = engine.compile(SOURCE).expect("must compile");
+        engine.eval_ast::<Dynamic>(&ast).is_ok()
+    });
+    let vm = cheapest(&|engine| {
+        let ast = engine.compile(SOURCE).expect("must compile");
+        let program = Compiler::new().compile(&ast);
+        assert_eq!(program.residual_count(), 0, "{SOURCE:?} must be fully lowered");
+        Vm::new(engine).eval_with_scope(&mut Scope::new(), &program).is_ok()
+    });
+
+    assert!(walker > 1 && walker < 32, "the walker must be stopped by the budget somewhere measurable, not at {walker}",);
+    assert_eq!(
+        vm, walker,
+        "a dispatched call runs at {walker} call level(s) in the walker and {vm} here, \
+         so a budget a host set against the walker does not buy the same program",
+    );
+}

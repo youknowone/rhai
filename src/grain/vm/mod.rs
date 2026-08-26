@@ -65,7 +65,12 @@ macro_rules! is_shared {
     }};
 }
 
-/// Make a function call into Rhai using [`_call_fn_raw`](crate::eval::_call_fn_raw).
+/// Make a function call into Rhai using [`dispatch_fn`](crate::eval::dispatch_fn).
+///
+/// `dispatch_fn` rather than `_call_fn_raw` because this is an evaluator making
+/// a call, not a native reentering one: the extra level `_call_fn_raw` takes is
+/// the boundary a native crosses, and there is no boundary here. Taking it
+/// would spend `max_call_levels` at twice the walker's rate.
 ///
 /// `site` is what the call site already worked out about itself, for a site
 /// that has run before and kept it. See [`CallMemo`].
@@ -92,7 +97,7 @@ fn call_engine(
     );
     let native_only = site.is_none() && !is_identifier(fn_name);
 
-    crate::eval::_call_fn_raw(
+    crate::eval::dispatch_fn(
         engine,
         global,
         caches,
