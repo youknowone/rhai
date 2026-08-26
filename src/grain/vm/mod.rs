@@ -930,6 +930,16 @@ pub struct Vm<'e> {
     operator_memo: [OperatorMemo; OPERATOR_MEMO_SLOTS],
     /// What each call site last resolved to. See [`CallMemo`].
     call_memo: [Option<CallMemo>; CALL_MEMO_SLOTS],
+    /// The program a pointer this run creates carries with it, when there is
+    /// one to carry.
+    ///
+    /// `Some` exactly where the wrappers are registered — see
+    /// [`Vm::eval_with_callbacks`] and the crossings it leads to — because
+    /// both answer the same question, which is whether a pointer this run
+    /// hands out has anywhere to be called from. A `Vm` reached any other way
+    /// holds the program by reference for the length of a call and has no
+    /// share of it to give away. See [`callback::pointer`].
+    callbacks: Option<SharedProgram>,
     /// A number identifying the frame currently running.
     ///
     /// Handed out on entry to [`Vm::execute`] and put back on the way out, so
@@ -1035,6 +1045,7 @@ impl<'e> Vm<'e> {
             pending_slot: None,
             operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
             call_memo: core::array::from_fn(|_| None),
+            callbacks: None,
             generation: 0,
             last_generation: 0,
             #[cfg(feature = "debugging")]
@@ -1054,10 +1065,10 @@ impl<'e> Vm<'e> {
     ///
     /// The empty `Caches` is the cost, and it is the one thing a `Vm` normally
     /// exists to avoid. It cannot be helped: the outer `Vm` is borrowed by the
-    /// frame still running beneath this one. Rhai pays the same on its own
-    /// callbacks — but it also skips resolution entirely for a pointer that
-    /// carries its body, which is why a crossing measures 0.34x. See the
-    /// `callback` module.
+    /// frame still running beneath this one — and it is what is left of the
+    /// difference now that a pointer this program hands out carries its body
+    /// and is called without being resolved, as Rhai's own is. A crossing
+    /// measures 0.87x. See the `callback` module.
     ///
     /// Operation counting has the same shape and the same reason: increments
     /// inside the callback land on the clone and are lost when it drops, as
@@ -1086,6 +1097,10 @@ impl<'e> Vm<'e> {
             // none yet.
             operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
             call_memo: core::array::from_fn(|_| None),
+            // Set by [`callback::invoke`], which has the share of the program
+            // this crossing came out of. A crossing reached any other way has
+            // none, and hands out the pointers it can rather than none at all.
+            callbacks: None,
             generation: 0,
             last_generation: 0,
             // A step belongs to the statement that asked for it, and that
@@ -1451,7 +1466,12 @@ impl<'e> Vm<'e> {
     pub fn eval_with_callbacks(&mut self, scope: &mut Scope, program: &SharedProgram) -> VmResult {
         let wrappers =
             (!program.functions().is_empty()).then(|| callback::wrappers(program).into());
-        self.run_with(program, scope, wrappers)
+        // Put back rather than cleared: a `Vm` reentered from a callback is
+        // running the program its own field already names.
+        let outer = mem::replace(&mut self.callbacks, Some(program.clone()));
+        let result = self.run_with(program, scope, wrappers);
+        self.callbacks = outer;
+        result
     }
 
     fn run_with(
@@ -4902,13 +4922,28 @@ impl<'e> Vm<'e> {
                     // have written and the validating constructors refuse it.
                     // Nothing unsound rides on that check — a name that will
                     // not resolve simply fails when the pointer is called.
+                    //
+                    // Carrying the body where there is a share of the program
+                    // to carry, which is what spares a native the lookup on
+                    // every element. See [`callback::pointer`].
+                    debug_assert!(
+                        self.callbacks
+                            .as_ref()
+                            .map_or(true, |owned| core::ptr::eq(&**owned, program)),
+                        "a pointer would be handed out carrying a program this frame is not running"
+                    );
+                    let typ = self
+                        .callbacks
+                        .as_ref()
+                        .and_then(|owned| callback::pointer(owned, index, name))
+                        .unwrap_or(FnPtrType::Normal);
                     self.stack.push(
                         FnPtr {
                             name: name.into(),
                             curry: Default::default(),
                             #[cfg(not(feature = "no_function"))]
                             env: None,
-                            typ: FnPtrType::Normal,
+                            typ,
                         }
                         .into(),
                     );

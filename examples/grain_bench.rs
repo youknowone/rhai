@@ -131,9 +131,10 @@ const CASES: &[Case] = &[
         floor: 1.50,
     },
     // The one case the VM is expected to lose. Every element is a boundary out
-    // of the VM, through Rhai's dispatch and back into a second `Vm` with an
-    // empty resolution cache — where the walker stays inside itself and reaches
-    // the closure body directly. 1000 crossings per iteration.
+    // of the VM and back into a second `Vm` with an empty resolution cache —
+    // where the walker stays inside itself and reaches the closure body
+    // directly. 1000 crossings per iteration, and the crossing is what is
+    // left: the pointer itself carries its body, so no element is resolved.
     //
     // Also the only case here that indexes: the `a.push(i)` loop is a chain
     // rooted at a local, so it is what says the root is still being walked
@@ -144,7 +145,7 @@ const CASES: &[Case] = &[
                  let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
         iterations: 20,
         callbacks: true,
-        floor: 0.64,
+        floor: 0.80,
     },
     Case {
         name: "primes",

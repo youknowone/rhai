@@ -53,6 +53,37 @@ fn a_native_can_call_a_closure_back() {
     agree("let a = [1, 2, 3, 4]; a.filter(|x| x % 2 == 0)");
 }
 
+/// A native that calls back gets the value it handed over left where it was.
+///
+/// `filter` hands the closure an element of the array it is filtering, by
+/// reference. The dispatch copies that reference for a call it resolved
+/// (`func/call.rs:439`) and nothing copies it for a pointer that carries its
+/// body, so the copy is ours to make. A chunk that took the value instead
+/// would leave a unit behind in the caller's array — and the array would still
+/// be the right length, and the filter would still pick the right elements, so
+/// what has to be looked at is the array itself.
+#[test]
+fn a_callback_leaves_the_array_it_was_called_over_alone() {
+    let engine = corpus::engine();
+    let source = "let a = [1, 2, 3, 4]; let b = a.filter(|x| x % 2 == 0); [a, b]";
+
+    assert_eq!(walk(&engine, source), run(&engine, source), "{source}");
+    assert_eq!(run(&engine, source), Ok("[[1, 2, 3, 4], [2, 4]]".to_string()));
+}
+
+/// A chunk that binds `this` is not handed out carrying its body.
+///
+/// Rhai gives a body-carrying pointer its receiver as the first *argument*
+/// (`types/fn_ptr.rs:490`), which is not where a chunk expecting `this` looks
+/// for one — a nought-parameter chunk asked for one argument is not found at
+/// all. So these keep the name-only pointer and reach the walker's copy, which
+/// is what `Program::needs_walker` keeps alive for them.
+#[test]
+fn a_callback_that_binds_this_is_left_to_the_walker() {
+    lowered("let a = [1, 2, 3]; a.map(|| this * 2)");
+    agree("let a = [1, 2, 3]; a.map(|| this * 2)");
+}
+
 #[test]
 fn a_native_can_call_a_named_function_back() {
     agree("fn double(x) { x * 2 } let a = [1, 2, 3]; a.map(Fn(\"double\"))");
