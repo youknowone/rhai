@@ -166,6 +166,12 @@ required-features = ["grain"]
 name = "grain_nsiter"
 required-features = ["grain"]
 
+# Walker-against-VM timing for a script named on the command line, so a
+# decomposition can be a set of files rather than a patch to a fixed table.
+[[example]]
+name = "grain_probe"
+required-features = ["grain"]
+
 # The grain harnesses, as one binary. `tests/mod.rs` wraps them in an inline
 # `mod grain`, which is what puts their module paths inside `tests/grain/`.
 [[test]]
