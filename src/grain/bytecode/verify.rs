@@ -456,24 +456,26 @@ fn verify_chunk(
 /// Capabilities an instruction requires.
 fn required_caps(op: &Op, pools: &Pools) -> Caps {
     match op {
-        Op::Chain(index) => match pools.chains.get(*index as usize) {
-            Some(chain) => {
-                let mut caps = Caps::empty();
+        Op::Chain(index) | Op::IndexSet { chain: index, .. } => {
+            match pools.chains.get(*index as usize) {
+                Some(chain) => {
+                    let mut caps = Caps::empty();
 
-                match chain.root {
-                    Root::Local { .. } | Root::Named { .. } | Root::Temporary => {}
-                    Root::This { .. } => caps.insert(Caps::THIS),
+                    match chain.root {
+                        Root::Local { .. } | Root::Named { .. } | Root::Temporary => {}
+                        Root::This { .. } => caps.insert(Caps::THIS),
+                    }
+                    chain.steps.iter().for_each(|step| match step {
+                        Step::Index { .. } => caps.insert(Caps::INDEXING),
+                        Step::Property { .. } => caps.insert(Caps::PROPERTY),
+                        Step::Method { .. } => caps.insert(Caps::METHOD),
+                    });
+
+                    caps
                 }
-                chain.steps.iter().for_each(|step| match step {
-                    Step::Index { .. } => caps.insert(Caps::INDEXING),
-                    Step::Property { .. } => caps.insert(Caps::PROPERTY),
-                    Step::Method { .. } => caps.insert(Caps::METHOD),
-                });
-
-                caps
+                None => Caps::empty(),
             }
-            None => Caps::empty(),
-        },
+        }
 
         Op::Const(..)
         | Op::Unit
@@ -545,13 +547,15 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // that is not a slot, plus the value being assigned, and leaves one
         // behind. An index with no chain behind it reads as consuming nothing;
         // `check_indices` is what rejects it.
-        Op::Chain(index) => match pools.chains.get(*index as usize) {
-            Some(chain) => {
-                let consumes = chain.consumes();
-                (consumes, consumes, 1)
+        Op::Chain(index) | Op::IndexSet { chain: index, .. } => {
+            match pools.chains.get(*index as usize) {
+                Some(chain) => {
+                    let consumes = chain.consumes();
+                    (consumes, consumes, 1)
+                }
+                None => (0, 0, 1),
             }
-            None => (0, 0, 1),
-        },
+        }
 
         Op::Const(..)
         | Op::Unit
@@ -773,7 +777,9 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         // scope when it runs, as every other slot is.
         tag::CALL_FN_PTR_ON_NAMED => bounded(index(2), "name", pools.names),
         tag::EVAL_AST | tag::EVAL_AST_KEEP => bounded(index(1), "fragment", pools.residuals),
-        tag::CHAIN => {
+        // The slot is checked against the scope when it runs, as every other
+        // slot is; the chain behind it is the same record `CHAIN` names.
+        tag::CHAIN | tag::INDEX_SET => {
             bounded(index(1), "chain", pools.chains.len())?;
             check_chain_indices(at, &pools.chains[index(1) as usize], pools)
         }

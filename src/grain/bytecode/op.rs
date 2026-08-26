@@ -935,6 +935,27 @@ pub enum Op {
         kind: BinOpKind,
     },
 
+    /// Assign into `local[index]`, with the chain it specialises beside it.
+    ///
+    /// [`Op::Chain`] for the one shape that dominates a loop writing an array:
+    /// a root that is a local slot, exactly one [`Step::Index`], and a plain
+    /// `=` tail. The compiler emits it only for that shape, so the VM does not
+    /// re-derive it; what the VM still tests is the *types*, which no compiler
+    /// can know — the local has to hold an unshared, writable `Array` and the
+    /// index has to be a non-negative in-range integer.
+    ///
+    /// Anything it declines runs `chain`, which is the very chain this
+    /// replaced, so a receiver that turns out to be a map, a shared cell, a
+    /// host type with an indexer, or an out-of-range index is answered by the
+    /// generic walk and reports exactly what it reports. That is what keeps
+    /// this a speculation about shape rather than a claim about types.
+    IndexSet {
+        /// Index into the chain pool, for the fallback.
+        chain: u32,
+        /// The slot the root local lives in.
+        slot: u16,
+    },
+
     /// Apply a unary operator to the top of the stack, replacing it.
     ///
     /// [`Op::BinOp`] for one operand, and speculative in the same way: the

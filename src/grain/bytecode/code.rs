@@ -215,6 +215,11 @@ pub mod tag {
     /// `CALL` arm itself rather than a copy of it. There is no operator-pool
     /// index, because a unary operator has no built-in lookup to fall back to.
     pub const UN_OP: u8 = 0x4f;
+    /// [`Op::IndexSet`](super::Op::IndexSet).
+    ///
+    /// The same operand layout as [`CHAIN`] with the root's slot after it, so
+    /// the fallback is the `CHAIN` arm itself rather than a copy of it.
+    pub const INDEX_SET: u8 = 0x50;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -308,6 +313,7 @@ static WIDTHS: [u8; 256] = {
     widths[tag::CALL_OP as usize] = 6;
     widths[tag::BIN_OP as usize] = 6;
     widths[tag::UN_OP as usize] = 4;
+    widths[tag::INDEX_SET as usize] = 5;
     widths[tag::CALL_LOCAL_REF as usize] = 6;
     widths[tag::CALL_LOCAL_REF_CAPTURE as usize] = 6;
     widths[tag::CALL_NAMED_REF as usize] = 6;
@@ -646,6 +652,12 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&small(*index as usize, "chains")?.to_le_bytes());
             }
 
+            Op::IndexSet { chain, slot } => {
+                code.push(tag::INDEX_SET);
+                code.extend_from_slice(&small(*chain as usize, "chains")?.to_le_bytes());
+                code.extend_from_slice(&slot.to_le_bytes());
+            }
+
             Op::MakeArray(len) => {
                 code.push(tag::MAKE_ARRAY);
                 code.extend_from_slice(&len.to_le_bytes());
@@ -917,6 +929,7 @@ fn encoded_width(op: &Op) -> usize {
         | Op::JumpIfFalse { .. }
         | Op::SkipIfNotUnit { .. }
         | Op::IterNext { .. }
+        | Op::IndexSet { .. }
         | Op::PushHandler {
             catch_var: None, ..
         } => 5,
@@ -1074,6 +1087,10 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         tag::ROTATE => Op::Rotate(code[at + 1]),
 
         tag::CHAIN => Op::Chain(u32::from(small(1)?)),
+        tag::INDEX_SET => Op::IndexSet {
+            chain: u32::from(small(1)?),
+            slot: small(3)?,
+        },
         tag::SWITCH => Op::Switch(u32::from(small(1)?)),
         tag::MAKE_ARRAY => Op::MakeArray(small(1)?),
         tag::MAKE_MAP => Op::MakeMap(small(1)?),

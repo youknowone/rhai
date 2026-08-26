@@ -325,6 +325,37 @@ fn a_registered_operator_on_primitives_follows_rhais_own_gate() {
     }
 }
 
+/// A `const` array refuses an indexed write, on both sides.
+///
+/// `Op::IndexSet` writes straight into the scope entry, so that entry's access
+/// mode is the only thing standing between the instruction and a constant.
+/// Nothing else in the corpus covers it: the case cannot live there because
+/// Rhai blames `ErrorAssignmentToConstant` on the variable while the VM blames
+/// it on the `[`, a position divergence that predates this instruction and
+/// would fail a whole-outcome comparison for an unrelated reason.
+///
+/// So this compares what the instruction is actually responsible for — that
+/// both sides refuse, and that neither leaves the array written — and ignores
+/// the position they disagree about.
+#[cfg(not(feature = "no_index"))]
+#[test]
+fn a_const_array_refuses_an_indexed_write() {
+    let engine = corpus::engine();
+    const SOURCE: &str = "const A = [1, 2, 3]; A[0] = 9; A";
+
+    let stock = run_stock(&engine, SOURCE);
+    let vm = run_vm(&engine, SOURCE);
+
+    for (arm, outcome) in [("rhai", &stock), ("vm", &vm)] {
+        let err = outcome.result.as_ref().expect_err(&format!("{arm} must refuse the write"));
+        assert!(err.contains("ErrorAssignmentToConstant"), "{arm} refused for the wrong reason: {err}",);
+    }
+
+    // The refusal has to happen before the store, not after it.
+    assert_eq!(stock.scope, vm.scope, "the two sides left different values behind",);
+    assert!(stock.scope.iter().any(|(name, value)| name == "A" && value.contains('1') && !value.contains('9')), "the constant was written despite the refusal: {:?}", stock.scope,);
+}
+
 /// The same for the one unary operator that has a typed instruction.
 ///
 /// `Op::UnOp` runs `!` on a `bool` without resolving a function, so it must sit

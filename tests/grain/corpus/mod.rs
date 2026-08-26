@@ -716,6 +716,14 @@ pub const CASES: &[Case] = &[
     // visible from outside the expression that invented it.
     case("map_read_of_absent_key_is_not_visible_to_a_closure", "let m = #{}; let r = 0; { let f = || m; r = m.zz; } [m, r]"),
     case("op_assign_indexed", "let a = [1, 2, 3]; a[0] += 10; a"),
+    // The shapes `Op::IndexSet` speculates on but must hand back: an index
+    // that counts from the end, one that is off the end, a root that is a map
+    // rather than an array, and one whose cell is shared with a closure. Each
+    // has to reach the same answer the general walk gives, error included.
+    case("index_assign_negative", "let a = [1, 2, 3]; a[-1] = 9; a"),
+    case("error_index_assign_out_of_bounds", "let a = [1, 2, 3]; a[10] = 9; a"),
+    case("index_assign_map_root", r#"let m = #{}; m["k"] = 9; m"#),
+    case("index_assign_float_index", "let a = [1, 2, 3]; let i = 1; a[i] = 9; a"),
     // A chain is walked where its root lives rather than in a copy of it, so
     // the access mode of the entry is what refuses a write — not the fact that
     // the walk was handed something detached. All three have to agree with

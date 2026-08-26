@@ -4674,6 +4674,60 @@ impl<'e> Vm<'e> {
                     self.stack.push(value);
                 }
 
+                code::tag::INDEX_SET => {
+                    // The compiler has already decided the shape, so what is
+                    // left to test is the types — which it could not know. A
+                    // slot holding a writable, unshared `Array` and an index
+                    // that is a non-negative integer inside it runs here; a
+                    // map, a shared cell, a host type with an indexer or an
+                    // out-of-range index breaks out and is answered by the
+                    // chain below, reporting exactly what it reports.
+                    //
+                    // The operands are the chain's own: the index is under the
+                    // value, and an assigning chain leaves unit behind.
+                    let mut assigned = false;
+                    'fast: {
+                        let Some(under) = self.stack.len().checked_sub(2) else {
+                            break 'fast;
+                        };
+                        let Union::Int(i, ..) = self.stack[under].0 else {
+                            break 'fast;
+                        };
+                        // A negative index counts from the end, which is
+                        // `get_indexed_mut`'s rule and not worth restating.
+                        let Ok(i) = usize::try_from(i) else {
+                            break 'fast;
+                        };
+                        let at = base + small(3)? as usize;
+                        if at >= scope.len() {
+                            break 'fast;
+                        }
+                        let Union::Array(array, _, AccessMode::ReadWrite) =
+                            &mut scope.get_mut_by_index(at).0
+                        else {
+                            break 'fast;
+                        };
+                        let Some(cell) = array.get_mut(i) else {
+                            break 'fast;
+                        };
+                        *cell = self.stack.pop().expect("the value is on the stack");
+                        self.stack.pop();
+                        self.stack.push(Dynamic::UNIT);
+                        assigned = true;
+                    }
+                    if assigned {
+                        pc += width;
+                        continue;
+                    }
+
+                    let index = u32::from(small(1)?);
+                    let chain = program
+                        .chain(index)
+                        .ok_or_else(|| malformed(format!("no chain {index}")))?;
+                    let value = self.run_chain(program, chain, index, scope, base, pos!())?;
+                    self.stack.push(value);
+                }
+
                 code::tag::UNWIND_TO => {
                     let depth = small(1)?;
                     let target = base + depth as usize;
