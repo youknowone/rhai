@@ -25,7 +25,7 @@
 
 use alloc::borrow::Cow;
 
-use crate::grain::bytecode::{BinOpKind, BinOperand, Op, Receiver};
+use crate::grain::bytecode::{BinOpKind, BinOperand, Op, Receiver, UnOpKind};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -207,6 +207,14 @@ pub mod tag {
     pub const BIN_OP_FROM_LOCAL: u8 = 0x4d;
     /// [`Op::BinOpFrom`](super::Op::BinOpFrom) with a constant on the right.
     pub const BIN_OP_FROM_CONST: u8 = 0x4e;
+    /// [`Op::UnOp`](super::Op::UnOp).
+    ///
+    /// The same operand layout as [`CALL`], with the kind byte where the
+    /// argument count would be — a unary operator's count is always one, so
+    /// the byte was a constant. That is what lets the VM's fallback be the
+    /// `CALL` arm itself rather than a copy of it. There is no operator-pool
+    /// index, because a unary operator has no built-in lookup to fall back to.
+    pub const UN_OP: u8 = 0x4f;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -299,6 +307,7 @@ static WIDTHS: [u8; 256] = {
 
     widths[tag::CALL_OP as usize] = 6;
     widths[tag::BIN_OP as usize] = 6;
+    widths[tag::UN_OP as usize] = 4;
     widths[tag::CALL_LOCAL_REF as usize] = 6;
     widths[tag::CALL_LOCAL_REF_CAPTURE as usize] = 6;
     widths[tag::CALL_NAMED_REF as usize] = 6;
@@ -577,6 +586,12 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*kind as u8);
                 code.extend_from_slice(&small(*op as usize, "operators")?.to_le_bytes());
+            }
+
+            Op::UnOp { name, kind } => {
+                code.push(tag::UN_OP);
+                code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
+                code.push(*kind as u8);
             }
 
             Op::CallRef {
@@ -890,6 +905,7 @@ fn encoded_width(op: &Op) -> usize {
         | Op::AssignThis { op: Some(..) }
         | Op::CheckSize { .. } => 3,
         Op::Call { op: None, .. }
+        | Op::UnOp { .. }
         | Op::CallRef {
             receiver: Receiver::This,
             ..
@@ -1030,6 +1046,11 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             name: u32::from(small(1)?),
             op: u32::from(small(4)?),
             kind: BinOpKind::from_byte(code[at + 3])?,
+        },
+
+        tag::UN_OP => Op::UnOp {
+            name: u32::from(small(1)?),
+            kind: UnOpKind::from_byte(code[at + 3])?,
         },
 
         tag @ (tag::CALL_LOCAL_REF | tag::CALL_LOCAL_REF_CAPTURE) => Op::CallRef {

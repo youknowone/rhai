@@ -465,6 +465,27 @@ pub const CASES: &[Case] = &[
     // literal is observable.
     case("map_computed_order", r#"let log = ""; fn note(s, c) { s + c } let m = #{ a: note("", "x"), b: note("", "y") }; m.a + m.b"#),
     case("nested_containers", r#"let m = #{ xs: [1, 2, #{ y: 3 }] }; m.xs[2].y"#),
+    // --- unary operators --------------------------------------------------
+    // `!` on a `bool` is the one unary operator the walker short-circuits
+    // under fast operators, and so the only one the VM runs itself
+    // (`Op::UnOp`). The rest of these are the shapes that must still reach a
+    // registered function.
+    case("unary_not_bool", "let b = true; !b"),
+    case("unary_not_guard", "let b = false; let n = 0; if !b { n = 1; } n"),
+    case("unary_not_twice", "let b = true; !!b"),
+    // Not a `bool`, so the typed arm declines and the dispatch answers — with
+    // an error, because no `!` is registered for an integer.
+    case("error_unary_not_int", "let i = 1; !i"),
+    // A shared cell holding a `bool`. The typed arm does not flatten, so this
+    // is the dispatching path reaching the same answer. The capture is scoped
+    // to a block: a closure left in the top-level scope renders differently on
+    // the two sides, which would fail this for a reason that is not `!`.
+    case("unary_not_shared", "let b = true; { let f = || b; } b = false; !b"),
+    // Neither `-` nor `+` is short-circuited by the walker, so both stay
+    // ordinary calls to `packages::arithmetic` and must keep answering as one.
+    case("unary_neg_int", "let i = 7; -i"),
+    case("unary_plus_int", "let i = 7; +i"),
+    case("unary_neg_expr", "let i = 7; let j = 2; -(i * j)"),
     // --- control flow -----------------------------------------------------
     case("if_else", "let a = 5; if a > 3 { \"big\" } else { \"small\" }"),
     case("while_loop", "let i = 0; let s = 0; while i < 5 { s += i; i += 1; } s"),

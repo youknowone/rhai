@@ -325,6 +325,61 @@ fn a_registered_operator_on_primitives_follows_rhais_own_gate() {
     }
 }
 
+/// The same for the one unary operator that has a typed instruction.
+///
+/// `Op::UnOp` runs `!` on a `bool` without resolving a function, so it must sit
+/// behind the same gate the walker's own unary short-circuit does
+/// (`func/call.rs` `eval_fn_call_expr`, which takes it only under
+/// `fast_operators` and only for `Token::Bang`). With the gate off both sides
+/// dispatch and a registered `!` wins.
+///
+/// The second half is again what stops this being a tautology, and the third
+/// case is the control: `-` has no typed instruction and no short-circuit on
+/// either side, so a registration for it must win at *both* settings.
+#[test]
+fn a_registered_unary_operator_follows_rhais_own_gate() {
+    // Answers no built-in could: `!` is the identity on a `bool`, so a `!true`
+    // that dispatches is `true` and one that short-circuits is `false`. And
+    // `-` on an integer adds one, which no negation does.
+    fn engine_with_operators(fast: bool) -> Engine {
+        let mut engine = corpus::engine();
+        engine.set_fast_operators(fast);
+        engine.register_fn("!", |x: bool| x);
+        engine.register_fn("-", |x: rhai::INT| x + 1);
+        engine
+    }
+
+    // The first two witness the gate. `!!b` cannot and is here only for the
+    // agreement above: applying an identity twice and negating twice are the
+    // same answer, so it reads the same at both settings however it ran.
+    const GATED: &[&str] = &["let b = true; !b", "let b = false; if !b { 1 } else { 0 }", "let b = true; !!b"];
+    const OBSERVABLE: usize = 2;
+    // No short-circuit exists for `-` on either side, so the gate does not
+    // apply and the registration runs at both settings.
+    const UNGATED: &[&str] = &["let i = 7; -i"];
+
+    let fast = engine_with_operators(true);
+    let slow = engine_with_operators(false);
+
+    for source in GATED.iter().chain(UNGATED) {
+        assert_eq!(run_stock(&fast, source), run_vm(&fast, source), "fast operators: the VM disagreed with Rhai on `{source}`",);
+        assert_eq!(run_stock(&slow, source), run_vm(&slow, source), "dispatched operators: the VM disagreed with Rhai on `{source}`",);
+    }
+
+    // The gate is observable, so agreeing above meant something.
+    for source in &GATED[..OBSERVABLE] {
+        assert_ne!(run_stock(&fast, source), run_stock(&slow, source), "Rhai itself must answer `{source}` differently at the two settings, or the agreement above is vacuous",);
+        assert_ne!(run_vm(&fast, source), run_vm(&slow, source), "the VM must answer `{source}` differently at the two settings, or it is not reading the gate at all",);
+    }
+
+    // And `-` is not behind it, on either side. A VM that had given every
+    // unary operator a typed instruction would fail here rather than above.
+    for source in UNGATED {
+        assert_eq!(run_stock(&fast, source), run_stock(&slow, source), "Rhai does not gate `-`, so `{source}` must answer the same at both settings",);
+        assert_eq!(run_vm(&fast, source), run_vm(&slow, source), "the VM must not gate `-` either",);
+    }
+}
+
 /// A `switch` subject, a `for` range and an `if` guard are all operands too.
 ///
 /// The typed operator instruction is emitted for every binary operator the VM

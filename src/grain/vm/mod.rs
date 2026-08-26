@@ -37,7 +37,7 @@ mod arith;
 mod callback;
 
 use crate::grain::bytecode::{
-    code, AssignOp, BinOpKind, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail,
+    code, AssignOp, BinOpKind, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail, UnOpKind,
 };
 use crate::grain::program::{Program, SharedModule, SharedProgram};
 
@@ -286,6 +286,25 @@ fn apply_binary(kind: BinOpKind, lhs: &Dynamic, rhs: &Dynamic) -> Option<RhaiRes
     }
 
     None
+}
+
+/// The same for `op x`.
+///
+/// The coverage here is not a built-in table's — there is no unary one — it is
+/// the walker's. `eval_fn_call_expr` short-circuits exactly one unary operator
+/// under `fast_operators`, `!` on a `Union::Bool`, and resolves a function for
+/// every other one. Answering for a second pair would answer a host-registered
+/// unary operator differently from the tree this VM replaces.
+///
+/// A shared cell is not flattened first, matching [`apply_binary`]: it answers
+/// `None` and the caller dispatches, which reaches the same function the
+/// walker reaches for it.
+#[inline]
+fn apply_unary(kind: UnOpKind, operand: &Dynamic) -> Option<Dynamic> {
+    match (kind, &operand.0) {
+        (UnOpKind::Not, Union::Bool(b, ..)) => Some((!*b).into()),
+        _ => None,
+    }
 }
 
 /// The same for `x op= y`, applied in place.
@@ -4170,7 +4189,8 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_OP
                 | code::tag::BIN_OP
                 | code::tag::BIN_OP_FROM_LOCAL
-                | code::tag::BIN_OP_FROM_CONST => {
+                | code::tag::BIN_OP_FROM_CONST
+                | code::tag::UN_OP => {
                     // A fused operator names its operands instead of taking
                     // them off the stack; pushed here so that everything below
                     // — the typed arms and the dispatch they fall through to —
@@ -4251,14 +4271,43 @@ impl<'e> Vm<'e> {
                         }
                     }
 
+                    // The same for one operand, and the same gate for the
+                    // same reason: the walker short-circuits `!` on a `bool`
+                    // under `fast_operators` and resolves a function for it
+                    // without (`func/call.rs` `eval_fn_call_expr`).
+                    //
+                    // One value in and one out, so the operand's slot is where
+                    // the result belongs and the stack does not change depth.
+                    let unary = tag == code::tag::UN_OP;
+                    if unary && self.engine.fast_operators() {
+                        let under = self.stack.len().checked_sub(1).ok_or_else(|| {
+                            malformed("operator with too few operands".to_string())
+                        })?;
+                        // An unknown kind byte is not an error here, as above:
+                        // the dispatch below answers whatever it answers.
+                        if let Some(kind) = UnOpKind::from_byte(code[pc + 3]) {
+                            if let Some(value) = apply_unary(kind, &self.stack[under]) {
+                                self.stack[under] = value;
+                                pc += width;
+                                continue;
+                            }
+                        }
+                    }
+
                     let name_index = u32::from(small(1)?);
                     let name = program
                         .name(name_index)
                         .ok_or_else(|| malformed(format!("no name {name_index}")))?;
                     let capture = tag == code::tag::CALL_CAPTURE;
                     // The kind byte sits where an argument count would, because
-                    // an operator's count is always two.
-                    let argc = if typed { 2 } else { code[pc + 3] as usize };
+                    // an operator's count is always two — or, for `UN_OP`, one.
+                    let argc = if typed {
+                        2
+                    } else if unary {
+                        1
+                    } else {
+                        code[pc + 3] as usize
+                    };
                     let op = if typed || tag == code::tag::CALL_OP {
                         let index = u32::from(small(4)?);
                         Some(

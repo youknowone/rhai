@@ -51,6 +51,54 @@ pub enum BinOpKind {
     LessEquals = 16,
 }
 
+/// A unary operator the VM can execute without resolving a function.
+///
+/// What [`Op::UnOp`] carries. The same speculation as [`BinOpKind`]: it names
+/// the operator, never the operand type, and a site holding anything the VM
+/// cannot run falls back to the dispatch [`Op::Call`] would have done.
+///
+/// Only `!` is here, and the set is not an accident of coverage — it is the
+/// walker's. `eval_fn_call_expr` short-circuits exactly one unary operator
+/// under `Engine::fast_operators`, `!` on a `Union::Bool`, and dispatches
+/// every other one. Adding `-` here would answer a host-registered `-` on an
+/// integer differently from the tree this VM replaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UnOpKind {
+    /// `!`
+    Not = 0,
+}
+
+impl UnOpKind {
+    /// The last value, so the encoding can reject a byte that names nothing.
+    pub const LAST: u8 = Self::Not as u8;
+
+    /// Which unary operator a token is, if the VM has an implementation.
+    ///
+    /// `-` and `+` answer `None` and keep dispatching: they are registered
+    /// functions (`packages::arithmetic` `neg` and `plus`) that a host may
+    /// replace, and the walker resolves them rather than short-circuiting.
+    #[must_use]
+    pub const fn of(token: &Token) -> Option<Self> {
+        Some(match token {
+            Token::Bang => Self::Not,
+            _ => return None,
+        })
+    }
+
+    /// Recover a kind from the byte an instruction carries.
+    ///
+    /// `None` for a byte that names nothing, which is what stops a corrupt
+    /// artifact from reaching an unchecked transmute.
+    #[must_use]
+    pub const fn from_byte(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::Not,
+            _ => return None,
+        })
+    }
+}
+
 impl BinOpKind {
     /// The last value, so the encoding can reject a byte that names nothing.
     pub const LAST: u8 = Self::LessEquals as u8;
@@ -885,6 +933,30 @@ pub enum Op {
         op: u32,
         /// Which operator this is.
         kind: BinOpKind,
+    },
+
+    /// Apply a unary operator to the top of the stack, replacing it.
+    ///
+    /// [`Op::BinOp`] for one operand, and speculative in the same way: the
+    /// compiler emits it for the operator, the VM tests the operand, and a
+    /// value the typed arm declines takes exactly the [`Op::Call`] path and
+    /// reports what that path reports.
+    ///
+    /// No operator-pool index rides along, unlike [`Op::BinOp`]. A unary
+    /// operator has no built-in lookup to fall back *to* — `!` on a non-`bool`
+    /// is an ordinary call to a registered function — and the token would not
+    /// survive the artifact anyway, because `UnaryMinus` and `Minus` share the
+    /// syntax `"-"`. So the fallback is the plain `CALL` arm, which is what
+    /// this instruction's operand layout is: the kind byte sits where the
+    /// argument count would, a unary operator's count being always one.
+    ///
+    /// Gated at run time on `Engine::fast_operators()`, matching the walker's
+    /// own unary short-circuit in `eval_fn_call_expr`.
+    UnOp {
+        /// The operator's name, for the dispatch fallback and error messages.
+        name: u32,
+        /// Which operator this is.
+        kind: UnOpKind,
     },
 
     /// Apply a binary operator to a local and a second operand named by the

@@ -19,7 +19,7 @@ use crate::{Dynamic, ImmutableString, Position, AST};
 use crate::grain::bytecode::{
     assemble, resolve_switch_targets, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Op, Positions,
     Receiver,
-    Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail,
+    Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind,
 };
 use crate::grain::compile::poolable::is_poolable;
 use crate::grain::compile::slots::Slots;
@@ -2020,8 +2020,19 @@ impl Lowering {
             self.expression(arg);
         }
         let name = self.push_name(call.name.clone());
+
+        // The one unary operator the walker short-circuits, as its own
+        // instruction. It is emitted before the operator pool is consulted
+        // because it wants nothing from it. See [`Op::UnOp`].
+        if argc == 1 {
+            if let Some(kind) = call.op_token.as_ref().and_then(UnOpKind::of) {
+                self.emit_at(Op::UnOp { name, kind }, pos);
+                return;
+            }
+        }
+
         // Only for a binary operator, which is the only shape the built-in
-        // lookup takes. Keeping a unary one would be dead weight and worse:
+        // lookup takes. A unary one could not carry an index in any case:
         // `UnaryMinus` and `Minus` share the syntax `"-"`, so it is a token
         // that cannot be written to an artifact at all.
         let token = (argc == 2).then(|| call.op_token.clone()).flatten();
