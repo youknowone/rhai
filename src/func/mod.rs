@@ -17,7 +17,12 @@ pub use builtin::{get_builtin_binary_op_fn, get_builtin_op_assignment_fn};
 pub use call::ensure_no_data_race;
 #[cfg(not(feature = "no_function"))]
 pub use call::is_anonymous_fn;
-pub use call::{is_syntactic_fn_name, CallSite, FnCallArgs};
+// Only the compiled VM asks the question from outside this module: the walker
+// gets the same answer from its parser, and `exec_syntactic_fn_call` asks it of
+// itself either way.
+#[cfg(feature = "grain")]
+pub use call::is_syntactic_fn_name;
+pub use call::{CallSite, FnCallArgs};
 pub use func_args::FuncArgs;
 #[cfg(not(feature = "no_function"))]
 pub use func_trait::Func;

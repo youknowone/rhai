@@ -800,6 +800,10 @@ impl Scope<'_> {
     /// If the entry by the specified name is not found, [`None`] is returned.
     ///
     /// If the entry is read-only, [`Some`]`(`[`None`]`))` is returned.
+    ///
+    /// The compiled VM's only reader: the walker reaches the same entry through
+    /// [`Scope::get_mut`], which flattens a shared cell on the way out.
+    #[cfg(feature = "grain")]
     #[inline]
     #[must_use]
     pub(crate) fn get_mut_raw(&mut self, name: &str) -> Option<Option<&mut Dynamic>> {
