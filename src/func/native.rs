@@ -537,7 +537,7 @@ impl<'a> NativeCallContext<'a> {
             return self
                 .engine()
                 .exec_native_fn_call(
-                    global, caches, fn_name, op_token, hash, args, is_ref_mut, false, pos,
+                    global, caches, fn_name, op_token, hash, args, is_ref_mut, false, pos, None,
                 )
                 .map(|(r, ..)| r);
         }
@@ -567,6 +567,7 @@ impl<'a> NativeCallContext<'a> {
                 is_ref_mut,
                 is_method_call,
                 pos,
+                None,
             )
             .map(|(r, ..)| r)
     }

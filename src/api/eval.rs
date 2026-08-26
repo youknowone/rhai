@@ -402,6 +402,7 @@ impl Engine {
             is_ref_mut,
             is_method_call,
             Position::NONE,
+            None,
         )
         .map(|(v, ..)| v)
     }

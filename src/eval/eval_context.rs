@@ -2,6 +2,7 @@
 
 use super::{Caches, GlobalRuntimeState};
 use crate::ast::FnCallHashes;
+use crate::func::CallSite;
 use crate::tokenizer::{is_valid_identifier, Token};
 use crate::types::dynamic::Variant;
 use crate::{
@@ -263,6 +264,7 @@ impl<'a, 's, 'ps, 'g, 'c, 't> EvalContext<'a, 's, 'ps, 'g, 'c, 't> {
             is_ref_mut,
             false,
             Position::NONE,
+            None,
         )
         .and_then(|result| {
             result.try_cast_result().map_err(|r| {
@@ -310,6 +312,7 @@ impl<'a, 's, 'ps, 'g, 'c, 't> EvalContext<'a, 's, 'ps, 'g, 'c, 't> {
             is_ref_mut,
             false,
             Position::NONE,
+            None,
         )
         .and_then(|result| {
             result.try_cast_result().map_err(|r| {
@@ -366,6 +369,7 @@ impl<'a, 's, 'ps, 'g, 'c, 't> EvalContext<'a, 's, 'ps, 'g, 'c, 't> {
             is_ref_mut,
             is_method_call,
             Position::NONE,
+            None,
         )
     }
     /// Call a registered native Rust function inside the [evaluation context][`EvalContext`].
@@ -406,6 +410,7 @@ impl<'a, 's, 'ps, 'g, 'c, 't> EvalContext<'a, 's, 'ps, 'g, 'c, 't> {
             is_ref_mut,
             false,
             Position::NONE,
+            None,
         )
     }
 
@@ -485,39 +490,56 @@ pub(crate) fn _call_fn_raw(
     is_ref_mut: bool,
     is_method_call: bool,
     pos: Position,
+    site: Option<&CallSite>,
 ) -> RhaiResult {
     defer! { let orig_level = global.level; global.level += 1 }
 
     let fn_name = fn_name.as_ref();
-    let op_token = Token::lookup_symbol_from_syntax(fn_name);
-    let op_token = op_token.as_ref();
     let args_len = args.len();
+
+    // What the call site already worked out about itself, or the same worked
+    // out here for a caller with nowhere to keep it. See [`CallSite`].
+    let looked_up;
+    let op_token = match site {
+        Some(site) => site.op_token,
+        None => {
+            looked_up = Token::lookup_symbol_from_syntax(fn_name);
+            looked_up.as_ref()
+        }
+    };
+    let resolved = site.and_then(|site| site.resolved);
 
     if native_only {
         if let Some(result) = engine.exec_syntactic_fn_call(global, caches, fn_name, args, pos)? {
             return Ok(result);
         }
 
-        let hash = calc_fn_hash(None, fn_name, args_len);
+        let hash = match site {
+            Some(site) => site.hashes.native(),
+            None => calc_fn_hash(None, fn_name, args_len),
+        };
 
         return engine
             .exec_native_fn_call(
-                global, caches, fn_name, op_token, hash, args, is_ref_mut, false, pos,
+                global, caches, fn_name, op_token, hash, args, is_ref_mut, false, pos, resolved,
             )
             .map(|(r, ..)| r);
     }
 
     // Native or script
 
-    let hash = match is_method_call {
-        #[cfg(not(feature = "no_function"))]
-        true => FnCallHashes::from_script_and_native(
-            calc_fn_hash(None, fn_name, args_len - 1),
-            calc_fn_hash(None, fn_name, args_len),
-        ),
-        #[cfg(feature = "no_function")]
-        true => FnCallHashes::from_native_only(calc_fn_hash(None, fn_name, args_len)),
-        _ => FnCallHashes::from_hash(calc_fn_hash(None, fn_name, args_len)),
+    let hash = match site {
+        Some(site) => site.hashes,
+        None => match is_method_call {
+            #[cfg(not(feature = "no_function"))]
+            true => FnCallHashes::from_script_and_native(
+                calc_fn_hash(None, fn_name, args_len - 1),
+                calc_fn_hash(None, fn_name, args_len),
+            ),
+            #[cfg(feature = "no_function")]
+            true => FnCallHashes::from_native_only(calc_fn_hash(None, fn_name, args_len)),
+            _ => FnCallHashes::from_hash(calc_fn_hash(None, fn_name, args_len)),
+        },
     };
 
     engine
@@ -532,6 +554,7 @@ pub(crate) fn _call_fn_raw(
             is_ref_mut,
             is_method_call,
             pos,
+            resolved,
         )
         .map(|(r, ..)| r)
 }

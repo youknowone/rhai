@@ -35,6 +35,31 @@ use num_traits::Float;
 /// Arguments to a function call, which is a list of [`&mut Dynamic`][Dynamic].
 pub type FnCallArgs<'a> = [&'a mut Dynamic];
 
+/// What a caller has already worked out about a call site.
+///
+/// Every field is a function of the call's name and argument count alone,
+/// which a site fixes — so a caller that reaches the same site more than once
+/// can work them out once and hand them over instead. The walker gets the same
+/// answers from its parser and keeps them in the AST node
+/// ([`FnCallExpr::hashes`], [`FnCallExpr::op_token`]); this is for a caller
+/// whose call sites are instructions rather than nodes.
+#[derive(Debug, Clone, Copy)]
+pub struct CallSite<'a> {
+    /// [`Token::lookup_symbol_from_syntax`] of the name.
+    pub op_token: Option<&'a Token>,
+    /// [`calc_fn_hash`] of the name and argument count.
+    pub hashes: FnCallHashes,
+    /// What the site resolved to, for a site that finds the same native
+    /// function every time it runs.
+    ///
+    /// Filling this in asserts two more things about the site, which the caller
+    /// must establish first: that the name is not one
+    /// [`Engine::exec_syntactic_fn_call`] answers, and that no script function
+    /// carries it. Both are lookups this replaces rather than repeats, so a
+    /// caller that cannot establish them leaves this [`None`].
+    pub resolved: Option<&'a FnResolutionCacheEntry>,
+}
+
 /// A type that temporarily stores a mutable reference to a `Dynamic`,
 /// replacing it with a cloned copy.
 #[derive(Debug)]
@@ -127,6 +152,27 @@ pub fn ensure_no_data_race(fn_name: &str, args: &FnCallArgs, is_ref_mut: bool) -
         })
 }
 
+/// Does [`Engine::exec_syntactic_fn_call`] answer a call by this name?
+///
+/// It answers every call to one of these — with a value, or with the error a
+/// wrong argument count earns — and no call to anything else. So the name
+/// alone decides, which is what lets a caller that reaches the same site more
+/// than once decide once and remember it. See [`CallSite::resolved`].
+#[inline]
+#[must_use]
+pub fn is_syntactic_fn_name(name: &str) -> bool {
+    match name {
+        KEYWORD_TYPE_OF => true,
+        #[cfg(not(feature = "no_closure"))]
+        crate::engine::KEYWORD_IS_SHARED => true,
+        #[cfg(not(feature = "no_function"))]
+        crate::engine::KEYWORD_IS_DEF_FN => true,
+        KEYWORD_IS_DEF_VAR | KEYWORD_FN_PTR | KEYWORD_EVAL | KEYWORD_FN_PTR_CALL
+        | KEYWORD_FN_PTR_CURRY => true,
+        _ => false,
+    }
+}
+
 /// Is a function name an anonymous function?
 #[cfg(not(feature = "no_function"))]
 #[inline]
@@ -162,7 +208,7 @@ impl Engine {
     /// 4) Imported modules - functions marked with global namespace
     /// 5) Static registered modules
     #[must_use]
-    fn resolve_fn<'s>(
+    pub(crate) fn resolve_fn<'s>(
         &self,
         _global: &GlobalRuntimeState,
         caches: &'s mut Caches,
@@ -349,17 +395,28 @@ impl Engine {
         is_ref_mut: bool,
         non_volatile_only: bool,
         pos: Position,
+        prefetched: Option<&FnResolutionCacheEntry>,
     ) -> RhaiResultOf<(Dynamic, bool)> {
         self.track_operation(global, pos)?;
 
-        if let Some(result) = self.exec_syntactic_fn_call(global, caches, name, args, pos)? {
-            return Ok((result, false));
-        }
-
         // Check if function access already in the cache
         let local_entry = &mut None;
-        let a = Some(&mut *args);
-        let func = self.resolve_fn(global, caches, local_entry, op_token, hash, a, true);
+        let func = match prefetched {
+            // A caller that already knows what this site finds. Filling that in
+            // asserts the name is not one a syntactic call answers, so neither
+            // that check nor the resolution is repeated and `hash` goes unread.
+            // See [`CallSite::resolved`].
+            prefetched @ Some(..) => prefetched,
+            None => {
+                if let Some(result) =
+                    self.exec_syntactic_fn_call(global, caches, name, args, pos)?
+                {
+                    return Ok((result, false));
+                }
+                let a = Some(&mut *args);
+                self.resolve_fn(global, caches, local_entry, op_token, hash, a, true)
+            }
+        };
 
         if let Some(FnResolutionCacheEntry { func, source }) = func {
             debug_assert!(func.is_native());
@@ -661,7 +718,10 @@ impl Engine {
             | KEYWORD_FN_PTR_CURRY => (),
 
             // Normal functions
-            _ => return Ok(None),
+            _ => {
+                debug_assert!(!is_syntactic_fn_name(fn_name));
+                return Ok(None);
+            }
         }
 
         Err(ERR::ErrorFunctionNotFound(self.gen_fn_call_signature(fn_name, args), pos).into())
@@ -689,10 +749,16 @@ impl Engine {
         is_ref_mut: bool,
         _is_method_call: bool,
         pos: Position,
+        prefetched: Option<&FnResolutionCacheEntry>,
     ) -> RhaiResultOf<(Dynamic, bool)> {
-        // These may be redirected from method style calls.
-        if let Some(result) = self.exec_syntactic_fn_call(global, caches, fn_name, args, pos)? {
-            return Ok((result, false));
+        // These may be redirected from method style calls. A site that arrives
+        // with its resolution has established that neither this nor the script
+        // lookup below has anything to find for its name, which is why both are
+        // skipped rather than repeated. See [`CallSite::resolved`].
+        if prefetched.is_none() {
+            if let Some(result) = self.exec_syntactic_fn_call(global, caches, fn_name, args, pos)? {
+                return Ok((result, false));
+            }
         }
 
         // Check for data race.
@@ -703,7 +769,7 @@ impl Engine {
 
         // Script-defined function call?
         #[cfg(not(feature = "no_function"))]
-        if !hashes.is_native_only() {
+        if prefetched.is_none() && !hashes.is_native_only() {
             let hash = hashes.script();
             let local_entry = &mut None;
             let mut resolved = None;
@@ -773,7 +839,7 @@ impl Engine {
         let hash = hashes.native();
 
         let result = self.exec_native_fn_call(
-            global, caches, fn_name, op_token, hash, args, is_ref_mut, false, pos,
+            global, caches, fn_name, op_token, hash, args, is_ref_mut, false, pos, prefetched,
         );
 
         #[cfg(feature = "internals")]
@@ -908,7 +974,7 @@ impl Engine {
                         // Map it to name(args) in function-call style
                         self.exec_fn_call(
                             global, caches, None, fn_name, None, new_hash, &mut args, false, false,
-                            pos,
+                            pos, None,
                         )
                     }
                 }
@@ -1020,7 +1086,7 @@ impl Engine {
                         // Map it to name(args) in function-call style
                         self.exec_fn_call(
                             global, caches, None, &name, None, new_hash, args, is_ref_mut, true,
-                            pos,
+                            pos, None,
                         )
                     }
                 }
@@ -1173,7 +1239,8 @@ impl Engine {
                             .collect::<FnArgsVec<_>>();
 
                         self.exec_fn_call(
-                            global, caches, None, fn_name, None, hash, args, is_ref_mut, true, pos,
+                            global, caches, None, fn_name, None, hash, args, is_ref_mut, true,
+                            pos, None,
                         )
                     }
                     _ => unreachable!(),
@@ -1445,7 +1512,7 @@ impl Engine {
             return self
                 .exec_fn_call(
                     global, caches, scope, fn_name, op_token, hashes, &mut args, is_ref_mut, false,
-                    pos,
+                    pos, None,
                 )
                 .map(|(v, ..)| v);
         }
@@ -1520,6 +1587,7 @@ impl Engine {
 
         self.exec_fn_call(
             global, caches, None, fn_name, op_token, hashes, &mut args, is_ref_mut, false, pos,
+            None,
         )
         .map(|(v, ..)| v)
     }
@@ -1811,7 +1879,7 @@ impl Engine {
             } else {
                 let operand = &mut [&mut value];
                 self.exec_fn_call(
-                    global, caches, None, name, op_token, *hashes, operand, false, false, pos,
+                    global, caches, None, name, op_token, *hashes, operand, false, false, pos, None,
                 )
                 .map(|(v, ..)| v)
             };
@@ -1850,6 +1918,7 @@ impl Engine {
             return self
                 .exec_fn_call(
                     global, caches, None, name, op_token, *hashes, operands, false, false, pos,
+                    None,
                 )
                 .map(|(v, ..)| v);
         }

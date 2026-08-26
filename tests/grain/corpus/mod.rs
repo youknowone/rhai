@@ -228,6 +228,9 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "is_def_fn"
                 | "map_computed_order"
                 | "map_read_of_absent_key_is_not_visible_to_a_closure"
+                | "resolution_arity_decides"
+                | "resolution_inside_a_script_function"
+                | "resolution_script_function_shadows_a_native"
                 | "switch_on_a_shared_subject_matches"
                 | "switch_range_on_a_shared_subject_matches"
                 | "temp_root_call"
@@ -971,6 +974,22 @@ pub const CASES: &[Case] = &[
     case("type_of_a_host_type", "let w = widget(1); type_of(w)"),
     case("type_of_method_style", "let s = \"a\"; s.type_of()"),
     case("type_of_a_pointer", "let r = \"\"; { let f = |x| x; r = type_of(f); } r"),
+    // --- call resolution ---
+    // A site that runs more than once resolves once and remembers, so what it
+    // remembered has to be right for every later turn. Each of these puts a
+    // site in a loop and changes one thing under it. A constant argument is
+    // folded by the optimizer, so every one of them computes its argument.
+    case("resolution_repeated_native", "let s = 0; for i in 0..5 { s += abs(0 - i - 1); } s"),
+    case("resolution_two_sites_one_name", "let s = 0; for i in 0..5 { s += abs(0 - i - 1) + abs(0 - i - 2); } s"),
+    case("resolution_alternating_argument_types", "let t = \"\"; for i in 0..4 { let x = if i % 2 == 0 { 7 + i } else { \"s\" }; t += to_string(x); } t"),
+    case("resolution_arity_decides", "fn abs(x, y) { x + y } let s = 0; for i in 0..4 { s += abs(0 - i - 1) + abs(i, 1); } s"),
+    case("resolution_script_function_shadows_a_native", "fn abs(x) { 999 } let s = 0; for i in 0..3 { s += abs(0 - i - 1); } s"),
+    case("resolution_syntactic_name_in_a_loop", "let t = \"\"; for i in 0..3 { t += type_of(i + 0); } t"),
+    case("resolution_inside_a_script_function", "fn g(n) { abs(n) } let s = 0; for i in 0..4 { s += g(0 - i - 1); } s"),
+    case("error_resolution_function_not_found", "let s = 0; for i in 0..2 { s += nosuch(i); } s"),
+    // A shared cell holds whatever is inside the lock, so a site that sees one
+    // may not be answered out of what it resolved for anything else.
+    case("closure_shared_argument_to_a_native", "let x = 0 - 5; { let f = || x; } let s = 0; for i in 0..3 { s += abs(x); } s"),
     // --- optimizer ---
     case("optimizer_folding_switch", "let a = 1; { let b = 99; switch b { _ => b } }"),
     case("optimizer_folding_variables_access", "let a = 1; { let b = 99; b; b; b; b }"),

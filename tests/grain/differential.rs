@@ -1097,3 +1097,172 @@ fn one_vm_running_two_programs_does_not_answer_the_second_out_of_the_first() {
     assert_eq!(run(&mut vm, &compare), "false");
     assert_eq!(run(&mut vm, &concat), "\"xy\"", "the second program read the first program's operator out of the memo",);
 }
+
+/// One call site seeing many argument types must agree with Rhai on every one.
+///
+/// A site resolves once and keeps what it found, so the keeping has to be
+/// exact: which function Rhai resolves for a call depends on the argument
+/// *types* as well as the name and the count, and the same site in a loop sees
+/// whatever the loop hands it. This runs one site over every arm a value can
+/// be, including the two whose type its discriminant does not fix — a shared
+/// cell and a custom type — which is why no entry is ever made for those.
+///
+/// `probe` is registered here rather than borrowed from a package because it
+/// has to resolve to a *visibly different* function per type: Rhai's own
+/// `to_string` has a `Dynamic` registration behind the typed ones, so a stale
+/// entry for it can still answer correctly and would prove nothing.
+#[cfg(not(feature = "no_function"))]
+#[test]
+fn one_call_site_seeing_many_argument_types_agrees_with_rhai() {
+    let mut engine = corpus::engine();
+    #[derive(Clone)]
+    struct Tag(rhai::INT);
+    engine.register_type_with_name::<Tag>("Tag");
+    engine.register_fn("tag", |n: rhai::INT| Tag(n));
+    // A second custom type, so the site sees two values that are the same
+    // *arm* and different types — which is what an entry keyed on the arm
+    // rather than on the type would get wrong.
+    #[derive(Clone)]
+    struct Label(char);
+    engine.register_type_with_name::<Label>("Label");
+    engine.register_fn("label", |c: char| Label(c));
+    engine.register_fn("probe", |l: Label| format!("label{}", l.0));
+    engine.register_fn("probe", |n: rhai::INT| format!("int{n}"));
+    engine.register_fn("probe", |s: rhai::ImmutableString| format!("str{s}"));
+    engine.register_fn("probe", |c: char| format!("char{c}"));
+    engine.register_fn("probe", |b: bool| format!("bool{b}"));
+    engine.register_fn("probe", |_: ()| "unit".to_string());
+    engine.register_fn("probe", |t: Tag| format!("tag{}", t.0));
+
+    const PICK: &str = "fn pick(k) { if k == 0 { 1 } else if k == 1 { \"a\" } else if k == 2 { 'c' } else if k == 3 { true } else if k == 4 { () } else if k == 5 { tag(1) } else { label('z') } }";
+
+    let mut sources: Vec<String> = vec![
+        format!("{PICK} let out = \"\"; for i in 0..7 {{ out += probe(pick(i)) + \",\" }} out"),
+        // The same site with its argument in a local, which is the shape Rhai
+        // rewrites to reach a `&mut` first argument — a different door into the
+        // same resolution.
+        format!("{PICK} let out = \"\"; for i in 0..7 {{ let x = pick(i); out += probe(x) + \",\" }} out"),
+        // The same site reached from nested frames, so a callee writes the slot
+        // the caller is using — and a recursive one, so the generation has to
+        // tell two frames of the same program apart.
+        format!("{PICK} fn show(v) {{ probe(v) }} let out = \"\"; for i in 0..7 {{ out += show(pick(i)) + \",\" }} out"),
+        format!("{PICK} fn walk(i) {{ if i >= 7 {{ \"\" }} else {{ probe(pick(i)) + \",\" + walk(i + 1) }} }} walk(0)"),
+    ];
+
+    // A shared cell holds whatever is inside the lock, so its discriminant says
+    // nothing about the resolution — the arm no entry may be made for. Kept
+    // inside a function so no `FnPtr` is left in the top-level scope, where the
+    // two sides render one differently for reasons that predate all of this.
+    #[cfg(all(not(feature = "no_closure"), not(feature = "no_object")))]
+    sources.push(r#"fn probing(a, b) { let f = || a; let g = || b; let out = ""; for i in 0..4 { let x = if i % 2 == 0 { a } else { b }; out += probe(x) + "," } out + `${f.call()}${g.call()}` } probing(1, "a")"#.into());
+
+    #[cfg(not(feature = "no_float"))]
+    {
+        engine.register_fn("probe", |f: rhai::FLOAT| format!("float{f}"));
+        sources.push(format!("{PICK} let out = \"\"; for i in 0..7 {{ out += probe(pick(i)) + probe(2.5) + \",\" }} out"));
+    }
+
+    let mut failures = Vec::new();
+    for source in &sources {
+        let stock = run_stock(&engine, source);
+        let vm = run_vm(&engine, source);
+        assert!(stock.result.is_ok(), "`{source}` must run: {:?}", stock.result);
+        if stock != vm {
+            failures.push(format!("\n  `{source}`\n    rhai: {:?}\n    vm:   {:?}", stock.result, vm.result));
+        }
+    }
+
+    assert!(failures.is_empty(), "{} polymorphic call sites disagreed with Rhai:{}", failures.len(), failures.join(""),);
+}
+
+/// A script function reached through a registered module still wins.
+///
+/// Rhai looks for a script function of the call's name and arity before it
+/// looks for a native one, and a site that remembers a native has to have
+/// established there is no script function to find. The engine below carries
+/// one that shadows a built-in: the walker calls it, so the VM must too.
+///
+/// The shadowing function is registered on the *engine* rather than written in
+/// the script, because a script one is compiled to a chunk and reached before
+/// any of this — which would leave the check below with nothing to establish.
+#[cfg(not(feature = "no_function"))]
+#[cfg(not(feature = "no_module"))]
+#[test]
+fn a_script_function_in_a_registered_module_wins_over_the_native_it_shadows() {
+    let mut engine = corpus::engine();
+    let ast = engine.compile("fn abs(x) { 999 }").expect("the shadowing module parses");
+    let module = rhai::Module::eval_ast_as_new(Scope::new(), &ast, &engine).expect("the module builds");
+    engine.register_global_module(module.into());
+
+    // In a loop, so the second turn is the one that reads back whatever the
+    // first left behind.
+    let source = "let s = 0; for i in 0..3 { s += abs(0 - i - 1); } s";
+    let stock = run_stock(&engine, source);
+    assert_eq!(stock.result, Ok("2997".to_string()), "the walker must reach the shadowing function, or this proves nothing",);
+    assert_eq!(run_vm(&engine, source), stock, "the VM answered the site out of the native `abs` it shadows",);
+}
+
+/// One `Vm` running two programs must not answer the second's calls out of the
+/// first's.
+///
+/// A call site's entry is keyed on the name's index in the program's own pool,
+/// and two programs of the same shape hold different names at the same index.
+/// The frame generation is the field that keeps those apart; nothing else in
+/// the key does. This is [`one_vm_running_two_programs_does_not_answer_the_second_out_of_the_first`]
+/// for calls rather than operators.
+#[test]
+fn one_vm_running_two_programs_does_not_answer_the_second_call_out_of_the_first() {
+    let engine = corpus::engine();
+
+    let compile = |source: &str| {
+        let ast = engine.compile(source).expect("both sources parse");
+        Compiler::new().compile(&ast)
+    };
+    // Byte-identical up to the name, so the two calls land at the same address
+    // and — with one name each — at the same index in their own pools.
+    let sign = compile("let a = 0 - 7; sign(a)");
+    let abs = compile("let a = 0 - 7; abs(a)");
+
+    assert_eq!(sign.code().len(), abs.code().len(), "the two programs must lay out identically, or they do not collide and this proves nothing",);
+
+    let run = |vm: &mut Vm, program: &rhai::grain::Program| {
+        let mut scope = Scope::new();
+        vm.eval_with_scope(&mut scope, program).map_or_else(|err| format!("{err:?}"), |value| format!("{value:?}"))
+    };
+
+    let mut vm = Vm::new(&engine);
+    assert_eq!(run(&mut vm, &sign), "-1", "the first program is the one that fills the memo");
+    assert_eq!(run(&mut vm, &abs), "7", "the second program read the first program's call out of the memo",);
+
+    let mut vm = Vm::new(&engine);
+    assert_eq!(run(&mut vm, &abs), "7");
+    assert_eq!(run(&mut vm, &sign), "-1", "the second program read the first program's call out of the memo",);
+}
+
+/// A name Rhai answers itself keeps answering itself, whatever the host
+/// registered under it.
+///
+/// `type_of` and the names beside it are answered by
+/// `Engine::exec_syntactic_fn_call` before any resolution happens, so a site
+/// carrying one may never be answered out of what a resolution found — and
+/// nothing in the packages is registered under one, so only a host can put a
+/// function there for the two to disagree about. This is that host.
+#[test]
+fn a_name_rhai_answers_itself_is_not_answered_out_of_a_registered_function() {
+    let mut engine = corpus::engine();
+    engine.register_fn("type_of", |_: rhai::INT| "hijacked");
+    #[cfg(not(feature = "no_closure"))]
+    engine.register_fn("is_shared", |_: rhai::INT| "hijacked");
+
+    let mut sources = vec!["let s = \"\"; for i in 0..3 { s += type_of(i + 0); } s"];
+    #[cfg(not(feature = "no_closure"))]
+    sources.push("let s = \"\"; for i in 0..3 { s += is_shared(i + 0); } s");
+
+    for source in sources {
+        let stock = run_stock(&engine, source);
+        // Rhai answers the name itself, so the registration is never reached —
+        // which is what makes the VM reaching it a disagreement.
+        assert!(!format!("{:?}", stock.result).contains("hijacked"), "`{source}`: the walker reached the registration, so this proves nothing: {:?}", stock.result,);
+        assert_eq!(run_vm(&engine, source), stock, "`{source}`: the VM answered a syntactic name out of a registered function",);
+    }
+}

@@ -11,9 +11,11 @@ use std::prelude::v1::*;
 #[cfg(not(feature = "unchecked"))]
 #[cfg(not(all(feature = "no_index", feature = "no_object")))]
 use crate::eval::calc_data_sizes;
-use crate::eval::{Caches, GlobalRuntimeState};
+use crate::eval::{Caches, FnResolutionCacheEntry, GlobalRuntimeState};
 use crate::func::native::FnBuiltin;
-use crate::func::{get_builtin_binary_op_fn, get_builtin_op_assignment_fn};
+use crate::func::{
+    get_builtin_binary_op_fn, get_builtin_op_assignment_fn, is_syntactic_fn_name, CallSite,
+};
 use crate::packages::string_basic::print_with_func;
 use crate::tokenizer::Token;
 use crate::types::dynamic::{AccessMode, DynamicWriteLock, Union};
@@ -21,7 +23,7 @@ use crate::types::fn_ptr::FnPtrType;
 use crate::types::StringsInterner;
 // `Variant` is only re-exported from the crate root under `internals`, so it
 // comes from where it is defined.
-use crate::ast::Expr;
+use crate::ast::{Expr, FnCallHashes};
 #[cfg(not(feature = "no_index"))]
 use crate::Array;
 #[cfg(not(feature = "no_object"))]
@@ -64,6 +66,9 @@ macro_rules! is_shared {
 }
 
 /// Make a function call into Rhai using [`_call_fn_raw`](crate::eval::_call_fn_raw).
+///
+/// `site` is what the call site already worked out about itself, for a site
+/// that has run before and kept it. See [`CallMemo`].
 #[inline(always)]
 fn call_engine(
     engine: &Engine,
@@ -75,10 +80,17 @@ fn call_engine(
     is_ref_mut: bool,
     is_method_call: bool,
     pos: Position,
+    site: Option<&CallSite>,
 ) -> VmResult {
-    let native_only = !crate::tokenizer::is_valid_identifier(fn_name);
-    #[cfg(not(feature = "no_function"))]
-    let native_only = native_only && !crate::parser::is_anonymous_fn(fn_name);
+    // A site is only ever made for a name a script function could carry, so a
+    // site that exists has already answered this. Asserted rather than assumed,
+    // because widening [`memoisable_name`] would otherwise send a call down the
+    // other of the dispatch's two branches without anything saying so.
+    debug_assert!(
+        site.is_none() || is_identifier(fn_name),
+        "`{fn_name}` has a call site but is a name only a native can carry"
+    );
+    let native_only = site.is_none() && !is_identifier(fn_name);
 
     crate::eval::_call_fn_raw(
         engine,
@@ -91,7 +103,21 @@ fn call_engine(
         is_ref_mut,
         is_method_call,
         pos,
+        site,
     )
+}
+
+/// Whether Rhai would look for a script function of this name, rather than
+/// treating the name as one only a native can carry.
+///
+/// `func/native.rs:475`, which is where the dispatch decides it.
+#[inline]
+#[must_use]
+fn is_identifier(fn_name: &str) -> bool {
+    let identifier = crate::tokenizer::is_valid_identifier(fn_name);
+    #[cfg(not(feature = "no_function"))]
+    let identifier = identifier || crate::parser::is_anonymous_fn(fn_name);
+    identifier
 }
 
 /// Stamp the call site on an error that passes through a function boundary unwrapped,
@@ -258,6 +284,250 @@ fn resolve_operator(
         resolved,
     };
     resolved
+}
+
+/// How many call sites the memo below holds at once.
+///
+/// Direct-mapped and small for [`OPERATOR_MEMO_SLOTS`]'s reasons, and keyed on
+/// the name rather than the address so that two sites calling the same
+/// function of the same arity share one entry.
+const CALL_MEMO_SLOTS: usize = 16;
+
+/// What a call site resolved to, the last time it ran.
+///
+/// Rhai answers a call by name: it hashes the name with the argument count, and
+/// then the argument types on top of that, and looks the result up in the
+/// resolution cache the run carries (`func/call.rs` `resolve_fn`). The walker
+/// pays only the second half, because its parser worked out the first and left
+/// it in the AST node (`FnCallExpr::hashes`). An instruction has nowhere to
+/// leave it, so without this a site in a loop hashes its own name once a turn
+/// and asks the same three questions again every time.
+///
+/// This is where the answers are left instead. What an entry replaces is a
+/// hash of the name, a lookup for a script function of that name, the check for
+/// a syntactic call, and the resolution itself — all of which Rhai skips when
+/// handed a [`CallSite`], and none of which it skips otherwise.
+///
+/// Four things make an entry unreadable rather than wrong, and every one of
+/// them is checked before it is used:
+///
+/// * **Another frame.** `generation` is the frame that made it. Two frames can
+///   be running two programs, where equal name indices mean different names —
+///   and a frame is also the largest span over which the modules a resolution
+///   searches cannot change. See [`Vm::generation`] and [`memoisable_state`].
+/// * **Other argument types.** `args` is the types it resolved against; a value
+///   whose type its discriminant does not fix stops an entry being made at all.
+///   See [`arg_codes`].
+/// * **Another site in the same slot.** The table is direct-mapped, so `name`
+///   and `argc` say whether what is in a slot belongs to this site.
+/// * **A site the memo may not answer for**, which is remembered as an entry
+///   that says so — otherwise deciding it would cost every call what it saves.
+struct CallMemo {
+    /// Which frame made it. See [`Vm::generation`].
+    generation: u64,
+    /// The name pool index of the site it belongs to.
+    name: u32,
+    /// That site's argument count.
+    argc: u8,
+    /// The argument types it resolved against, four bits each and the first
+    /// argument lowest. See [`arg_codes`].
+    args: u32,
+    /// How many modules were imported when it was made. See [`num_imports`].
+    imports: usize,
+    /// What Rhai's resolution answered, with the hashes the site would have
+    /// computed to ask it — or [`None`] for a site that must go the ordinary
+    /// way, which is worth remembering for the same reason the answer is.
+    resolved: Option<(FnCallHashes, FnResolutionCacheEntry)>,
+}
+
+impl CallMemo {
+    /// Whether this entry is the one a lookup is asking for.
+    #[inline]
+    #[must_use]
+    fn answers(&self, generation: u64, name: u32, argc: usize, args: u32, imports: usize) -> bool {
+        self.generation == generation
+            && self.name == name
+            && usize::from(self.argc) == argc
+            && self.args == args
+            && self.imports == imports
+    }
+
+    /// What this entry says to hand Rhai, if it says anything.
+    #[inline]
+    #[must_use]
+    fn site(&self) -> Option<CallSite<'_>> {
+        self.resolved.as_ref().map(|(hashes, entry)| CallSite {
+            // A site is only made for a name no operator is spelled with, so
+            // this is what the dispatch would have looked up. See
+            // [`memoisable_name`].
+            op_token: None,
+            hashes: *hashes,
+            resolved: Some(entry),
+        })
+    }
+}
+
+/// Which slot a site's entry lives in.
+#[inline]
+#[must_use]
+fn call_memo_slot(name: u32, argc: usize) -> usize {
+    (name as usize ^ argc) & (CALL_MEMO_SLOTS - 1)
+}
+
+/// The argument types packed four bits each, or [`None`] for a call no entry
+/// may be keyed on.
+///
+/// [`None`] for a call with more arguments than fit, and for one carrying a
+/// value whose type its discriminant does not fix ([`type_code`]) — a trait
+/// object's is the boxed value's and a shared cell's is whatever is inside the
+/// lock, and Rhai keys a resolution on the type rather than on the arm.
+#[inline]
+#[must_use]
+fn arg_codes(args: &[&mut Dynamic]) -> Option<u32> {
+    if args.len() > 8 {
+        return None;
+    }
+    let mut packed = 0;
+    for (index, arg) in args.iter().enumerate() {
+        match type_code(arg) {
+            0 => return None,
+            code => packed |= u32::from(code) << (index * 4),
+        }
+    }
+    Some(packed)
+}
+
+/// How many modules the run has imported, or zero where there are no modules.
+///
+/// A resolution searches the function libraries, the global modules and the
+/// imported ones (`func/call.rs` `resolve_fn`). The first two cannot change
+/// under a running frame — a library is stacked around a whole run
+/// ([`Vm::with_environment`]) and registering with the engine wants it by
+/// mutable reference, which a run holds by shared one — and neither can the
+/// third, because the two statements that would declare one both defeat the
+/// lowering outright (`compile/mod.rs`, the `Stmt::Import` and `KEYWORD_EVAL`
+/// arms), so a compiled frame has none to run.
+///
+/// The frame a `Vm` was reentered from may still have imported some, so this is
+/// part of an entry's key rather than a condition on making one: a count is
+/// what says the search this entry answered is the search being made.
+#[inline]
+#[must_use]
+fn num_imports(global: &GlobalRuntimeState) -> usize {
+    #[cfg(not(feature = "no_module"))]
+    return global.num_imports();
+    #[cfg(feature = "no_module")]
+    {
+        let _ = global;
+        0
+    }
+}
+
+/// Whether a call by this name resolves the way an entry assumes.
+///
+/// Two names do not: one Rhai answers itself
+/// ([`is_syntactic_fn_name`](crate::func::is_syntactic_fn_name)), and one no
+/// script function could carry, which the dispatch sends down a path of its own
+/// ([`is_identifier`]). A site is made only for the names that are neither.
+#[inline]
+#[must_use]
+fn memoisable_name(name: &str) -> bool {
+    is_identifier(name) && !is_syntactic_fn_name(name)
+}
+
+/// What Rhai's own dispatch would find for this site, for a site an entry may
+/// be made for at all.
+///
+/// This is the work an entry exists to move: the hashes the dispatch computes
+/// from the name and the argument count, the lookups that rule out a script
+/// function of that name, and the resolution itself — reached through Rhai's
+/// own `resolve_fn`, with the same hash, the same arguments and the same
+/// `allow_dynamic`, so what is kept is what the dispatch would have used.
+///
+/// [`None`] where a site may not be answered from an entry, which is a name
+/// Rhai answers itself, a name only a native can carry, a script function that
+/// would win, or a call that resolves to nothing at all.
+fn resolve_site(
+    engine: &Engine,
+    global: &GlobalRuntimeState,
+    caches: &mut Caches,
+    name: &str,
+    args: &mut [&mut Dynamic],
+) -> Option<(FnCallHashes, FnResolutionCacheEntry)> {
+    if !memoisable_name(name) {
+        return None;
+    }
+
+    // The hashes the dispatch computes for a call that is not method-style,
+    // which the two callers of this both are: passing a variable by reference
+    // is Rhai's rewrite for reaching a `&mut` first argument and does not
+    // change how the name is keyed (`eval/eval_context.rs` `_call_fn_raw`).
+    let hashes = FnCallHashes::from_hash(crate::calc_fn_hash(None, name, args.len()));
+
+    // A script function of this name is reached before any native, and which of
+    // the two a site finds is exactly what an entry may not be wrong about.
+    #[cfg(not(feature = "no_function"))]
+    if engine.has_script_fn(global, caches, hashes.script()) {
+        return None;
+    }
+
+    let local_entry = &mut None;
+    engine
+        .resolve_fn(
+            global,
+            caches,
+            local_entry,
+            None,
+            hashes.native(),
+            Some(args),
+            true,
+        )
+        .filter(|entry| entry.func.is_native())
+        .cloned()
+        .map(|entry| (hashes, entry))
+}
+
+/// The site to hand Rhai for this call, or [`None`] for a call that has to go
+/// the ordinary way.
+///
+/// Works the answer out and keeps it when there is nothing to read back, so a
+/// site costs a resolution once per frame rather than once per call. See
+/// [`CallMemo`].
+///
+/// A free function rather than a method because the arguments are borrowed out
+/// of the operand stack and the scope, and the memo is a different field of the
+/// same `Vm`.
+#[allow(clippy::too_many_arguments)]
+fn call_site<'m>(
+    memo: &'m mut [Option<CallMemo>; CALL_MEMO_SLOTS],
+    engine: &Engine,
+    global: &GlobalRuntimeState,
+    caches: &mut Caches,
+    generation: u64,
+    name_index: u32,
+    name: &str,
+    args: &mut [&mut Dynamic],
+) -> Option<&'m CallMemo> {
+    let argc = args.len();
+    let codes = arg_codes(args)?;
+    let imports = num_imports(global);
+    let slot = call_memo_slot(name_index, argc);
+
+    if memo[slot].as_ref().map_or(true, |entry| {
+        !entry.answers(generation, name_index, argc, codes, imports)
+    }) {
+        memo[slot] = Some(CallMemo {
+            generation,
+            name: name_index,
+            // Bounded by [`arg_codes`], which refuses anything wider.
+            argc: argc as u8,
+            args: codes,
+            imports,
+            resolved: resolve_site(engine, global, caches, name, args),
+        });
+    }
+
+    memo[slot].as_ref()
 }
 
 /// The operator applied to the operands themselves, for the pairs the dispatch
@@ -658,18 +928,23 @@ pub struct Vm<'e> {
     pending_slot: Option<u32>,
     /// What each operator site last resolved to. See [`OperatorMemo`].
     operator_memo: [OperatorMemo; OPERATOR_MEMO_SLOTS],
+    /// What each call site last resolved to. See [`CallMemo`].
+    call_memo: [Option<CallMemo>; CALL_MEMO_SLOTS],
     /// A number identifying the frame currently running.
     ///
-    /// Incremented on entry to [`Vm::run_frame`] and read into a local, so an
-    /// entry the memo holds belongs to exactly one frame and no other. That is
-    /// what makes an address safe to key on: two frames can be at the same
-    /// address in two different programs, and a nested call can evict a slot
-    /// its caller wrote — but neither can be mistaken for a hit, because the
-    /// generation never repeats.
+    /// Handed out on entry to [`Vm::execute`] and put back on the way out, so
+    /// an entry either memo holds belongs to exactly one frame and no other.
+    /// That is what makes a site safe to key on: two frames can be at the same
+    /// address, or hold the same name index, in two different programs, and a
+    /// nested call can evict a slot its caller wrote — but neither can be
+    /// mistaken for a hit, because a generation is never handed out twice.
     ///
-    /// Clearing the table would do the same job and would cost every call the
+    /// Clearing the tables would do the same job and would cost every frame the
     /// memset. A counter costs an increment.
-    operator_generation: u64,
+    generation: u64,
+    /// The last generation handed out, so that the next one is one nothing
+    /// carries. Never read back into an entry.
+    last_generation: u64,
     /// Steps waiting for the statement that asked for them to end.
     ///
     /// Rhai keeps this in a `defer` per AST node (`eval/stmt.rs:271`): a `next`
@@ -759,7 +1034,9 @@ impl<'e> Vm<'e> {
             chain_step: 0,
             pending_slot: None,
             operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
-            operator_generation: 0,
+            call_memo: core::array::from_fn(|_| None),
+            generation: 0,
+            last_generation: 0,
             #[cfg(feature = "debugging")]
             pending_steps: Vec::new(),
         }
@@ -805,10 +1082,12 @@ impl<'e> Vm<'e> {
             owns_trace: false,
             chain_step: 0,
             pending_slot: None,
-            // A memo names an address in a frame of this `Vm`, and a crossing
-            // has none yet.
+            // A memo names a site in a frame of this `Vm`, and a crossing has
+            // none yet.
             operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
-            operator_generation: 0,
+            call_memo: core::array::from_fn(|_| None),
+            generation: 0,
+            last_generation: 0,
             // A step belongs to the statement that asked for it, and that
             // statement is running in the `Vm` this crossing came from.
             #[cfg(feature = "debugging")]
@@ -1705,6 +1984,7 @@ impl<'e> Vm<'e> {
                         true,
                         true,
                         step_pos,
+                        None,
                     )?
                 };
 
@@ -2061,6 +2341,7 @@ impl<'e> Vm<'e> {
                 true,
                 true,
                 step_pos,
+                None,
             )
         };
 
@@ -2196,6 +2477,7 @@ impl<'e> Vm<'e> {
             true,
             false,
             pos,
+            None,
         );
         match result {
             Ok(_) => Ok(()),
@@ -2214,6 +2496,7 @@ impl<'e> Vm<'e> {
                     true,
                     false,
                     pos,
+                    None,
                 )?;
                 *target = value;
                 Ok(())
@@ -2841,6 +3124,21 @@ impl<'e> Vm<'e> {
         // afterwards rather than reusing them.
         let mut args: FnArgsVec<&mut Dynamic> = self.stack[first..].iter_mut().collect();
 
+        // What this site resolved to when it last ran, which is what Rhai has
+        // to work out again for a site with nothing to read back. See
+        // [`CallMemo`].
+        let memo = call_site(
+            &mut self.call_memo,
+            self.engine,
+            &self.global,
+            &mut self.caches,
+            self.generation,
+            name_index,
+            name,
+            &mut args,
+        );
+        let site = memo.and_then(CallMemo::site);
+
         call_engine(
             self.engine,
             &mut self.global,
@@ -2851,6 +3149,7 @@ impl<'e> Vm<'e> {
             false,
             false,
             pos,
+            site.as_ref(),
         )
     }
 
@@ -2999,6 +3298,20 @@ impl<'e> Vm<'e> {
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
                 .chain(self.stack[rest..].iter_mut())
                 .collect();
+            // Keyed the same way [`Vm::call_stacked`] keys it, because it is
+            // the same call: passing the receiver by reference is how Rhai
+            // reaches a `&mut` first argument and is not a different lookup.
+            let memo = call_site(
+                &mut self.call_memo,
+                self.engine,
+                &self.global,
+                &mut self.caches,
+                self.generation,
+                name_index,
+                name,
+                &mut args,
+            );
+            let site = memo.and_then(CallMemo::site);
             // The scope a dispatched script function runs in, which is never
             // this frame's — see [`Vm::call_stacked`], which has to build one
             // for the same reason and cannot borrow this one because the
@@ -3013,6 +3326,7 @@ impl<'e> Vm<'e> {
                 true,
                 false,
                 pos,
+                site.as_ref(),
             )
         };
 
@@ -3075,6 +3389,17 @@ impl<'e> Vm<'e> {
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
                 .chain(self.stack[first + 1..].iter_mut())
                 .collect();
+            let memo = call_site(
+                &mut self.call_memo,
+                self.engine,
+                &self.global,
+                &mut self.caches,
+                self.generation,
+                name_index,
+                name,
+                &mut args,
+            );
+            let site = memo.and_then(CallMemo::site);
             call_engine(
                 self.engine,
                 &mut self.global,
@@ -3085,6 +3410,7 @@ impl<'e> Vm<'e> {
                 true,
                 false,
                 pos,
+                site.as_ref(),
             )
         };
 
@@ -3413,6 +3739,11 @@ impl<'e> Vm<'e> {
         // Each frame's floor is its own. A checkpoint inside a function this
         // one calls must not become what this one unwinds to.
         let outer_floor = mem::replace(&mut self.unwind_floor, base);
+        // The same for what this frame's memo entries are stamped with, except
+        // that the stamp is new rather than saved: a frame's entries must not
+        // be readable from the one it returns to. See [`Vm::generation`].
+        self.last_generation = self.last_generation.wrapping_add(1);
+        let outer_generation = mem::replace(&mut self.generation, self.last_generation);
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
         // than being examined inside it. Catching therefore happens out here:
@@ -3452,6 +3783,7 @@ impl<'e> Vm<'e> {
             self.unwind_after_error(scope);
         }
         self.unwind_floor = outer_floor;
+        self.generation = outer_generation;
         result
     }
 
@@ -3750,11 +4082,9 @@ impl<'e> Vm<'e> {
         }
 
         let code = program.code();
-        // What this frame's operator memo entries are stamped with. Nothing
-        // else can carry it, so nothing else can be read back. See
-        // [`Vm::operator_generation`].
-        self.operator_generation = self.operator_generation.wrapping_add(1);
-        let generation = self.operator_generation;
+        // What this frame's memo entries are stamped with. Nothing else can
+        // carry it, so nothing else can read them back. See [`Vm::generation`].
+        let generation = self.generation;
         // The chunk's entry the first time round, a catch block's address when
         // resumed after one.
         let mut pc = start;

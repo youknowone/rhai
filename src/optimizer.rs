@@ -148,6 +148,7 @@ impl<'a> OptimizerState<'a> {
                 false,
                 true,
                 Position::NONE,
+                None,
             )
             .ok()
             .map(|(v, ..)| v)
