@@ -4685,7 +4685,13 @@ impl<'e> Vm<'e> {
                     //
                     // The operands are the chain's own: the index is under the
                     // value, and an assigning chain leaves unit behind.
+                    // Only an `Array` reaches the fast path, and `no_index`
+                    // takes the arm it destructures with the rest of indexing —
+                    // so there is nothing left here to be fast about, and the
+                    // compiler emits no `IndexSet` on that build either.
+                    #[cfg_attr(feature = "no_index", allow(unused_mut))]
                     let mut assigned = false;
+                    #[cfg(not(feature = "no_index"))]
                     'fast: {
                         let Some(under) = self.stack.len().checked_sub(2) else {
                             break 'fast;

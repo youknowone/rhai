@@ -150,7 +150,7 @@ const fn case(name: &'static str, source: &'static str) -> Case {
 #[must_use]
 pub fn applies_to_this_build(name: &str) -> bool {
     #[cfg(feature = "no_closure")]
-    if name.starts_with("closure_") || name.starts_with("is_shared") {
+    if name.starts_with("closure_") || name.starts_with("is_shared") || name == "unary_not_shared" {
         return false;
     }
     #[cfg(feature = "no_module")]
@@ -275,6 +275,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_array_bounds"
             | "error_const_root_method_step"
             | "error_host_index_bounds"
+            | "error_index_assign_out_of_bounds"
             | "error_index_into_an_unindexable_step"
             | "error_index_into_an_unindexable_step_deep"
             | "error_no_function_for_the_receiver"
@@ -288,6 +289,9 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "for_with_counter"
             | "host_index_get"
             | "host_index_set"
+            | "index_assign_float_index"
+            | "index_assign_map_root"
+            | "index_assign_negative"
             | "host_mutation_before_a_failure_survives_in_an_array"
             | "host_index_temp_set"
             | "host_string_index_property_get_fallback"
@@ -379,6 +383,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "host_string_index_property_set_fallback"
                 | "host_string_index_property_op_assign_fallback"
                 | "host_temp_string_index_property_set_fallback"
+                | "index_assign_map_root"
                 | "index_assign_nested"
                 | "index_expression_reads_the_root"
                 | "interpolation_of_containers"

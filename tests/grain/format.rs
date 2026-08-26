@@ -131,7 +131,8 @@ fn the_round_trip_covers_something_worth_covering() {
         "index_assign_array", // IndexSet, the specialised slot-rooted write
         // and one that keeps the general instruction, so the chain encoder's
         // slot-rooted branch stays covered now that the plain write does not
-        // reach it
+        // reach it — indexed too, and so `no_index` syntax as well
+        #[cfg(not(feature = "no_index"))]
         "op_assign_indexed",
         // and one rooted on the operand stack instead, which takes a method
         // call to get there
