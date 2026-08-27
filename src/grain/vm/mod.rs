@@ -1240,7 +1240,7 @@ impl<'e> Vm<'e> {
                 this,
             );
         };
-        let (params, chunk) = (function.params.clone(), function.chunk);
+        let (params, chunk) = (&*function.params, function.chunk);
 
         // `call_compiled` takes its arguments off the operand stack, where a
         // compiled call site would already have put them.
@@ -1251,7 +1251,7 @@ impl<'e> Vm<'e> {
         let (result, this) = self.call_compiled_with_this(
             program,
             name,
-            &params,
+            params,
             chunk,
             first,
             scope,
@@ -1965,7 +1965,7 @@ impl<'e> Vm<'e> {
                     let typed = self.engine.map_type_name(type_name);
                     program
                         .method(name_index, argc, typed)
-                        .map(|f| (f.params.clone(), f.chunk))
+                        .map(|f| (&*f.params, f.chunk))
                 };
 
                 let mut args: FnArgsVec<Dynamic> =
@@ -1982,7 +1982,7 @@ impl<'e> Vm<'e> {
                     let (result, returned) = self.call_compiled_with_this(
                         program,
                         name,
-                        &params,
+                        params,
                         chunk,
                         at,
                         new_scope,
@@ -2725,7 +2725,7 @@ impl<'e> Vm<'e> {
         // receiver alongside them.
         let function = program
             .function_named(pointer.fn_name(), curried + taken)
-            .map(|f| (f.params.clone(), f.chunk));
+            .map(|f| (&*f.params, f.chunk));
 
         // Bound once, whichever path takes it. Curried values are spliced in
         // above `at`, so the receiver's index is unaffected either way.
@@ -2750,7 +2750,7 @@ impl<'e> Vm<'e> {
             let (result, returned) = self.call_compiled_with_this(
                 program,
                 pointer.fn_name(),
-                &params,
+                params,
                 chunk,
                 first,
                 new_scope,
