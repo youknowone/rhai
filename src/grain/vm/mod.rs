@@ -37,6 +37,8 @@ use crate::{
 
 mod arith;
 mod callback;
+#[cfg(feature = "grain-jit")]
+mod jit;
 
 use crate::grain::bytecode::{
     code, AssignOp, BinOpKind, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail, UnOpKind,
@@ -4133,6 +4135,12 @@ impl<'e> Vm<'e> {
             // only happens after the instruction succeeded — so recording it
             // here names whichever instruction fails.
             *reached = pc;
+
+            // Before anything is decoded, so the state the tracer records is
+            // the state an instruction starts from and a loop that jumps back
+            // to `pc` arrives here holding exactly what it held last time.
+            #[cfg(feature = "grain-jit")]
+            jit::GrainJitDriver.jit_merge_point(pc, program, self, scope, base, reached);
 
             // No check against the chunk's end. Verification proves execution
             // cannot leave it — every path reaches a `Return`, no jump goes
