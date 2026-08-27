@@ -58,6 +58,7 @@ const OUTPUTS: &[&str] = &[
     "insns.bin",
     "descrs.bin",
     "descrs_index.bin",
+    "symbolic_fnaddrs.bin",
 ];
 
 pub fn main() {
@@ -219,6 +220,15 @@ fn write_tables(out_dir: &str, pipeline: &majit_translate::ProgramPipelineResult
         "jit_drivers.bin",
         &bincode::serialize(&pipeline.jit_drivers).unwrap(),
     );
+    // A build script cannot take an address in the process that will run. For
+    // a callee it could not bind, the lowering stores a stable symbolic value
+    // and records the path beside it; the runtime owns the shims for those
+    // paths and swaps the real addresses in before anything is published.
+    write(
+        out_dir,
+        "symbolic_fnaddrs.bin",
+        &bincode::serialize(&pipeline.symbolic_fnaddr_paths).unwrap(),
+    );
     // Through a `BTreeMap` view so the bytes do not depend on hash iteration
     // order: two builds of the same artefact have to produce the same table,
     // or a cached one cannot be reused.
@@ -254,6 +264,11 @@ fn write_empty_tables(out_dir: &str) {
         out_dir,
         "jit_drivers.bin",
         &bincode::serialize(&empty).unwrap(),
+    );
+    write(
+        out_dir,
+        "symbolic_fnaddrs.bin",
+        &bincode::serialize(&Vec::<(i64, String)>::new()).unwrap(),
     );
     write(
         out_dir,

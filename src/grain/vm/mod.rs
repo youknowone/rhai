@@ -39,6 +39,8 @@ mod arith;
 mod callback;
 #[cfg(feature = "grain-jit")]
 mod jit;
+#[cfg(feature = "grain-jit")]
+pub mod jitcodes;
 
 use crate::grain::bytecode::{
     code, AssignOp, BinOpKind, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail, UnOpKind,

@@ -207,6 +207,13 @@ name = "grain_allocation_efficiency"
 path = "tests/grain/allocation.rs"
 required-features = ["grain"]
 
+# Its own binary because it is the only test that needs the lowered tables, and
+# they are only present under `grain-jit`.
+[[test]]
+name = "grain_jitcodes"
+path = "tests/grain/jitcodes.rs"
+required-features = ["grain-jit"]
+
 # The `grain-jit` lowering runs inside `build.rs`, and it is the longest step
 # of a cold build by a wide margin. Cargo compiles build dependencies at
 # `opt-level = 0` by default, which is the wrong trade for an analysis pass
