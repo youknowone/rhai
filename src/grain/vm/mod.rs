@@ -67,6 +67,24 @@ macro_rules! is_shared {
     }};
 }
 
+/// Take an `Option`'s value, or leave through the error the second argument
+/// builds.
+///
+/// The check open-coded rather than written through `Option::ok_or_else`:
+/// `core`'s combinator is opaque to anything reading this loop from outside,
+/// the same reason the operand decoders in `execute` are macros and not
+/// closures. `pyopcode.py:868` spells the same guard as a test and a raise.
+/// The error expression is still evaluated only on the miss, so a `format!`
+/// on the failure path costs nothing on the way through.
+macro_rules! or_raise {
+    ($option:expr, $error:expr) => {
+        match $option {
+            Some(value) => value,
+            None => return Err($error),
+        }
+    };
+}
+
 /// Make a function call into Rhai using [`dispatch_fn`](crate::eval::dispatch_fn).
 ///
 /// `dispatch_fn` rather than `_call_fn_raw` because this is an evaluator making
@@ -733,10 +751,10 @@ fn chain_op<'p>(
     let Tail::Assign { op: Some(op) } = &chain.tail else {
         return Ok(None);
     };
-    program
-        .assign_op(*op)
-        .map(Some)
-        .ok_or_else(|| malformed(format!("no op-assignment {op}")))
+    Ok(Some(or_raise!(
+        program.assign_op(*op),
+        malformed(format!("no op-assignment {op}"))
+    )))
 }
 
 /// One `for` loop in progress.
@@ -805,9 +823,10 @@ fn place<'a>(
     name: &str,
     pos: Position,
 ) -> Result<DynamicWriteLock<'a, Dynamic>, Box<EvalAltResult>> {
-    entry
-        .write_lock::<Dynamic>()
-        .ok_or_else(|| Box::new(EvalAltResult::ErrorDataRace(name.to_string(), pos)))
+    Ok(or_raise!(
+        entry.write_lock::<Dynamic>(),
+        Box::new(EvalAltResult::ErrorDataRace(name.to_string(), pos))
+    ))
 }
 
 /// Write a `for` loop variable into its slot, through a shared cell if one is
@@ -1582,15 +1601,17 @@ impl<'e> Vm<'e> {
     }
 
     fn pop(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
-        self.stack
-            .pop()
-            .ok_or_else(|| malformed("operand stack underflow".to_string()))
+        Ok(or_raise!(
+            self.stack.pop(),
+            malformed("operand stack underflow".to_string())
+        ))
     }
 
     fn inspect(&mut self) -> Result<&Dynamic, Box<EvalAltResult>> {
-        self.stack
-            .last()
-            .ok_or_else(|| malformed("operand stack underflow".to_string()))
+        Ok(or_raise!(
+            self.stack.last(),
+            malformed("operand stack underflow".to_string())
+        ))
     }
 
     /// `reached` tracks the instruction being executed, so a failure can be
@@ -1667,11 +1688,10 @@ impl<'e> Vm<'e> {
     ) -> VmResult {
         // Step operands were pushed first, then the root if it is one that has
         // to be evaluated, then the value being assigned.
-        let operands_at = self
-            .stack
-            .len()
-            .checked_sub(chain.consumes())
-            .ok_or_else(|| malformed("chain with too few operands".to_string()))?;
+        let operands_at = or_raise!(
+            self.stack.len().checked_sub(chain.consumes()),
+            malformed("chain with too few operands".to_string())
+        );
 
         let ChainRoot {
             value: mut root,
@@ -1722,10 +1742,10 @@ impl<'e> Vm<'e> {
             // rather than the cell. Walking the cell would take the host down,
             // so this is a panic-safety fix and not only a correctness one.
             if is_shared!(*root.as_mut()) {
-                let mut guard = root.as_mut().write_lock::<Dynamic>().ok_or_else(|| {
+                let mut guard = or_raise!(root.as_mut().write_lock::<Dynamic>(), {
                     let name = root_name(program, chain).unwrap_or_default();
                     Box::new(EvalAltResult::ErrorDataRace(name.to_string(), pos))
-                })?;
+                });
                 self.walk_chain(
                     program,
                     chain,
@@ -1799,10 +1819,10 @@ impl<'e> Vm<'e> {
             // name's does: this lookup can fail, and Rhai blames the `this`
             // rather than the `.` after it (`eval/chaining.rs:519-527`).
             Root::This { pos: this_pos } => {
-                let value = self
-                    .this
-                    .take()
-                    .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(this_pos)))?;
+                let value = or_raise!(
+                    self.this.take(),
+                    Box::new(EvalAltResult::ErrorUnboundThis(this_pos))
+                );
                 Ok(ChainRoot {
                     value: RootValue::This(value),
                     pos: this_pos,
@@ -1812,9 +1832,7 @@ impl<'e> Vm<'e> {
             // A name has a position of its own, and it wins: the lookup below
             // can fail, and Rhai blames the variable rather than the chain.
             Root::Named { name, pos: var_pos } => {
-                let name = program
-                    .name(name)
-                    .ok_or_else(|| malformed(format!("no name {name}")))?;
+                let name = or_raise!(program.name(name), malformed(format!("no name {name}")));
 
                 // A resolver hands back a value rather than a place, which is
                 // what makes writing through it an error.
@@ -1840,15 +1858,15 @@ impl<'e> Vm<'e> {
                 // (`eval/expr.rs:151` against `:122`) — so a chain assigns
                 // into the copy and discards it, where writing to the name
                 // directly is refused.
-                self.engine
+                let value = self
+                    .engine
                     .global_modules
                     .iter()
-                    .find_map(|module| module.get_var(name))
-                    .map(|value| ChainRoot {
-                        value: RootValue::Detached(value),
-                        pos: var_pos,
-                    })
-                    .ok_or_else(|| missing(name, var_pos))
+                    .find_map(|module| module.get_var(name));
+                Ok(ChainRoot {
+                    value: RootValue::Detached(or_raise!(value, missing(name, var_pos))),
+                    pos: var_pos,
+                })
             }
 
             // Moved off the operand stack rather than copied. The slot it
@@ -1911,9 +1929,10 @@ impl<'e> Vm<'e> {
                 pos: idx_pos,
                 bracket,
             } => {
-                let idx = operands
-                    .get_mut(*operand as usize)
-                    .ok_or_else(|| malformed("chain index operand missing".to_string()))?;
+                let idx = or_raise!(
+                    operands.get_mut(*operand as usize),
+                    malformed("chain index operand missing".to_string())
+                );
                 let mut idx = idx.clone();
                 // Rhai reports an out-of-bounds index against the index and a
                 // value that cannot be indexed at all against this step's `[`.
@@ -1958,9 +1977,10 @@ impl<'e> Vm<'e> {
             } => {
                 let step_pos = *step_pos;
                 let name_index = *name;
-                let name = program
-                    .name(name_index)
-                    .ok_or_else(|| malformed(format!("no name {name_index}")))?;
+                let name = or_raise!(
+                    program.name(name_index),
+                    malformed(format!("no name {name_index}"))
+                );
                 let first = *operand as usize;
                 let argc = *argc as usize;
                 if first + argc > operands.len() {
@@ -2326,17 +2346,16 @@ impl<'e> Vm<'e> {
 
         // The name is a map key for maps, and the same string is what a host
         // type's fallback string indexer is addressed with.
-        let key = program
-            .name(name)
-            .ok_or_else(|| malformed(format!("no name {name}")))?;
+        let key = or_raise!(program.name(name), malformed(format!("no name {name}")));
 
         // A map is the one property holder that is not a host type, and
         // `no_object` removes both it and the syntax that would reach one.
         #[cfg(not(feature = "no_object"))]
         if target.is_map() {
-            let mut map = target
-                .write_lock::<Map>()
-                .ok_or_else(|| malformed("a map that is not a map".to_string()))?;
+            let mut map = or_raise!(
+                target.write_lock::<Map>(),
+                malformed("a map that is not a map".to_string())
+            );
 
             // Only a write creates a key. Rhai passes `add_if_not_found` for
             // an assignment (`eval/chaining.rs:930`) and withholds it for a
@@ -2369,9 +2388,10 @@ impl<'e> Vm<'e> {
 
         // A host type: getter in, setter out.
         let call = |vm: &mut Self, fn_name: u32, args: &mut [&mut Dynamic]| -> VmResult {
-            let fn_name = program
-                .name(fn_name)
-                .ok_or_else(|| malformed(format!("no name {fn_name}")))?;
+            let fn_name = or_raise!(
+                program.name(fn_name),
+                malformed(format!("no name {fn_name}"))
+            );
             call_engine(
                 vm.engine,
                 &mut vm.global,
@@ -2499,12 +2519,14 @@ impl<'e> Vm<'e> {
             return done;
         }
 
-        let op_assign_name = program
-            .name(op.op_assign_name)
-            .ok_or_else(|| malformed(format!("no op-assign name {}", op.op_assign_name)))?;
-        let op_name = program
-            .name(op.op_name)
-            .ok_or_else(|| malformed(format!("no operator name {}", op.op_name)))?;
+        let op_assign_name = or_raise!(
+            program.name(op.op_assign_name),
+            malformed(format!("no op-assign name {}", op.op_assign_name))
+        );
+        let op_name = or_raise!(
+            program.name(op.op_name),
+            malformed(format!("no operator name {}", op.op_name))
+        );
 
         // The real scope may be borrowed by the target, and dispatch does not
         // read it anyway — operators resolve against the engine.
@@ -2707,11 +2729,10 @@ impl<'e> Vm<'e> {
         frame_base: usize,
         pos: Position,
     ) -> VmResult {
-        let base = self
-            .stack
-            .len()
-            .checked_sub(argc + 1)
-            .ok_or_else(|| malformed("function pointer call is missing its target".into()))?;
+        let base = or_raise!(
+            self.stack.len().checked_sub(argc + 1),
+            malformed("function pointer call is missing its target".into())
+        );
         let mut at = base;
 
         // In method position a target that is not a pointer means the *first
@@ -2728,10 +2749,10 @@ impl<'e> Vm<'e> {
             }
         }
 
-        let pointer = self.stack[at]
-            .clone()
-            .try_cast::<FnPtr>()
-            .ok_or_else(|| self.mismatch::<FnPtr>(self.stack[at].type_name(), pos))?;
+        let pointer = or_raise!(
+            self.stack[at].clone().try_cast::<FnPtr>(),
+            self.mismatch::<FnPtr>(self.stack[at].type_name(), pos)
+        );
 
         let taken = self.stack.len() - at - 1;
         let curried = pointer.curry().len();
@@ -2836,9 +2857,7 @@ impl<'e> Vm<'e> {
                 *scope.get_mut_by_index(index) = value;
             }
             Some(Receiver::Named(var)) => {
-                let name = program
-                    .name(var)
-                    .ok_or_else(|| malformed(format!("no name {var}")))?;
+                let name = or_raise!(program.name(var), malformed(format!("no name {var}")));
                 // A resolver's answer or a module constant has no entry behind
                 // it, and Rhai could not have written through one either.
                 if let Some(entry) = scope.get_mut(name) {
@@ -2885,11 +2904,12 @@ impl<'e> Vm<'e> {
             rendered = Some(print_with_func(FUNC_TO_STRING, &context, &mut item));
         }
 
-        let mut buffer = self
-            .stack
-            .last_mut()
-            .and_then(|value| value.write_lock::<ImmutableString>())
-            .ok_or_else(|| malformed("interpolation lost its buffer".into()))?;
+        let mut buffer = or_raise!(
+            self.stack
+                .last_mut()
+                .and_then(|value| value.write_lock::<ImmutableString>()),
+            malformed("interpolation lost its buffer".into())
+        );
 
         // `make_mut` is in place while the buffer is uniquely held, which on
         // the operand stack it is — so this is one growing allocation rather
@@ -2971,7 +2991,7 @@ impl<'e> Vm<'e> {
                 .find_map(|module| module.get_qualified_iter(type_id))
         });
 
-        let func = func.ok_or_else(|| Box::new(EvalAltResult::ErrorFor(pos)))?;
+        let func = or_raise!(func, Box::new(EvalAltResult::ErrorFor(pos)));
 
         self.iterators.push(Iteration {
             items: Items::Boxed(func(iterable)),
@@ -3081,17 +3101,18 @@ impl<'e> Vm<'e> {
 
                 // Check if there is a compiled function.
                 for f in program.functions() {
-                    let local_name = program
-                        .name(f.name)
-                        .ok_or_else(|| malformed(format!("no name {}", f.name)))?;
+                    let local_name = or_raise!(
+                        program.name(f.name),
+                        malformed(format!("no name {}", f.name))
+                    );
 
                     if local_name == fn_name.as_str() && f.params.len() == arity {
                         if let Some(ref this_type) = this_type {
                             if let Some(local_this_type_index) = f.this_type {
                                 let local_this_type_name =
-                                    program.name(local_this_type_index).ok_or_else(|| {
+                                    or_raise!(program.name(local_this_type_index), {
                                         malformed(format!("no name {local_this_type_index}"))
-                                    })?;
+                                    });
 
                                 if local_this_type_name == this_type {
                                     return Ok(Some(Dynamic::TRUE));
@@ -3106,7 +3127,7 @@ impl<'e> Vm<'e> {
                 // Call into Rhai.
                 let mut args = self.stack[first..].iter_mut().collect::<FnArgsVec<_>>();
 
-                return self
+                let answer = self
                     .engine
                     .exec_syntactic_fn_call(
                         &mut self.global,
@@ -3115,11 +3136,11 @@ impl<'e> Vm<'e> {
                         &mut args,
                         pos,
                     )
-                    .map_err(|err| dispatch_failure(err, pos))?
-                    .ok_or_else(|| {
-                        EvalAltResult::ErrorFunctionNotFound(name.to_string(), pos).into()
-                    })
-                    .map(Some);
+                    .map_err(|err| dispatch_failure(err, pos))?;
+                return Ok(Some(or_raise!(
+                    answer,
+                    EvalAltResult::ErrorFunctionNotFound(name.to_string(), pos).into()
+                )));
             }
             _ => {}
         }
@@ -3276,18 +3297,15 @@ impl<'e> Vm<'e> {
                 (Site::Slot(index), argc - 1)
             }
             Receiver::Named(var) => {
-                let name = program
-                    .name(var)
-                    .ok_or_else(|| malformed(format!("no name {var}")))?;
+                let name = or_raise!(program.name(var), malformed(format!("no name {var}")));
                 (Site::Name(name), argc)
             }
             Receiver::This => unreachable!("taken above"),
         };
-        let first = self
-            .stack
-            .len()
-            .checked_sub(on_stack)
-            .ok_or_else(|| malformed("call with too few arguments".to_string()))?;
+        let first = or_raise!(
+            self.stack.len().checked_sub(on_stack),
+            malformed("call with too few arguments".to_string())
+        );
 
         let place = match at {
             Site::Slot(index) => Some(scope.get_mut_by_index(index)),
@@ -3330,9 +3348,10 @@ impl<'e> Vm<'e> {
                 // reach, and it is the price of having resolved the name where
                 // its position was.
                 Site::Name(name) => (
-                    scope
-                        .get_mut(name)
-                        .ok_or_else(|| malformed(format!("`{name}` stopped being writable")))?,
+                    or_raise!(
+                        scope.get_mut(name),
+                        malformed(format!("`{name}` stopped being writable"))
+                    ),
                     first + 1,
                 ),
             };
@@ -3397,11 +3416,10 @@ impl<'e> Vm<'e> {
         capture: bool,
         pos: Position,
     ) -> VmResult {
-        let first = self
-            .stack
-            .len()
-            .checked_sub(argc)
-            .ok_or_else(|| malformed("call with too few arguments".to_string()))?;
+        let first = or_raise!(
+            self.stack.len().checked_sub(argc),
+            malformed("call with too few arguments".to_string())
+        );
 
         // Rhai turns `f(this, ..)` into `this.f(..)` for a receiver that is not
         // shared, and read-only is *not* part of that test — unlike the variable
@@ -3421,10 +3439,10 @@ impl<'e> Vm<'e> {
         }
 
         let value = {
-            let entry = self
-                .this
-                .as_mut()
-                .ok_or_else(|| malformed("`this` stopped being bound".to_string()))?;
+            let entry = or_raise!(
+                self.this.as_mut(),
+                malformed("`this` stopped being bound".to_string())
+            );
             // Argument zero is the snapshot, dead now that there is a register
             // to reach through.
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
@@ -3558,16 +3576,14 @@ impl<'e> Vm<'e> {
             .map_or(0, |dbg| dbg.call_stack().len());
 
         for (param, slot) in params.iter().zip(first..) {
-            let name = program
-                .name(*param)
-                .ok_or_else(|| malformed(format!("no name {param}")))?;
+            let name = or_raise!(program.name(*param), malformed(format!("no name {param}")));
             // Taken, not cloned — Rhai consumes the caller's argument slots
             // (`func/script.rs:75`), and the caller truncates them away after.
-            let value = self
-                .stack
-                .get_mut(slot)
-                .ok_or_else(|| malformed("call with too few arguments".to_string()))?
-                .take();
+            let value = or_raise!(
+                self.stack.get_mut(slot),
+                malformed("call with too few arguments".to_string())
+            )
+            .take();
             scope.push_dynamic(name, value);
         }
         let scope_end_len = scope.len();
@@ -3922,16 +3938,16 @@ impl<'e> Vm<'e> {
                 return Ok(());
             }
 
-            let value = self
-                .stack
-                .last()
-                .ok_or_else(|| malformed("size check with no element".to_string()))?;
+            let value = or_raise!(
+                self.stack.last(),
+                malformed("size check with no element".to_string())
+            );
             let delta = calc_data_sizes(value, true);
 
-            let total = self
-                .sizes
-                .last_mut()
-                .ok_or_else(|| malformed("size check outside a literal".to_string()))?;
+            let total = or_raise!(
+                self.sizes.last_mut(),
+                malformed("size check outside a literal".to_string())
+            );
             *total = (
                 total.0 + delta.0 + usize::from(!map),
                 total.1 + delta.1 + usize::from(map),
@@ -4032,9 +4048,7 @@ impl<'e> Vm<'e> {
         scope.rewind(scope_len);
 
         if let Some(index) = catch_var {
-            let name = program
-                .name(index)
-                .ok_or_else(|| malformed(format!("no name {index}")))?;
+            let name = or_raise!(program.name(index), malformed(format!("no name {index}")));
             #[cfg(not(feature = "unchecked"))]
             if scope.len() >= self.engine.max_variables() {
                 return Err(Box::new(EvalAltResult::ErrorTooManyVariables(
@@ -4149,20 +4163,22 @@ impl<'e> Vm<'e> {
             // No address in the message: `reached` is written every iteration,
             // so the fault trace already names this instruction. Read it from
             // `Vm::fault_pc`, corrupt artifact or not.
-            let tag = *code.get(pc).ok_or_else(|| {
+            let tag = *or_raise!(code.get(pc), {
                 Box::new(EvalAltResult::ErrorRuntime(
                     "ran off the end of a chunk".into(),
                     Position::NONE,
                 ))
-            })?;
+            });
 
             // Every instruction's operands sit at a fixed offset from its tag,
             // so dispatch is a match and a couple of loads with nothing decoded
             // and nothing allocated. The bounds checks are what let this run
             // straight off an artifact without trusting it; the verifier has
             // already made them unreachable for anything that loaded.
-            let width = code::width(code, pc)
-                .ok_or_else(|| malformed("undecodable instruction".to_string()))?;
+            let width = or_raise!(
+                code::width(code, pc),
+                malformed("undecodable instruction".to_string())
+            );
             // Macros rather than closures, for the reason the position lookup
             // below is one and one more. Both were rebuilt every iteration
             // because they capture `pc`, which moves; and a closure is opaque
@@ -4236,9 +4252,10 @@ impl<'e> Vm<'e> {
             match tag {
                 code::tag::CONST => {
                     let index = u32::from(small!(1));
-                    let value = program
-                        .constant(index)
-                        .ok_or_else(|| malformed(format!("no constant {index}")))?;
+                    let value = or_raise!(
+                        program.constant(index),
+                        malformed(format!("no constant {index}"))
+                    );
                     self.stack.push(value.clone());
                 }
 
@@ -4277,9 +4294,8 @@ impl<'e> Vm<'e> {
 
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
                     let index = u32::from(small!(1));
-                    let name = program
-                        .name(index)
-                        .ok_or_else(|| malformed(format!("no name {index}")))?;
+                    let name =
+                        or_raise!(program.name(index), malformed(format!("no name {index}")));
                     let flatten = tag == code::tag::LOAD_NAMED;
                     let value = self.load_named(name, scope, flatten, pos!())?;
                     self.stack.push(value);
@@ -4287,16 +4303,14 @@ impl<'e> Vm<'e> {
 
                 code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
                     let index = u32::from(small!(1));
-                    let name = program
-                        .name(index)
-                        .ok_or_else(|| malformed(format!("no name {index}")))?;
+                    let name =
+                        or_raise!(program.name(index), malformed(format!("no name {index}")));
                     let op = if tag == code::tag::ASSIGN_NAMED_OP {
                         let index = u32::from(small!(3));
-                        Some(
-                            program
-                                .assign_op(index)
-                                .ok_or_else(|| malformed(format!("no op-assignment {index}")))?,
-                        )
+                        Some(or_raise!(
+                            program.assign_op(index),
+                            malformed(format!("no op-assignment {index}"))
+                        ))
                     } else {
                         None
                     };
@@ -4312,9 +4326,8 @@ impl<'e> Vm<'e> {
                     // A `Scope` entry name is an `Identifier`, which is a
                     // `SmartString` — short names live inline, so handing it a
                     // borrowed `&str` costs a copy rather than an allocation.
-                    let name = program
-                        .name(index)
-                        .ok_or_else(|| malformed(format!("no name {index}")))?;
+                    let name =
+                        or_raise!(program.name(index), malformed(format!("no name {index}")));
                     // Flattened, as Rhai flattens a declaration's initializer
                     // (`eval/stmt.rs:438`). A native can hand back a cell that is
                     // already shared, and sharing must stop at the `let` rather
@@ -4347,11 +4360,10 @@ impl<'e> Vm<'e> {
                         _ => None,
                     };
                     let op = match op {
-                        Some(index) => Some(
-                            program
-                                .assign_op(index)
-                                .ok_or_else(|| malformed(format!("no op-assignment {index}")))?,
-                        ),
+                        Some(index) => Some(or_raise!(
+                            program.assign_op(index),
+                            malformed(format!("no op-assignment {index}"))
+                        )),
                         None => None,
                     };
 
@@ -4369,9 +4381,7 @@ impl<'e> Vm<'e> {
                         Some(src) => {
                             let index = base + src as usize;
                             if index >= scope.len() {
-                                return Err(malformed(format!(
-                                    "local slot {src} is out of scope"
-                                )));
+                                return Err(malformed(format!("local slot {src} is out of scope")));
                             }
                             scope.get_mut_by_index(index).flatten_clone()
                         }
@@ -4384,9 +4394,10 @@ impl<'e> Vm<'e> {
                     }
 
                     if scope.get_mut_by_index(index).is_read_only() {
-                        let name = program
-                            .name(var_name)
-                            .ok_or_else(|| malformed(format!("no name {var_name}")))?;
+                        let name = or_raise!(
+                            program.name(var_name),
+                            malformed(format!("no name {var_name}"))
+                        );
                         return Err(Box::new(EvalAltResult::ErrorAssignmentToConstant(
                             name.to_string(),
                             pos!(),
@@ -4414,9 +4425,9 @@ impl<'e> Vm<'e> {
                     let entry = scope.get_mut_by_index(index);
                     if !is_shared!(entry) {
                         let mut rhs = rhs;
-                        if let Some(done) =
-                            op.and_then(|op| self.store_builtin(op, entry, &mut rhs, move || program.position(pc)))
-                        {
+                        if let Some(done) = op.and_then(|op| {
+                            self.store_builtin(op, entry, &mut rhs, move || program.position(pc))
+                        }) {
                             done?;
                             pc += width;
                             continue;
@@ -4432,18 +4443,19 @@ impl<'e> Vm<'e> {
                     // for the sake of a branch almost nothing takes, and the
                     // verifier has already bounded the index (`check_indices`),
                     // so nothing is being checked later that was checked before.
-                    let name = program
-                        .name(var_name)
-                        .ok_or_else(|| malformed(format!("no name {var_name}")))?;
+                    let name = or_raise!(
+                        program.name(var_name),
+                        malformed(format!("no name {var_name}"))
+                    );
                     let mut target = place(entry, name, pos!())?;
                     self.store(program, op, &mut target, rhs, pos!())?;
                 }
 
                 code::tag::LOAD_THIS | code::tag::LOAD_THIS_SHARED => {
-                    let value = self
-                        .this
-                        .as_ref()
-                        .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(pos!())))?;
+                    let value = or_raise!(
+                        self.this.as_ref(),
+                        Box::new(EvalAltResult::ErrorUnboundThis(pos!()))
+                    );
                     // Rhai's read is `this_ptr.cloned()` and does not flatten
                     // (`eval/expr.rs:272`); its consumers do. Which tag this is
                     // is which consumer asked.
@@ -4463,11 +4475,10 @@ impl<'e> Vm<'e> {
                 code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
                     let op = if tag == code::tag::ASSIGN_THIS_OP {
                         let index = u32::from(small!(1));
-                        Some(
-                            program
-                                .assign_op(index)
-                                .ok_or_else(|| malformed(format!("no op-assignment {index}")))?,
-                        )
+                        Some(or_raise!(
+                            program.assign_op(index),
+                            malformed(format!("no op-assignment {index}"))
+                        ))
                     } else {
                         None
                     };
@@ -4481,10 +4492,10 @@ impl<'e> Vm<'e> {
                     // paths — Rhai's mutation survives an error, and a frame
                     // that lost its receiver would answer `ErrorUnboundThis` to
                     // every read after this one.
-                    let mut this = self
-                        .this
-                        .take()
-                        .ok_or_else(|| Box::new(EvalAltResult::ErrorUnboundThis(pos!())))?;
+                    let mut this = or_raise!(
+                        self.this.take(),
+                        Box::new(EvalAltResult::ErrorUnboundThis(pos!()))
+                    );
 
                     let outcome = if this.is_read_only() {
                         // Named for an expression that has no name, which is
@@ -4512,9 +4523,10 @@ impl<'e> Vm<'e> {
 
                 code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
                     let index = u32::from(small!(1));
-                    let expr = program
-                        .residual(index)
-                        .ok_or_else(|| malformed(format!("no residual {index}")))?;
+                    let expr = or_raise!(
+                        program.residual(index),
+                        malformed(format!("no residual {index}"))
+                    );
                     let rewind_scope = tag == code::tag::EVAL_AST;
 
                     // Straight to the walker's own entry points rather than
@@ -4613,10 +4625,11 @@ impl<'e> Vm<'e> {
                                 scope.get_mut_by_index(index).flatten_clone()
                             } else {
                                 let index = u32::from(small!(8));
-                                program
-                                    .constant(index)
-                                    .ok_or_else(|| malformed(format!("no constant {index}")))?
-                                    .clone()
+                                or_raise!(
+                                    program.constant(index),
+                                    malformed(format!("no constant {index}"))
+                                )
+                                .clone()
                             };
                             self.stack.push(lhs);
                             self.stack.push(rhs);
@@ -4640,9 +4653,9 @@ impl<'e> Vm<'e> {
                     // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
                     if typed && self.engine.fast_operators() {
                         let top = self.stack.len();
-                        let under = top.checked_sub(2).ok_or_else(|| {
+                        let under = or_raise!(top.checked_sub(2), {
                             malformed("operator with too few operands".to_string())
-                        })?;
+                        });
                         // An unknown kind byte is not an error here: the
                         // dispatch below reads the operator out of the pool
                         // and answers whatever it answers, which is what a
@@ -4675,9 +4688,9 @@ impl<'e> Vm<'e> {
                     // the result belongs and the stack does not change depth.
                     let unary = tag == code::tag::UN_OP;
                     if unary && self.engine.fast_operators() {
-                        let under = self.stack.len().checked_sub(1).ok_or_else(|| {
+                        let under = or_raise!(self.stack.len().checked_sub(1), {
                             malformed("operator with too few operands".to_string())
-                        })?;
+                        });
                         // An unknown kind byte is not an error here, as above:
                         // the dispatch below answers whatever it answers.
                         if let Some(kind) = UnOpKind::from_byte(code[pc + 3]) {
@@ -4690,9 +4703,10 @@ impl<'e> Vm<'e> {
                     }
 
                     let name_index = u32::from(small!(1));
-                    let name = program
-                        .name(name_index)
-                        .ok_or_else(|| malformed(format!("no name {name_index}")))?;
+                    let name = or_raise!(
+                        program.name(name_index),
+                        malformed(format!("no name {name_index}"))
+                    );
                     let capture = tag == code::tag::CALL_CAPTURE;
                     // The kind byte sits where an argument count would, because
                     // an operator's count is always two — or, for `UN_OP`, one.
@@ -4705,20 +4719,18 @@ impl<'e> Vm<'e> {
                     };
                     let op = if typed || tag == code::tag::CALL_OP {
                         let index = u32::from(small!(4));
-                        Some(
-                            program
-                                .token(index)
-                                .ok_or_else(|| malformed(format!("no operator {index}")))?,
-                        )
+                        Some(or_raise!(
+                            program.token(index),
+                            malformed(format!("no operator {index}"))
+                        ))
                     } else {
                         None
                     };
 
-                    let first = self
-                        .stack
-                        .len()
-                        .checked_sub(argc)
-                        .ok_or_else(|| malformed("call with too few arguments".to_string()))?;
+                    let first = or_raise!(
+                        self.stack.len().checked_sub(argc),
+                        malformed("call with too few arguments".to_string())
+                    );
 
                     // Reach the same built-in the walker reaches. Gated on
                     // Rhai's own `fast_operators()` rather than a guard of our
@@ -4771,9 +4783,10 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_THIS_REF
                 | code::tag::CALL_THIS_REF_CAPTURE => {
                     let name_index = u32::from(small!(1));
-                    let name = program
-                        .name(name_index)
-                        .ok_or_else(|| malformed(format!("no name {name_index}")))?;
+                    let name = or_raise!(
+                        program.name(name_index),
+                        malformed(format!("no name {name_index}"))
+                    );
                     let argc = code[pc + 3] as usize;
                     // `this` is a register, so this one carries no operand for
                     // the receiver and is two bytes shorter.
@@ -4812,14 +4825,14 @@ impl<'e> Vm<'e> {
 
                 code::tag::ROTATE => {
                     let under = code[pc + 1] as usize;
-                    let top = self
-                        .stack
-                        .len()
-                        .checked_sub(1)
-                        .ok_or_else(|| malformed("rotate on an empty stack".to_string()))?;
-                    let to = top
-                        .checked_sub(under)
-                        .ok_or_else(|| malformed("rotate past the bottom".to_string()))?;
+                    let top = or_raise!(
+                        self.stack.len().checked_sub(1),
+                        malformed("rotate on an empty stack".to_string())
+                    );
+                    let to = or_raise!(
+                        top.checked_sub(under),
+                        malformed("rotate past the bottom".to_string())
+                    );
                     self.stack[to..].rotate_right(1);
                 }
 
@@ -4828,11 +4841,10 @@ impl<'e> Vm<'e> {
                 #[cfg(not(feature = "no_index"))]
                 code::tag::MAKE_ARRAY => {
                     let len = small!(1) as usize;
-                    let first = self
-                        .stack
-                        .len()
-                        .checked_sub(len)
-                        .ok_or_else(|| malformed("array with too few elements".to_string()))?;
+                    let first = or_raise!(
+                        self.stack.len().checked_sub(len),
+                        malformed("array with too few elements".to_string())
+                    );
 
                     // The running total belongs to this literal and goes with
                     // it. `Op::CheckSize` is what filled it in, one element at
@@ -4855,11 +4867,10 @@ impl<'e> Vm<'e> {
                 #[cfg(not(feature = "no_object"))]
                 code::tag::MAKE_MAP => {
                     let len = small!(1) as usize;
-                    let first = self
-                        .stack
-                        .len()
-                        .checked_sub(2 * len + 1)
-                        .ok_or_else(|| malformed("map with too few operands".to_string()))?;
+                    let first = or_raise!(
+                        self.stack.len().checked_sub(2 * len + 1),
+                        malformed("map with too few operands".to_string())
+                    );
                     // As for `MakeArray`: nothing was pushed for a literal
                     // with no computed entries, so nothing may be popped.
                     if len > 0 {
@@ -4868,9 +4879,10 @@ impl<'e> Vm<'e> {
 
                     let mut parts = self.stack.drain(first..);
                     let template = parts.next().expect("checked above");
-                    let mut map = template
-                        .try_cast::<Map>()
-                        .ok_or_else(|| malformed("map literal without a template".to_string()))?;
+                    let mut map = or_raise!(
+                        template.try_cast::<Map>(),
+                        malformed("map literal without a template".to_string())
+                    );
                     while let Some(key) = parts.next() {
                         let value = parts.next().expect("pairs, checked above");
                         let key = key.into_immutable_string().map_err(|actual| {
@@ -4892,9 +4904,10 @@ impl<'e> Vm<'e> {
 
                 code::tag::SWITCH => {
                     let index = u32::from(small!(1));
-                    let table = program
-                        .switch(index)
-                        .ok_or_else(|| malformed(format!("no switch {index}")))?;
+                    let table = or_raise!(
+                        program.switch(index),
+                        malformed(format!("no switch {index}"))
+                    );
                     let subject = self.pop()?;
                     // Always a jump: an arm that matched nothing still has the
                     // default to go to.
@@ -4926,9 +4939,10 @@ impl<'e> Vm<'e> {
                         Some(index)
                     } else {
                         let name_index = u32::from(small!(1));
-                        let name = program
-                            .name(name_index)
-                            .ok_or_else(|| malformed(format!("no name {name_index}")))?;
+                        let name = or_raise!(
+                            program.name(name_index),
+                            malformed(format!("no name {name_index}"))
+                        );
                         // The resolver gets first refusal, and a name it
                         // answers is not shared at all (`eval/stmt.rs:998`).
                         if self.resolve_var(name, scope, pos!())?.is_some() {
@@ -4947,7 +4961,7 @@ impl<'e> Vm<'e> {
                             .iter_raw()
                             .position(|(entry, ..)| entry == name)
                             .map(|from_top| depth - 1 - from_top);
-                        Some(found.ok_or_else(|| missing(name, pos!()))?)
+                        Some(or_raise!(found, missing(name, pos!())))
                     };
 
                     if let Some(index) = entry {
@@ -4960,9 +4974,8 @@ impl<'e> Vm<'e> {
 
                 code::tag::MAKE_CLOSURE => {
                     let index = u32::from(small!(1));
-                    let name = program
-                        .name(index)
-                        .ok_or_else(|| malformed(format!("no name {index}")))?;
+                    let name =
+                        or_raise!(program.name(index), malformed(format!("no name {index}")));
                     // Non-validated, because `anon$…` is not a name a script could
                     // have written and the validating constructors refuse it.
                     // Nothing unsound rides on that check — a name that will
@@ -5018,15 +5031,14 @@ impl<'e> Vm<'e> {
 
                 code::tag::CURRY => {
                     let argc = code[pc + 1] as usize;
-                    let at = self
-                        .stack
-                        .len()
-                        .checked_sub(argc + 1)
-                        .ok_or_else(|| malformed("curry is missing its target".into()))?;
-                    let mut pointer = self.stack[at]
-                        .clone()
-                        .try_cast::<FnPtr>()
-                        .ok_or_else(|| self.mismatch::<FnPtr>(self.stack[at].type_name(), pos!()))?;
+                    let at = or_raise!(
+                        self.stack.len().checked_sub(argc + 1),
+                        malformed("curry is missing its target".into())
+                    );
+                    let mut pointer = or_raise!(
+                        self.stack[at].clone().try_cast::<FnPtr>(),
+                        self.mismatch::<FnPtr>(self.stack[at].type_name(), pos!())
+                    );
                     for value in self.stack.drain(at + 1..) {
                         pointer.add_curry(value);
                     }
@@ -5077,9 +5089,8 @@ impl<'e> Vm<'e> {
 
                 code::tag::CHAIN => {
                     let index = u32::from(small!(1));
-                    let chain = program
-                        .chain(index)
-                        .ok_or_else(|| malformed(format!("no chain {index}")))?;
+                    let chain =
+                        or_raise!(program.chain(index), malformed(format!("no chain {index}")));
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
                     self.stack.push(value);
                 }
@@ -5137,9 +5148,8 @@ impl<'e> Vm<'e> {
                     }
 
                     let index = u32::from(small!(1));
-                    let chain = program
-                        .chain(index)
-                        .ok_or_else(|| malformed(format!("no chain {index}")))?;
+                    let chain =
+                        or_raise!(program.chain(index), malformed(format!("no chain {index}")));
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
                     self.stack.push(value);
                 }
@@ -5205,10 +5215,10 @@ impl<'e> Vm<'e> {
                 | code::tag::ITER_NEXT_INDEXED
                 | code::tag::ITER_NEXT_STORE => {
                     let exit = wide!(1) as usize;
-                    let iteration = self
-                        .iterators
-                        .last_mut()
-                        .ok_or_else(|| malformed("no iterator to advance".to_string()))?;
+                    let iteration = or_raise!(
+                        self.iterators.last_mut(),
+                        malformed("no iterator to advance".to_string())
+                    );
 
                     let Some(item) = iteration.items.next() else {
                         self.iterators.pop();
@@ -5219,12 +5229,12 @@ impl<'e> Vm<'e> {
                     // Counted before the item is unwrapped, as Rhai does, so a
                     // loop long enough to wrap the counter is an error rather
                     // than a wrap.
-                    iteration.count = iteration.count.checked_add(1).ok_or_else(|| {
+                    iteration.count = or_raise!(iteration.count.checked_add(1), {
                         Box::new(EvalAltResult::ErrorArithmetic(
                             format!("for-loop counter overflow: {}", iteration.count),
                             pos!(),
                         ))
-                    })?;
+                    });
                     let count = iteration.count;
 
                     // A fallible iterator's error is positioned at the
@@ -5245,11 +5255,9 @@ impl<'e> Vm<'e> {
                         if index >= scope.len() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
-                        store_shared(
-                            scope.get_mut_by_index(index),
-                            value.flatten(),
-                            move || program.position(pc),
-                        )?;
+                        store_shared(scope.get_mut_by_index(index), value.flatten(), move || {
+                            program.position(pc)
+                        })?;
                         pc += width;
                         continue;
                     }
@@ -5267,7 +5275,9 @@ impl<'e> Vm<'e> {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     let value = self.pop()?;
-                    store_shared(scope.get_mut_by_index(index), value, move || program.position(pc))?;
+                    store_shared(scope.get_mut_by_index(index), value, move || {
+                        program.position(pc)
+                    })?;
                 }
 
                 code::tag::THROW => {
