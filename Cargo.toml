@@ -46,6 +46,9 @@ arbitrary = { version = "1.3.2", optional = true, features = ["derive"] }
 majit-translate = { path = "../majit/majit-translate", optional = true, default-features = false, features = ["mir-frontend"] }
 majit-metainterp = { path = "../majit/majit-metainterp", optional = true, default-features = false, features = ["dynasm"] }
 majit-ir = { path = "../majit/majit-ir", optional = true, default-features = false }
+# Only the front-end census examples read a `.ullbc` directly; the lowering
+# itself goes through `majit-translate`, which already depends on this.
+majit-charon-reader = { path = "../majit/majit-charon-reader", optional = true, default-features = false }
 bincode = { version = "1.3", optional = true }
 
 # The lowering runs in `build.rs`, over an LLBC artefact extracted ahead of
@@ -92,7 +95,7 @@ fuzz = ["arbitrary", "rust_decimal?/rust-fuzz", "serde", "grain"]
 grain = []
 ## Emit the tracing-JIT merge point in the `grain` dispatch loop, for a consumer
 ## that lowers the VM. Costs a call per instruction and compiles nothing else.
-grain-jit = ["grain", "dep:majit-translate", "dep:majit-metainterp", "dep:majit-ir", "dep:bincode"]
+grain-jit = ["grain", "dep:majit-translate", "dep:majit-metainterp", "dep:majit-ir", "dep:majit-charon-reader", "dep:bincode"]
 
 #! ### System Configuration Features
 
@@ -191,6 +194,42 @@ required-features = ["grain"]
 [[example]]
 name = "grain_probe"
 required-features = ["grain"]
+
+# Front-end censuses over a Charon extraction of this crate. They read a
+# `.ullbc` named on the command line rather than anything in `OUT_DIR`, so they
+# report on a lowering without being part of one, and they name majit's
+# `mir-frontend` API directly — which is why they are gated on `grain-jit`
+# rather than on `grain`.
+
+# Runs the whole graph pipeline and dumps its abort / residual / descr sections.
+[[example]]
+name = "grain_llbc_smoke"
+required-features = ["grain-jit"]
+
+# Reads back the assembled portal jitcode and groups its ops by family,
+# resolving each residual call's fnaddr so a direct call is not counted as one
+# it could not name.
+[[example]]
+name = "grain_jitcode_census"
+required-features = ["grain-jit"]
+
+# Dumps the descrs the pipeline minted.
+[[example]]
+name = "grain_descr_audit"
+required-features = ["grain-jit"]
+
+# Lowers the portal function alone and prints every merge-point-shaped call
+# target, for telling "the extraction carried no merge point" apart from "the
+# pipeline dropped it".
+[[example]]
+name = "grain_merge_point_probe"
+required-features = ["grain-jit"]
+
+# Lowers one function of a hand-written fixture, to isolate which spelling of a
+# read puts a reference on a `SwitchInt`.
+[[example]]
+name = "grain_switch_arm_probe"
+required-features = ["grain-jit"]
 
 # The grain harnesses, as one binary. `tests/mod.rs` wraps them in an inline
 # `mod grain`, which is what puts their module paths inside `tests/grain/`.
