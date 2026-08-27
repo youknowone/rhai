@@ -17,9 +17,15 @@ use std::prelude::v1::*;
 /// `Scope` stores its own. That is a copy into a `SmartString` and not an
 /// allocation, so it costs nothing for the short names a `let` or a parameter
 /// actually has.
+///
+/// The blob is held as text rather than as bytes because whether it *is* text
+/// is settled once, where the artifact is accepted: a reader that kept bytes
+/// would have to answer the same question again on every name it read, and a
+/// name is read on every call, every property and every operator a program
+/// runs. See [`Strings::get`].
 #[derive(Debug, Clone, Default)]
 pub struct Strings<'a> {
-    blob: Cow<'a, [u8]>,
+    blob: Cow<'a, str>,
     /// Start of each name; the end is the next start, so this is one longer
     /// than the number of names.
     starts: Vec<u32>,
@@ -29,11 +35,11 @@ impl<'a> Strings<'a> {
     /// Build from names in index order.
     #[must_use]
     pub fn new<S: AsRef<str>>(names: impl IntoIterator<Item = S>) -> Strings<'static> {
-        let mut blob = Vec::new();
+        let mut blob = String::new();
         let mut starts = vec![0u32];
 
         for name in names {
-            blob.extend_from_slice(name.as_ref().as_bytes());
+            blob.push_str(name.as_ref());
             starts.push(blob.len() as u32);
         }
 
@@ -50,6 +56,11 @@ impl<'a> Strings<'a> {
     /// [`BadTable`] if the spans do not ascend within the blob, or if any name
     /// is not UTF-8 — both of which would otherwise turn into a slice panic
     /// while the VM was already running.
+    ///
+    /// This is the only place the blob's text-ness is decided. Every read after
+    /// it is a slice of a `str`, which is why a span landing inside a character
+    /// is refused here as well: it names bytes that are not a name, and leaving
+    /// it would turn every later read of that index into `None`.
     pub fn borrowed(blob: &'a [u8], starts: Vec<u32>) -> Result<Self, BadTable> {
         if starts.is_empty() {
             return Err(BadTable::NoTerminator);
@@ -58,12 +69,18 @@ impl<'a> Strings<'a> {
             return Err(BadTable::NoTerminator);
         }
 
+        let blob = core::str::from_utf8(blob).map_err(|error| BadTable::NotUtf8 {
+            at: error.valid_up_to(),
+        })?;
+
         for pair in starts.windows(2) {
             let (from, to) = (pair[0] as usize, pair[1] as usize);
             if to < from || to > blob.len() {
                 return Err(BadTable::SpanOutOfRange { from, to });
             }
-            core::str::from_utf8(&blob[from..to]).map_err(|_| BadTable::NotUtf8 { at: from })?;
+            if !blob.is_char_boundary(from) || !blob.is_char_boundary(to) {
+                return Err(BadTable::NotUtf8 { at: from });
+            }
         }
         if *starts.last().expect("checked") as usize != blob.len() {
             return Err(BadTable::TrailingBytes);
@@ -89,19 +106,21 @@ impl<'a> Strings<'a> {
 
     /// The name at `index`, or `None`.
     ///
-    /// Never allocates: the result points into the artifact.
+    /// Never allocates and never re-reads the name: the blob is already text,
+    /// so this is two bounds checks and a slice. It used to validate the span
+    /// as UTF-8 on every read — a walk of the name's bytes — which is a
+    /// question [`Strings::borrowed`] has already answered for the whole blob.
     #[must_use]
     pub fn get(&self, index: u32) -> Option<&str> {
         let from = *self.starts.get(index as usize)? as usize;
         let to = *self.starts.get(index as usize + 1)? as usize;
-        // Checked once on construction, so this cannot fail.
-        core::str::from_utf8(self.blob.get(from..to)?).ok()
+        self.blob.get(from..to)
     }
 
     /// The concatenated names, without their spans.
     #[must_use]
     pub fn blob(&self) -> &[u8] {
-        &self.blob
+        self.blob.as_bytes()
     }
 
     /// The span boundaries, one longer than [`Strings::len`].
@@ -203,6 +222,24 @@ mod tests {
         assert_eq!(
             Strings::borrowed(b"abcd", vec![0, 3]).err(),
             Some(BadTable::TrailingBytes),
+        );
+    }
+
+    /// A span landing inside a character is refused where the table is
+    /// accepted, rather than answered as a missing name on every read of that
+    /// index. The blob is valid UTF-8 here — it is the span that is not — so
+    /// the whole-blob check cannot be what catches this.
+    #[test]
+    fn a_span_that_splits_a_character_is_refused() {
+        let blob = "é".as_bytes();
+        assert_eq!(
+            blob.len(),
+            2,
+            "the fixture only works on a two-byte character"
+        );
+        assert_eq!(
+            Strings::borrowed(blob, vec![0, 1, 2]).err(),
+            Some(BadTable::NotUtf8 { at: 0 }),
         );
     }
 
