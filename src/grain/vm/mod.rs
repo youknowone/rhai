@@ -298,6 +298,15 @@ fn resolve_operator(
 /// function of the same arity share one entry.
 const CALL_MEMO_SLOTS: usize = 16;
 
+/// The table itself, which a [`Vm`] holds only once it has memoised a call.
+///
+/// It is 1.4KB, and a crossing builds a whole `Vm` per element a native calls
+/// back over ([`callback::invoke`](crate::grain::vm::callback)) — so for a
+/// chunk that calls nothing, which is what a `map` or a `filter` body usually
+/// is, this was the largest thing a crossing zeroed and then walked again to
+/// drop. Made where the first site is memoised instead. See [`call_site`].
+type CallMemoTable = [Option<CallMemo>; CALL_MEMO_SLOTS];
+
 /// What a call site resolved to, the last time it ran.
 ///
 /// Rhai answers a call by name: it hashes the name with the argument count, and
@@ -504,7 +513,7 @@ fn resolve_site(
 /// same `Vm`.
 #[allow(clippy::too_many_arguments)]
 fn call_site<'m>(
-    memo: &'m mut [Option<CallMemo>; CALL_MEMO_SLOTS],
+    memo: &'m mut Option<Box<CallMemoTable>>,
     engine: &Engine,
     global: &GlobalRuntimeState,
     caches: &mut Caches,
@@ -517,6 +526,10 @@ fn call_site<'m>(
     let codes = arg_codes(args)?;
     let imports = num_imports(global);
     let slot = call_memo_slot(name_index, argc);
+
+    // After the two questions that can refuse a site, so a call that may not be
+    // memoised at all does not leave a table behind.
+    let memo = memo.get_or_insert_with(|| Box::new(core::array::from_fn(|_| None)));
 
     if memo[slot].as_ref().map_or(true, |entry| {
         !entry.answers(generation, name_index, argc, codes, imports)
@@ -933,8 +946,9 @@ pub struct Vm<'e> {
     pending_slot: Option<u32>,
     /// What each operator site last resolved to. See [`OperatorMemo`].
     operator_memo: [OperatorMemo; OPERATOR_MEMO_SLOTS],
-    /// What each call site last resolved to. See [`CallMemo`].
-    call_memo: [Option<CallMemo>; CALL_MEMO_SLOTS],
+    /// What each call site last resolved to, once there is one. See
+    /// [`CallMemo`] and [`CallMemoTable`].
+    call_memo: Option<Box<CallMemoTable>>,
     /// The program a pointer this run creates carries with it, when there is
     /// one to carry.
     ///
@@ -1049,7 +1063,7 @@ impl<'e> Vm<'e> {
             chain_step: 0,
             pending_slot: None,
             operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
-            call_memo: core::array::from_fn(|_| None),
+            call_memo: None,
             callbacks: None,
             generation: 0,
             last_generation: 0,
@@ -1101,7 +1115,7 @@ impl<'e> Vm<'e> {
             // A memo names a site in a frame of this `Vm`, and a crossing has
             // none yet.
             operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
-            call_memo: core::array::from_fn(|_| None),
+            call_memo: None,
             // Set by [`callback::invoke`], which has the share of the program
             // this crossing came out of. A crossing reached any other way has
             // none, and hands out the pointers it can rather than none at all.
