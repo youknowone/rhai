@@ -4163,14 +4163,32 @@ impl<'e> Vm<'e> {
             // already made them unreachable for anything that loaded.
             let width = code::width(code, pc)
                 .ok_or_else(|| malformed("undecodable instruction".to_string()))?;
-            let small = |offset: usize| {
-                code::u16_at(code, pc + offset)
-                    .ok_or_else(|| malformed("truncated operand".to_string()))
-            };
-            let wide = |offset: usize| {
-                code::u32_at(code, pc + offset)
-                    .ok_or_else(|| malformed("truncated operand".to_string()))
-            };
+            // Macros rather than closures, for the reason the position lookup
+            // below is one and one more. Both were rebuilt every iteration
+            // because they capture `pc`, which moves; and a closure is opaque
+            // to anything reading this loop from outside, which arrives at
+            // `Fn::call` on an anonymous type it has no body for. The 45
+            // operand reads in the dispatch below were 45 indirect calls, each
+            // paying a second one for the lazy error.
+            //
+            // The bounds check stays. It is what lets this run straight off an
+            // artifact without trusting it, and `mutated_artifacts_load_or_fail            //_but_never_misbehave` is the claim it carries.
+            macro_rules! small {
+                ($offset:expr) => {
+                    match code::u16_at(code, pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                };
+            }
+            macro_rules! wide {
+                ($offset:expr) => {
+                    match code::u32_at(code, pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                };
+            }
 
             // Instructions carry no position; the table does, keyed on the
             // address. A stripped program answers `NONE` for every one of
@@ -4217,7 +4235,7 @@ impl<'e> Vm<'e> {
 
             match tag {
                 code::tag::CONST => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let value = program
                         .constant(index)
                         .ok_or_else(|| malformed(format!("no constant {index}")))?;
@@ -4229,7 +4247,7 @@ impl<'e> Vm<'e> {
                 code::tag::TRUE => self.stack.push(Dynamic::from(true)),
 
                 code::tag::LOAD_LOCAL => {
-                    let slot = small(1)?;
+                    let slot = small!(1);
                     let index = base + slot as usize;
                     if index >= scope.len() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
@@ -4242,7 +4260,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::STORE_LOCAL | code::tag::STORE_CONST => {
-                    let slot = small(1)?;
+                    let slot = small!(1);
                     let index = base + slot as usize;
                     if index >= scope.len() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
@@ -4258,7 +4276,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let name = program
                         .name(index)
                         .ok_or_else(|| malformed(format!("no name {index}")))?;
@@ -4268,12 +4286,12 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let name = program
                         .name(index)
                         .ok_or_else(|| malformed(format!("no name {index}")))?;
                     let op = if tag == code::tag::ASSIGN_NAMED_OP {
-                        let index = u32::from(small(3)?);
+                        let index = u32::from(small!(3));
                         Some(
                             program
                                 .assign_op(index)
@@ -4290,7 +4308,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::DECLARE_LOCAL | code::tag::DECLARE_CONST => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     // A `Scope` entry name is an `Identifier`, which is a
                     // `SmartString` — short names live inline, so handing it a
                     // borrowed `&str` costs a copy rather than an allocation.
@@ -4313,19 +4331,19 @@ impl<'e> Vm<'e> {
                 | code::tag::ASSIGN_LOCAL_OP
                 | code::tag::ASSIGN_LOCAL_FROM
                 | code::tag::ASSIGN_LOCAL_FROM_OP => {
-                    let slot = small(1)?;
-                    let var_name = u32::from(small(3)?);
+                    let slot = small!(1);
+                    let var_name = u32::from(small!(3));
                     // The fused forms carry the source slot where the plain
                     // ones end, so the operator index moves along by it.
                     let from = match tag {
                         code::tag::ASSIGN_LOCAL_FROM | code::tag::ASSIGN_LOCAL_FROM_OP => {
-                            Some(small(5)?)
+                            Some(small!(5))
                         }
                         _ => None,
                     };
                     let op = match tag {
-                        code::tag::ASSIGN_LOCAL_OP => Some(u32::from(small(5)?)),
-                        code::tag::ASSIGN_LOCAL_FROM_OP => Some(u32::from(small(7)?)),
+                        code::tag::ASSIGN_LOCAL_OP => Some(u32::from(small!(5))),
+                        code::tag::ASSIGN_LOCAL_FROM_OP => Some(u32::from(small!(7))),
                         _ => None,
                     };
                     let op = match op {
@@ -4444,7 +4462,7 @@ impl<'e> Vm<'e> {
 
                 code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
                     let op = if tag == code::tag::ASSIGN_THIS_OP {
-                        let index = u32::from(small(1)?);
+                        let index = u32::from(small!(1));
                         Some(
                             program
                                 .assign_op(index)
@@ -4493,7 +4511,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let expr = program
                         .residual(index)
                         .ok_or_else(|| malformed(format!("no residual {index}")))?;
@@ -4534,12 +4552,12 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::JUMP => {
-                    transfer!(wide(1)? as usize);
+                    transfer!(wide!(1) as usize);
                     continue;
                 }
 
                 code::tag::JUMP_IF_FALSE | code::tag::JUMP_IF_TRUE => {
-                    let target = wide(1)? as usize;
+                    let target = wide!(1) as usize;
                     let condition = self.pop()?;
                     // Rhai requires a boolean guard and reports the mismatch at
                     // the guard's own position (`eval/stmt.rs:487-490`).
@@ -4553,7 +4571,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::SKIP_IF_NOT_UNIT => {
-                    let target = wide(1)? as usize;
+                    let target = wide!(1) as usize;
                     let condition = self.inspect()?;
                     if !condition.is_unit() {
                         transfer!(target);
@@ -4576,7 +4594,7 @@ impl<'e> Vm<'e> {
                     // the dispatch loop for it.
                     let typed = match tag {
                         code::tag::BIN_OP_FROM_LOCAL | code::tag::BIN_OP_FROM_CONST => {
-                            let slot = small(6)?;
+                            let slot = small!(6);
                             let index = base + slot as usize;
                             if index >= scope.len() {
                                 return Err(malformed(format!(
@@ -4585,7 +4603,7 @@ impl<'e> Vm<'e> {
                             }
                             let lhs = scope.get_mut_by_index(index).flatten_clone();
                             let rhs = if tag == code::tag::BIN_OP_FROM_LOCAL {
-                                let slot = small(8)?;
+                                let slot = small!(8);
                                 let index = base + slot as usize;
                                 if index >= scope.len() {
                                     return Err(malformed(format!(
@@ -4594,7 +4612,7 @@ impl<'e> Vm<'e> {
                                 }
                                 scope.get_mut_by_index(index).flatten_clone()
                             } else {
-                                let index = u32::from(small(8)?);
+                                let index = u32::from(small!(8));
                                 program
                                     .constant(index)
                                     .ok_or_else(|| malformed(format!("no constant {index}")))?
@@ -4671,7 +4689,7 @@ impl<'e> Vm<'e> {
                         }
                     }
 
-                    let name_index = u32::from(small(1)?);
+                    let name_index = u32::from(small!(1));
                     let name = program
                         .name(name_index)
                         .ok_or_else(|| malformed(format!("no name {name_index}")))?;
@@ -4686,7 +4704,7 @@ impl<'e> Vm<'e> {
                         code[pc + 3] as usize
                     };
                     let op = if typed || tag == code::tag::CALL_OP {
-                        let index = u32::from(small(4)?);
+                        let index = u32::from(small!(4));
                         Some(
                             program
                                 .token(index)
@@ -4752,7 +4770,7 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_NAMED_REF_CAPTURE
                 | code::tag::CALL_THIS_REF
                 | code::tag::CALL_THIS_REF_CAPTURE => {
-                    let name_index = u32::from(small(1)?);
+                    let name_index = u32::from(small!(1));
                     let name = program
                         .name(name_index)
                         .ok_or_else(|| malformed(format!("no name {name_index}")))?;
@@ -4761,10 +4779,10 @@ impl<'e> Vm<'e> {
                     // the receiver and is two bytes shorter.
                     let receiver = match tag {
                         code::tag::CALL_LOCAL_REF | code::tag::CALL_LOCAL_REF_CAPTURE => {
-                            Receiver::Local(small(4)?)
+                            Receiver::Local(small!(4))
                         }
                         code::tag::CALL_NAMED_REF | code::tag::CALL_NAMED_REF_CAPTURE => {
-                            Receiver::Named(u32::from(small(4)?))
+                            Receiver::Named(u32::from(small!(4)))
                         }
                         code::tag::CALL_THIS_REF | code::tag::CALL_THIS_REF_CAPTURE => {
                             Receiver::This
@@ -4809,7 +4827,7 @@ impl<'e> Vm<'e> {
                 // feature that removes the type.
                 #[cfg(not(feature = "no_index"))]
                 code::tag::MAKE_ARRAY => {
-                    let len = small(1)? as usize;
+                    let len = small!(1) as usize;
                     let first = self
                         .stack
                         .len()
@@ -4836,7 +4854,7 @@ impl<'e> Vm<'e> {
 
                 #[cfg(not(feature = "no_object"))]
                 code::tag::MAKE_MAP => {
-                    let len = small(1)? as usize;
+                    let len = small!(1) as usize;
                     let first = self
                         .stack
                         .len()
@@ -4867,13 +4885,13 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
-                    let index = small(1)?;
+                    let index = small!(1);
                     let map = tag == code::tag::CHECK_MAP_SIZE;
                     self.check_size(index, map, pos!())?;
                 }
 
                 code::tag::SWITCH => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let table = program
                         .switch(index)
                         .ok_or_else(|| malformed(format!("no switch {index}")))?;
@@ -4885,7 +4903,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::LOAD_SHARED => {
-                    let slot = small(1)?;
+                    let slot = small!(1);
                     let index = base + slot as usize;
                     if index >= scope.len() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
@@ -4900,14 +4918,14 @@ impl<'e> Vm<'e> {
                 #[cfg(not(feature = "no_closure"))]
                 code::tag::SHARE | code::tag::SHARE_NAMED => {
                     let entry = if tag == code::tag::SHARE {
-                        let slot = small(1)?;
+                        let slot = small!(1);
                         let index = base + slot as usize;
                         if index >= scope.len() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
                         Some(index)
                     } else {
-                        let name_index = u32::from(small(1)?);
+                        let name_index = u32::from(small!(1));
                         let name = program
                             .name(name_index)
                             .ok_or_else(|| malformed(format!("no name {name_index}")))?;
@@ -4941,7 +4959,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::MAKE_CLOSURE => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let name = program
                         .name(index)
                         .ok_or_else(|| malformed(format!("no name {index}")))?;
@@ -5024,9 +5042,9 @@ impl<'e> Vm<'e> {
                     let argc = code[pc + 1] as usize;
                     let method = tag != code::tag::CALL_FN_PTR;
                     let receiver = match tag {
-                        code::tag::CALL_FN_PTR_ON_LOCAL => Some(Receiver::Local(small(2)?)),
+                        code::tag::CALL_FN_PTR_ON_LOCAL => Some(Receiver::Local(small!(2))),
                         code::tag::CALL_FN_PTR_ON_NAMED => {
-                            Some(Receiver::Named(u32::from(small(2)?)))
+                            Some(Receiver::Named(u32::from(small!(2))))
                         }
                         code::tag::CALL_FN_PTR_ON_THIS => Some(Receiver::This),
                         _ => None,
@@ -5058,7 +5076,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::CHAIN => {
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let chain = program
                         .chain(index)
                         .ok_or_else(|| malformed(format!("no chain {index}")))?;
@@ -5096,7 +5114,7 @@ impl<'e> Vm<'e> {
                         let Ok(i) = usize::try_from(i) else {
                             break 'fast;
                         };
-                        let at = base + small(3)? as usize;
+                        let at = base + small!(3) as usize;
                         if at >= scope.len() {
                             break 'fast;
                         }
@@ -5118,7 +5136,7 @@ impl<'e> Vm<'e> {
                         continue;
                     }
 
-                    let index = u32::from(small(1)?);
+                    let index = u32::from(small!(1));
                     let chain = program
                         .chain(index)
                         .ok_or_else(|| malformed(format!("no chain {index}")))?;
@@ -5127,7 +5145,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::UNWIND_TO => {
-                    let depth = small(1)?;
+                    let depth = small!(1);
                     let target = base + depth as usize;
                     if target > scope.len() {
                         return Err(malformed(format!(
@@ -5148,15 +5166,15 @@ impl<'e> Vm<'e> {
                     // build that has one.
                     #[cfg(feature = "debugging")]
                     {
-                        let depth = small(1)?;
+                        let depth = small!(1);
                         self.at_statement(scope, depth, pos!())?;
                     }
                 }
 
                 code::tag::PUSH_HANDLER | code::tag::PUSH_HANDLER_VAR => {
-                    let target = wide(1)? as usize;
+                    let target = wide!(1) as usize;
                     let catch_var = if tag == code::tag::PUSH_HANDLER_VAR {
-                        Some(u32::from(small(5)?))
+                        Some(u32::from(small!(5)))
                     } else {
                         None
                     };
@@ -5186,7 +5204,7 @@ impl<'e> Vm<'e> {
                 code::tag::ITER_NEXT
                 | code::tag::ITER_NEXT_INDEXED
                 | code::tag::ITER_NEXT_STORE => {
-                    let exit = wide(1)? as usize;
+                    let exit = wide!(1) as usize;
                     let iteration = self
                         .iterators
                         .last_mut()
@@ -5222,7 +5240,7 @@ impl<'e> Vm<'e> {
                     if tag == code::tag::ITER_NEXT_STORE {
                         // The `Op::StoreShared` this swallowed, which is where
                         // the loop variable is written on every turn.
-                        let slot = small(5)?;
+                        let slot = small!(5);
                         let index = base + slot as usize;
                         if index >= scope.len() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
@@ -5243,7 +5261,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::STORE_SHARED => {
-                    let slot = small(1)?;
+                    let slot = small!(1);
                     let index = base + slot as usize;
                     if index >= scope.len() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
