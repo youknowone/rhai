@@ -98,6 +98,28 @@ pub fn portal_index() -> Option<usize> {
     drivers.first().map(|driver| driver.main_jitcode_index)
 }
 
+/// Where the portal's `jit_merge_point` opcode byte sits in its own body.
+///
+/// `JitDriver::register_dispatch_jitcode` refuses a portal that cannot say,
+/// and a consumer cannot recover the answer by scanning the body: an operand
+/// byte may equal the opcode byte, so only the encoder knows which position is
+/// an instruction start. The assembler records it while it reserves that byte
+/// and `JitCode::from_canonical` carries it across, so `None` here means the
+/// lowering produced a portal the driver will not accept.
+pub fn portal_merge_point_offset() -> Option<usize> {
+    let portal = portal_index()?;
+    table().jitcodes().get(portal)?.exec.jit_merge_point_offset
+}
+
+/// The byte at `offset` in one lowered jitcode's body, or `None` when either
+/// index is out of range.
+pub fn body_byte(index: usize, offset: usize) -> Option<u8> {
+    table()
+        .jitcodes()
+        .get(index)
+        .and_then(|jc| jc.code.get(offset).copied())
+}
+
 /// How many jitcodes the build lowered. Zero when it lowered none.
 pub fn count() -> usize {
     table().jitcodes().len()

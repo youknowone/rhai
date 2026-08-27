@@ -13,6 +13,7 @@
 //! to be *consistently* empty rather than skipped: a table that lost its
 //! bodies but kept its driver would otherwise read as "no JIT was built".
 
+use majit_translate::codewriter::insns;
 use rhai::grain::jitcodes;
 
 #[test]
@@ -33,7 +34,23 @@ fn the_lowered_tables_round_trip_and_name_their_portal() {
 
     let portal = portal.expect("a lowered table is named by a driver");
     assert!(portal < count, "the driver names portal {portal} of {count} jitcodes");
+
+    // The offset is what `register_dispatch_jitcode` refuses a portal for
+    // lacking, and it cannot be recovered downstream: an operand byte may
+    // equal the opcode byte, so a scan can land on a position that is not an
+    // instruction start. It has to survive the same round trip as the bodies.
+    let offset = jitcodes::portal_merge_point_offset().expect("the portal carries its own merge offset");
+    let opcode = jitcodes::body_byte(portal, offset).expect("the offset is inside the portal's body");
+    // The same assertion `validate_dispatch_jitcode_payload` makes. Asserting
+    // only that the offset EXISTS would pass for an offset that survived the
+    // round trip pointing at the wrong byte, which is the failure the
+    // encoder-side recording exists to rule out.
+    assert!(opcode == insns::BC_JIT_MERGE_POINT || opcode == insns::BC_JIT_MERGE_POINT_C, "offset {offset} holds {opcode}, not a merge-point opcode",);
+
     // Printed in both arms, because "passed" alone does not say which one ran
     // and the empty arm asserts almost nothing.
-    eprintln!("loaded {count} jitcodes; the driver names portal {portal}");
+    eprintln!(
+        "loaded {count} jitcodes; the driver names portal {portal}, whose merge \
+         point opcode {opcode} sits at offset {offset}"
+    );
 }
