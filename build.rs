@@ -4,6 +4,12 @@ use std::{
     io::{Read, Write},
 };
 
+/// Lowering the `grain` dispatch loop to jitcode tables, behind the feature
+/// that emits the merge point it lowers around.
+#[cfg(feature = "grain-jit")]
+#[path = "build/majit_prepass.rs"]
+mod majit_prepass;
+
 fn main() {
     // Tell Cargo that if the given environment variable changes, to rerun this build script.
     println!("cargo:rerun-if-changed=build.template");
@@ -26,4 +32,7 @@ fn main() {
         .expect("cannot create `hashing_env.rs`")
         .write_all(contents.as_bytes())
         .expect("cannot write to `config/hashing_env.rs`");
+
+    #[cfg(feature = "grain-jit")]
+    majit_prepass::main();
 }
