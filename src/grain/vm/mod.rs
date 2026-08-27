@@ -910,7 +910,18 @@ pub struct Vm<'e> {
     engine: &'e Engine,
     global: GlobalRuntimeState,
     caches: Caches,
+    /// The operand stack: one allocation shared by every frame, with
+    /// [`Vm::depth`] naming the top rather than the vector's own length.
+    ///
+    /// `pyframe.py:110-112` allocates `[None] * size` and calls
+    /// `make_sure_not_resized` on it, so a push is a store and an increment
+    /// and never a length change. Every slot from `depth` up holds unit; a
+    /// value leaving the stack is cleared out of its slot rather than
+    /// abandoned, because a `Dynamic` holds a reference and nothing else
+    /// would drop it.
     stack: Vec<Dynamic>,
+    /// One past the top operand — `pyframe.py:88 valuestackdepth`.
+    depth: usize,
     #[cfg_attr(any(feature = "no_index", feature = "no_object"), allow(unused))]
     strings_interner: StringsInterner,
     /// One entry per `for` loop currently running.
@@ -1075,6 +1086,7 @@ impl<'e> Vm<'e> {
             caches: Caches::new(),
             strings_interner: StringsInterner::new(256),
             stack: Vec::new(),
+            depth: 0,
             iterators: Vec::new(),
             handlers: Vec::new(),
             sizes: Vec::new(),
@@ -1121,6 +1133,7 @@ impl<'e> Vm<'e> {
             caches: Caches::new(),
             strings_interner: StringsInterner::new(256),
             stack: Vec::new(),
+            depth: 0,
             iterators: Vec::new(),
             handlers: Vec::new(),
             sizes: Vec::new(),
@@ -1279,8 +1292,8 @@ impl<'e> Vm<'e> {
 
         // `call_compiled` takes its arguments off the operand stack, where a
         // compiled call site would already have put them.
-        let first = self.stack.len();
-        self.stack.extend(args);
+        let first = self.depth;
+        self.push_all(args.into_iter());
 
         let restore = mem::replace(&mut self.global.level, level);
         let (result, this) = self.call_compiled_with_this(
@@ -1296,7 +1309,7 @@ impl<'e> Vm<'e> {
         );
         self.global.level = restore;
 
-        self.stack.truncate(first);
+        self.truncate_stack(first);
         (result, this)
     }
 
@@ -1600,16 +1613,131 @@ impl<'e> Vm<'e> {
         result
     }
 
+    /// Slots for `extra` more operands above the top.
+    ///
+    /// Called once per frame entry with the deepest chunk's need, so the
+    /// store below it never has to test — and marked cold because a
+    /// well-formed program reaches it once and a growing one is already
+    /// paying for an allocation.
+    #[cold]
+    #[inline(never)]
+    fn grow_stack(&mut self, extra: usize) {
+        let want = (self.depth + extra.max(1)).next_power_of_two();
+        self.stack.resize(want, Dynamic::UNIT);
+    }
+
+    #[inline]
+    fn reserve_stack(&mut self, extra: usize) {
+        if self.depth + extra > self.stack.len() {
+            self.grow_stack(extra);
+        }
+    }
+
+    /// `pyframe.py:390 pushvalue` — a store into the slot the depth names,
+    /// and the depth moved on.
+    #[inline]
+    fn push(&mut self, value: Dynamic) {
+        let depth = self.depth;
+        if depth == self.stack.len() {
+            self.grow_stack(1);
+        }
+        self.stack[depth] = value;
+        self.depth = depth + 1;
+    }
+
+    fn push_all(&mut self, values: impl ExactSizeIterator<Item = Dynamic>) {
+        self.reserve_stack(values.len());
+        for value in values {
+            self.push(value);
+        }
+    }
+
+    /// The operands, without the slots above the top — those hold unit and
+    /// belong to nobody.
+    #[inline]
+    fn values(&self) -> &[Dynamic] {
+        &self.stack[..self.depth]
+    }
+
+    #[inline]
+    fn values_mut(&mut self) -> &mut [Dynamic] {
+        &mut self.stack[..self.depth]
+    }
+
+    /// `pyframe.py:427 dropvalues` — the abandoned slots are cleared rather
+    /// than left holding the reference the value carried.
+    fn truncate_stack(&mut self, depth: usize) {
+        // `Vec::truncate` was a no-op for a length it already sat below, and a
+        // caller that has popped past its own floor relies on that: taking the
+        // depth as given here would hand it slots it had already given up.
+        if depth >= self.depth {
+            return;
+        }
+        let mut slot = depth;
+        while slot < self.depth {
+            self.stack[slot] = Dynamic::UNIT;
+            slot += 1;
+        }
+        self.depth = depth;
+    }
+
+    /// Move the operands from `first` upwards off the stack.
+    ///
+    /// What `Vec::drain` was: it took the values out and shortened the
+    /// vector, and this takes them out and lowers the depth.
+    fn take_values_from(&mut self, first: usize) -> FnArgsVec<Dynamic> {
+        if first >= self.depth {
+            return FnArgsVec::new();
+        }
+        let mut taken = FnArgsVec::new();
+        let mut slot = first;
+        while slot < self.depth {
+            taken.push(mem::take(&mut self.stack[slot]));
+            slot += 1;
+        }
+        self.depth = first;
+        taken
+    }
+
+    /// Open `count` slots at `at`, moving whatever is above them up.
+    fn open_slots(&mut self, at: usize, count: usize) {
+        self.reserve_stack(count);
+        let mut slot = self.depth;
+        while slot > at {
+            slot -= 1;
+            self.stack[slot + count] = mem::take(&mut self.stack[slot]);
+        }
+        self.depth += count;
+    }
+
+    /// The top operand, or unit where there is none.
+    ///
+    /// The two sites that read the stack without a depth to check — a
+    /// `Return` with nothing pushed, and the fast assignment that has
+    /// already established its two operands — share this rather than one
+    /// carrying `unwrap_or` and the other an `expect`.
+    fn pop_or_unit(&mut self) -> Dynamic {
+        match self.depth.checked_sub(1) {
+            Some(depth) => {
+                self.depth = depth;
+                mem::take(&mut self.stack[depth])
+            }
+            None => Dynamic::UNIT,
+        }
+    }
+
     fn pop(&mut self) -> Result<Dynamic, Box<EvalAltResult>> {
-        Ok(or_raise!(
-            self.stack.pop(),
+        let depth = or_raise!(
+            self.depth.checked_sub(1),
             malformed("operand stack underflow".to_string())
-        ))
+        );
+        self.depth = depth;
+        Ok(mem::take(&mut self.stack[depth]))
     }
 
     fn inspect(&mut self) -> Result<&Dynamic, Box<EvalAltResult>> {
         Ok(or_raise!(
-            self.stack.last(),
+            self.values().last(),
             malformed("operand stack underflow".to_string())
         ))
     }
@@ -1689,7 +1817,7 @@ impl<'e> Vm<'e> {
         // Step operands were pushed first, then the root if it is one that has
         // to be evaluated, then the value being assigned.
         let operands_at = or_raise!(
-            self.stack.len().checked_sub(chain.consumes()),
+            self.depth.checked_sub(chain.consumes()),
             malformed("chain with too few operands".to_string())
         );
 
@@ -1725,11 +1853,11 @@ impl<'e> Vm<'e> {
             }),
             // Rhai flattens the right-hand side before assigning, so a shared
             // cell is copied out rather than aliased in.
-            (true, _) => Ok(Some(self.stack[self.stack.len() - 1].clone().flatten())),
+            (true, _) => Ok(Some(self.stack[self.depth - 1].clone().flatten())),
         };
 
         let result = value.and_then(|value| {
-            let mut operands: FnArgsVec<Dynamic> = self.stack
+            let mut operands: FnArgsVec<Dynamic> = self.values()
                 [operands_at..operands_at + chain.operands as usize]
                 .iter()
                 .cloned()
@@ -1778,7 +1906,7 @@ impl<'e> Vm<'e> {
         }
 
         let (out, _) = result?;
-        self.stack.truncate(operands_at);
+        self.truncate_stack(operands_at);
         Ok(out)
     }
 
@@ -2011,8 +2139,8 @@ impl<'e> Vm<'e> {
                     // write through `this` lands in the level above — which for
                     // a chain rooted at a local is the scope entry itself.
                     let (bound, write_back) = bind_this(target);
-                    let at = self.stack.len();
-                    self.stack.extend(args);
+                    let at = self.depth;
+                    self.push_all(args.into_iter());
                     // A chained call always starts an empty scope.
                     let new_scope = &mut Scope::new();
                     let (result, returned) = self.call_compiled_with_this(
@@ -2026,7 +2154,7 @@ impl<'e> Vm<'e> {
                         step_pos,
                         Some(bound),
                     );
-                    self.stack.truncate(at);
+                    self.truncate_stack(at);
                     // Before `?`: a body that mutated and then raised has
                     // already written, as it would through Rhai's pointer.
                     unbind_this(target, returned, write_back);
@@ -2730,7 +2858,7 @@ impl<'e> Vm<'e> {
         pos: Position,
     ) -> VmResult {
         let base = or_raise!(
-            self.stack.len().checked_sub(argc + 1),
+            self.depth.checked_sub(argc + 1),
             malformed("function pointer call is missing its target".into())
         );
         let mut at = base;
@@ -2744,7 +2872,7 @@ impl<'e> Vm<'e> {
         if method && !self.stack[at].is::<FnPtr>() {
             receiver_at = Some(at);
             at += 1;
-            if at >= self.stack.len() {
+            if at >= self.depth {
                 return Err(self.mismatch::<FnPtr>(self.stack[at - 1].type_name(), pos));
             }
         }
@@ -2754,7 +2882,7 @@ impl<'e> Vm<'e> {
             self.mismatch::<FnPtr>(self.stack[at].type_name(), pos)
         );
 
-        let taken = self.stack.len() - at - 1;
+        let taken = self.depth - at - 1;
         let curried = pointer.curry().len();
         // A receiver does not change which function a pointer names, only what
         // the callee's `this` is: Rhai keys its own script pointers on the
@@ -2778,8 +2906,11 @@ impl<'e> Vm<'e> {
             // Curried arguments go in front of the call's own, which is what
             // currying means and where the callee's parameters expect them.
             let first = at + 1;
-            self.stack
-                .splice(first..first, pointer.curry().iter().cloned());
+            let curried = pointer.curry();
+            self.open_slots(first, curried.len());
+            for (offset, value) in curried.iter().enumerate() {
+                self.stack[first + offset] = value.clone();
+            }
 
             // A function pointer call always starts with an empty scope.
             let new_scope = &mut Scope::new();
@@ -2800,7 +2931,7 @@ impl<'e> Vm<'e> {
         } else {
             // Anything else is Rhai's: a native function, a name registered
             // elsewhere, or a pointer it built itself.
-            let mut args: FnArgsVec<Dynamic> = self.stack.drain(at + 1..).collect();
+            let mut args = self.take_values_from(at + 1);
             let context = (self.engine, pointer.fn_name(), None, &self.global, pos).into();
             pointer
                 .call_raw(&context, bound.as_mut(), &mut args)
@@ -2823,7 +2954,7 @@ impl<'e> Vm<'e> {
         }
 
         let value = outcome?;
-        self.stack.truncate(base);
+        self.truncate_stack(base);
         Ok(value)
     }
 
@@ -2905,7 +3036,7 @@ impl<'e> Vm<'e> {
         }
 
         let mut buffer = or_raise!(
-            self.stack
+            self.values_mut()
                 .last_mut()
                 .and_then(|value| value.write_lock::<ImmutableString>()),
             malformed("interpolation lost its buffer".into())
@@ -3125,7 +3256,8 @@ impl<'e> Vm<'e> {
                 }
 
                 // Call into Rhai.
-                let mut args = self.stack[first..].iter_mut().collect::<FnArgsVec<_>>();
+                let top = self.depth;
+                let mut args = self.stack[first..top].iter_mut().collect::<FnArgsVec<_>>();
 
                 let answer = self
                     .engine
@@ -3184,7 +3316,8 @@ impl<'e> Vm<'e> {
         // which is exactly the shape Rhai's ABI wants (`func/call.rs:36`). It
         // consumes them, replacing each with unit, so the caller truncates
         // afterwards rather than reusing them.
-        let mut args: FnArgsVec<&mut Dynamic> = self.stack[first..].iter_mut().collect();
+        let top = self.depth;
+        let mut args: FnArgsVec<&mut Dynamic> = self.stack[first..top].iter_mut().collect();
 
         // What this site resolved to when it last ran, which is what Rhai has
         // to work out again for a site with nothing to read back. See
@@ -3303,7 +3436,7 @@ impl<'e> Vm<'e> {
             Receiver::This => unreachable!("taken above"),
         };
         let first = or_raise!(
-            self.stack.len().checked_sub(on_stack),
+            self.depth.checked_sub(on_stack),
             malformed("call with too few arguments".to_string())
         );
 
@@ -3332,16 +3465,18 @@ impl<'e> Vm<'e> {
             // it is exactly the value Rhai would pass.
             if let Site::Slot(index) = at {
                 let value = scope.get_mut_by_index(index).flatten_clone();
-                self.stack.insert(first, value);
+                self.open_slots(first, 1);
+                self.stack[first] = value;
             }
             let value = self.call_syntactic_or_stacked(
                 program, name_index, name, argc, first, scope, capture, pos,
             )?;
-            self.stack.truncate(first);
+            self.truncate_stack(first);
             return Ok(value);
         }
 
         let value = {
+            let top = self.depth;
             let (entry, rest) = match at {
                 Site::Slot(index) => (scope.get_mut_by_index(index), first),
                 // Argument zero is dead weight now that there is an entry to
@@ -3356,7 +3491,7 @@ impl<'e> Vm<'e> {
                 ),
             };
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
-                .chain(self.stack[rest..].iter_mut())
+                .chain(self.stack[rest..top].iter_mut())
                 .collect();
             // Keyed the same way [`Vm::call_stacked`] keys it, because it is
             // the same call: passing the receiver by reference is how Rhai
@@ -3390,7 +3525,7 @@ impl<'e> Vm<'e> {
             )
         };
 
-        self.stack.truncate(first);
+        self.truncate_stack(first);
         value
     }
 
@@ -3417,7 +3552,7 @@ impl<'e> Vm<'e> {
         pos: Position,
     ) -> VmResult {
         let first = or_raise!(
-            self.stack.len().checked_sub(argc),
+            self.depth.checked_sub(argc),
             malformed("call with too few arguments".to_string())
         );
 
@@ -3434,11 +3569,12 @@ impl<'e> Vm<'e> {
             let value = self.call_syntactic_or_stacked(
                 program, name_index, name, argc, first, scope, capture, pos,
             )?;
-            self.stack.truncate(first);
+            self.truncate_stack(first);
             return Ok(value);
         }
 
         let value = {
+            let top = self.depth;
             let entry = or_raise!(
                 self.this.as_mut(),
                 malformed("`this` stopped being bound".to_string())
@@ -3446,7 +3582,7 @@ impl<'e> Vm<'e> {
             // Argument zero is the snapshot, dead now that there is a register
             // to reach through.
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
-                .chain(self.stack[first + 1..].iter_mut())
+                .chain(self.stack[first + 1..top].iter_mut())
                 .collect();
             let memo = call_site(
                 &mut self.call_memo,
@@ -3473,7 +3609,7 @@ impl<'e> Vm<'e> {
             )
         };
 
-        self.stack.truncate(first);
+        self.truncate_stack(first);
         value
     }
 
@@ -3580,7 +3716,7 @@ impl<'e> Vm<'e> {
             // Taken, not cloned — Rhai consumes the caller's argument slots
             // (`func/script.rs:75`), and the caller truncates them away after.
             let value = or_raise!(
-                self.stack.get_mut(slot),
+                self.values_mut().get_mut(slot),
                 malformed("call with too few arguments".to_string())
             )
             .take();
@@ -3939,7 +4075,7 @@ impl<'e> Vm<'e> {
             }
 
             let value = or_raise!(
-                self.stack.last(),
+                self.values().last(),
                 malformed("size check with no element".to_string())
             );
             let delta = calc_data_sizes(value, true);
@@ -4043,7 +4179,7 @@ impl<'e> Vm<'e> {
         let value = self.catch_value(&mut err, catch_var.is_some());
 
         // Back to where the `try` began, at all three depths.
-        self.stack.truncate(operands);
+        self.truncate_stack(operands);
         self.iterators.truncate(iters);
         scope.rewind(scope_len);
 
@@ -4124,8 +4260,8 @@ impl<'e> Vm<'e> {
     ) -> VmResult {
         // A called function pushes its operands above the caller's rather than
         // starting a stack of its own, so this records where its own begin.
-        let stack_base = self.stack.len();
-        self.stack.reserve(program.max_stack() as usize);
+        let stack_base = self.depth;
+        self.reserve_stack(program.max_stack() as usize);
 
         // A residual's `Expr::Variable` nodes carry offsets Rhai's parser
         // computed against its own scope discipline, not against ours. Forcing
@@ -4256,12 +4392,12 @@ impl<'e> Vm<'e> {
                         program.constant(index),
                         malformed(format!("no constant {index}"))
                     );
-                    self.stack.push(value.clone());
+                    self.push(value.clone());
                 }
 
-                code::tag::UNIT => self.stack.push(Dynamic::UNIT),
-                code::tag::FALSE => self.stack.push(Dynamic::from(false)),
-                code::tag::TRUE => self.stack.push(Dynamic::from(true)),
+                code::tag::UNIT => self.push(Dynamic::UNIT),
+                code::tag::FALSE => self.push(Dynamic::from(false)),
+                code::tag::TRUE => self.push(Dynamic::from(true)),
 
                 code::tag::LOAD_LOCAL => {
                     let slot = small!(1);
@@ -4272,8 +4408,7 @@ impl<'e> Vm<'e> {
                     // Reads clone out, matching how Rhai's own variable reads
                     // leave the scope entry alone (`eval/expr.rs:276-278`), and
                     // flattening any shared cell the way a read should.
-                    self.stack
-                        .push(scope.get_mut_by_index(index).flatten_clone());
+                    self.push(scope.get_mut_by_index(index).flatten_clone());
                 }
 
                 code::tag::STORE_LOCAL | code::tag::STORE_CONST => {
@@ -4298,7 +4433,7 @@ impl<'e> Vm<'e> {
                         or_raise!(program.name(index), malformed(format!("no name {index}")));
                     let flatten = tag == code::tag::LOAD_NAMED;
                     let value = self.load_named(name, scope, flatten, pos!())?;
-                    self.stack.push(value);
+                    self.push(value);
                 }
 
                 code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
@@ -4459,7 +4594,7 @@ impl<'e> Vm<'e> {
                     // Rhai's read is `this_ptr.cloned()` and does not flatten
                     // (`eval/expr.rs:272`); its consumers do. Which tag this is
                     // is which consumer asked.
-                    self.stack.push(if tag == code::tag::LOAD_THIS {
+                    self.push(if tag == code::tag::LOAD_THIS {
                         value.flatten_clone()
                     } else {
                         value.clone()
@@ -4560,7 +4695,7 @@ impl<'e> Vm<'e> {
                         ),
                     }?;
 
-                    self.stack.push(value);
+                    self.push(value);
                 }
 
                 code::tag::JUMP => {
@@ -4631,8 +4766,8 @@ impl<'e> Vm<'e> {
                                 )
                                 .clone()
                             };
-                            self.stack.push(lhs);
-                            self.stack.push(rhs);
+                            self.push(lhs);
+                            self.push(rhs);
                             true
                         }
                         _ => tag == code::tag::BIN_OP,
@@ -4652,7 +4787,7 @@ impl<'e> Vm<'e> {
                     // is answered by it. See
                     // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
                     if typed && self.engine.fast_operators() {
-                        let top = self.stack.len();
+                        let top = self.depth;
                         let under = or_raise!(top.checked_sub(2), {
                             malformed("operator with too few operands".to_string())
                         });
@@ -4662,7 +4797,7 @@ impl<'e> Vm<'e> {
                         // verified program's byte can never make it do.
                         if let Some(kind) = BinOpKind::from_byte(code[pc + 3]) {
                             let applied = {
-                                let (lhs, rhs) = self.stack.split_at(top - 1);
+                                let (lhs, rhs) = self.values().split_at(top - 1);
                                 apply_binary(kind, &lhs[under], &rhs[0])
                             };
                             if let Some(value) = applied {
@@ -4671,8 +4806,8 @@ impl<'e> Vm<'e> {
                                 // error untouched, which is why `1 / 0` has
                                 // none. See `dispatch_failure`.
                                 let value = value?;
-                                self.stack.truncate(under);
-                                self.stack.push(value);
+                                self.truncate_stack(under);
+                                self.push(value);
                                 pc += width;
                                 continue;
                             }
@@ -4688,7 +4823,7 @@ impl<'e> Vm<'e> {
                     // the result belongs and the stack does not change depth.
                     let unary = tag == code::tag::UN_OP;
                     if unary && self.engine.fast_operators() {
-                        let under = or_raise!(self.stack.len().checked_sub(1), {
+                        let under = or_raise!(self.depth.checked_sub(1), {
                             malformed("operator with too few operands".to_string())
                         });
                         // An unknown kind byte is not an error here, as above:
@@ -4728,7 +4863,7 @@ impl<'e> Vm<'e> {
                     };
 
                     let first = or_raise!(
-                        self.stack.len().checked_sub(argc),
+                        self.depth.checked_sub(argc),
                         malformed("call with too few arguments".to_string())
                     );
 
@@ -4741,7 +4876,8 @@ impl<'e> Vm<'e> {
                     // (`func/call.rs:1775-1799`).
                     if let (Some(token), 2, true) = (op, argc, self.engine.fast_operators()) {
                         let memo = &mut self.operator_memo;
-                        let (lhs, rhs) = self.stack.split_at_mut(first + 1);
+                        let top = self.depth;
+                        let (lhs, rhs) = self.stack[..top].split_at_mut(first + 1);
                         let lhs = &mut lhs[first];
                         let rhs = &mut rhs[0];
 
@@ -4754,8 +4890,8 @@ impl<'e> Vm<'e> {
                             let context = need_context
                                 .then(|| (self.engine, name, None, &self.global, pos!()).into());
                             let value = func(context, &mut [lhs, rhs])?;
-                            self.stack.truncate(first);
-                            self.stack.push(value);
+                            self.truncate_stack(first);
+                            self.push(value);
                             pc += width;
                             continue;
                         }
@@ -4772,8 +4908,8 @@ impl<'e> Vm<'e> {
                         capture,
                         pos!(),
                     )?;
-                    self.stack.truncate(first);
-                    self.stack.push(value);
+                    self.truncate_stack(first);
+                    self.push(value);
                 }
 
                 code::tag::CALL_LOCAL_REF
@@ -4820,20 +4956,20 @@ impl<'e> Vm<'e> {
                         capture,
                         pos!(),
                     )?;
-                    self.stack.push(value);
+                    self.push(value);
                 }
 
                 code::tag::ROTATE => {
                     let under = code[pc + 1] as usize;
                     let top = or_raise!(
-                        self.stack.len().checked_sub(1),
+                        self.depth.checked_sub(1),
                         malformed("rotate on an empty stack".to_string())
                     );
                     let to = or_raise!(
                         top.checked_sub(under),
                         malformed("rotate past the bottom".to_string())
                     );
-                    self.stack[to..].rotate_right(1);
+                    self.values_mut()[to..].rotate_right(1);
                 }
 
                 // Emitted only for a literal, which is not syntax under the
@@ -4842,7 +4978,7 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_ARRAY => {
                     let len = small!(1) as usize;
                     let first = or_raise!(
-                        self.stack.len().checked_sub(len),
+                        self.depth.checked_sub(len),
                         malformed("array with too few elements".to_string())
                     );
 
@@ -4860,15 +4996,19 @@ impl<'e> Vm<'e> {
 
                     // Flattened, as Rhai does, so a shared cell is copied in
                     // rather than aliased.
-                    let array: Array = self.stack.drain(first..).map(Dynamic::flatten).collect();
-                    self.stack.push(Dynamic::from_array(array));
+                    let array: Array = self
+                        .take_values_from(first)
+                        .into_iter()
+                        .map(Dynamic::flatten)
+                        .collect();
+                    self.push(Dynamic::from_array(array));
                 }
 
                 #[cfg(not(feature = "no_object"))]
                 code::tag::MAKE_MAP => {
                     let len = small!(1) as usize;
                     let first = or_raise!(
-                        self.stack.len().checked_sub(2 * len + 1),
+                        self.depth.checked_sub(2 * len + 1),
                         malformed("map with too few operands".to_string())
                     );
                     // As for `MakeArray`: nothing was pushed for a literal
@@ -4877,7 +5017,7 @@ impl<'e> Vm<'e> {
                         self.sizes.pop();
                     }
 
-                    let mut parts = self.stack.drain(first..);
+                    let mut parts = self.take_values_from(first).into_iter();
                     let template = parts.next().expect("checked above");
                     let mut map = or_raise!(
                         template.try_cast::<Map>(),
@@ -4893,7 +5033,7 @@ impl<'e> Vm<'e> {
                         map.insert(key.as_str().into(), value.flatten());
                     }
                     drop(parts);
-                    self.stack.push(Dynamic::from_map(map));
+                    self.push(Dynamic::from_map(map));
                 }
 
                 code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
@@ -4923,7 +5063,7 @@ impl<'e> Vm<'e> {
                     }
                     // Cloned, not flattened: cloning a shared `Dynamic` clones
                     // the `Rc`, which is the capture.
-                    self.stack.push(scope.get_mut_by_index(index).clone());
+                    self.push(scope.get_mut_by_index(index).clone());
                 }
 
                 // Emitted only for a closure capture, which cannot be parsed
@@ -4995,7 +5135,7 @@ impl<'e> Vm<'e> {
                         .as_ref()
                         .and_then(|owned| callback::pointer(owned, index, name))
                         .unwrap_or(FnPtrType::Normal);
-                    self.stack.push(
+                    self.push(
                         FnPtr {
                             name: name.into(),
                             curry: Default::default(),
@@ -5010,7 +5150,7 @@ impl<'e> Vm<'e> {
                 #[cfg(not(feature = "no_closure"))]
                 code::tag::IS_SHARED => {
                     let value = self.pop()?;
-                    self.stack.push(value.is_shared().into());
+                    self.push(value.is_shared().into());
                 }
 
                 code::tag::MAKE_FN_PTR => {
@@ -5026,24 +5166,24 @@ impl<'e> Vm<'e> {
                         }
                         err
                     })?;
-                    self.stack.push(pointer.into());
+                    self.push(pointer.into());
                 }
 
                 code::tag::CURRY => {
                     let argc = code[pc + 1] as usize;
                     let at = or_raise!(
-                        self.stack.len().checked_sub(argc + 1),
+                        self.depth.checked_sub(argc + 1),
                         malformed("curry is missing its target".into())
                     );
                     let mut pointer = or_raise!(
                         self.stack[at].clone().try_cast::<FnPtr>(),
                         self.mismatch::<FnPtr>(self.stack[at].type_name(), pos!())
                     );
-                    for value in self.stack.drain(at + 1..) {
+                    for value in self.take_values_from(at + 1) {
                         pointer.add_curry(value);
                     }
-                    self.stack.truncate(at);
-                    self.stack.push(pointer.into());
+                    self.truncate_stack(at);
+                    self.push(pointer.into());
                 }
 
                 code::tag::CALL_FN_PTR
@@ -5063,11 +5203,11 @@ impl<'e> Vm<'e> {
                     };
                     let value =
                         self.call_fn_ptr(program, argc, method, receiver, scope, base, pos!())?;
-                    self.stack.push(value);
+                    self.push(value);
                 }
 
                 code::tag::INTERPOLATE_START => {
-                    self.stack.push(self.engine.const_empty_string().into());
+                    self.push(self.engine.const_empty_string().into());
                 }
 
                 code::tag::INTERPOLATE_APPEND => {
@@ -5084,7 +5224,7 @@ impl<'e> Vm<'e> {
                     // places is one allocation, which is the whole reason the
                     // engine keeps an interner.
                     let value = self.engine.get_interned_string(text.as_str());
-                    self.stack.push(value.into());
+                    self.push(value.into());
                 }
 
                 code::tag::CHAIN => {
@@ -5092,7 +5232,7 @@ impl<'e> Vm<'e> {
                     let chain =
                         or_raise!(program.chain(index), malformed(format!("no chain {index}")));
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
-                    self.stack.push(value);
+                    self.push(value);
                 }
 
                 code::tag::INDEX_SET => {
@@ -5114,7 +5254,7 @@ impl<'e> Vm<'e> {
                     let mut assigned = false;
                     #[cfg(not(feature = "no_index"))]
                     'fast: {
-                        let Some(under) = self.stack.len().checked_sub(2) else {
+                        let Some(under) = self.depth.checked_sub(2) else {
                             break 'fast;
                         };
                         let Union::Int(i, ..) = self.stack[under].0 else {
@@ -5137,9 +5277,10 @@ impl<'e> Vm<'e> {
                         let Some(cell) = array.get_mut(i) else {
                             break 'fast;
                         };
-                        *cell = self.stack.pop().expect("the value is on the stack");
-                        self.stack.pop();
-                        self.stack.push(Dynamic::UNIT);
+                        *cell = self.pop_or_unit();
+                        // The index operand, done with.
+                        drop(self.pop_or_unit());
+                        self.push(Dynamic::UNIT);
                         assigned = true;
                     }
                     if assigned {
@@ -5151,7 +5292,7 @@ impl<'e> Vm<'e> {
                     let chain =
                         or_raise!(program.chain(index), malformed(format!("no chain {index}")));
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
-                    self.stack.push(value);
+                    self.push(value);
                 }
 
                 code::tag::UNWIND_TO => {
@@ -5191,7 +5332,7 @@ impl<'e> Vm<'e> {
                     self.handlers.push(Handler {
                         target,
                         catch_var,
-                        operands: self.stack.len(),
+                        operands: self.depth,
                         scope_len: scope.len(),
                         iters: self.iterators.len(),
                         caught: None,
@@ -5263,9 +5404,9 @@ impl<'e> Vm<'e> {
                     }
 
                     if tag == code::tag::ITER_NEXT_INDEXED {
-                        self.stack.push(Dynamic::from(count));
+                        self.push(Dynamic::from(count));
                     }
-                    self.stack.push(value.flatten());
+                    self.push(value.flatten());
                 }
 
                 code::tag::STORE_SHARED => {
@@ -5288,10 +5429,10 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::RETURN => {
-                    let value = self.stack.pop().unwrap_or(Dynamic::UNIT);
+                    let value = self.pop_or_unit();
                     // Whatever else this frame left behind goes with it, so a
                     // caller's stack is exactly as it was.
-                    self.stack.truncate(stack_base);
+                    self.truncate_stack(stack_base);
                     return Ok(value);
                 }
 
