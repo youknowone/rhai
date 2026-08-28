@@ -92,6 +92,13 @@ fn main() {
                 // with no merge point at all and every census below describes a
                 // loop the tracer can never enter.
                 jitdriver_receiver_roots: vec!["GrainJitDriver".to_string()],
+                // Kept in step with `build/majit_prepass.rs`, which is the
+                // source of truth: this crate has neither helper, and left at
+                // their defaults they name the other interpreter's. A census
+                // run with the defaults measures a lowering the build does not
+                // produce.
+                str_concat_helper: String::new(),
+                int_str_helper: String::new(),
                 ..Default::default()
             },
             register_trait_families: Vec::new(),

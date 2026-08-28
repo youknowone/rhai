@@ -125,6 +125,20 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
                 // no merge point at all, and the tables below describe a loop
                 // the tracer can never enter.
                 jitdriver_receiver_roots: vec!["GrainJitDriver".to_string()],
+                // This VM has neither helper. Left at their defaults they name
+                // the other interpreter's externs, and every symbolic fnaddr on
+                // this side is still unbound, so such a call keeps the build's
+                // sentinel. Declining them drops 76 of the portal's 218 residual
+                // calls -- 35% of its residual population, 139 program-wide --
+                // along with the fnaddr `const_int` and the `-live-` each one
+                // carried, for -152 portal ops. The two ops then fall through to
+                // the `int_str/i>r` and `int_add/rr>r` defaults, which pyjitpl
+                // has no opimpl for: neither shape executes here yet. What this
+                // buys is that the gap reads as a missing opcode instead of a
+                // wired-looking call to an address this VM cannot bind. Naming
+                // this VM's own concat/render shims here is what makes them live.
+                str_concat_helper: String::new(),
+                int_str_helper: String::new(),
                 ..Default::default()
             },
             register_trait_families: Vec::new(),
