@@ -89,3 +89,26 @@ fn the_liveness_parts_are_present_exactly_when_the_bodies_are() {
 
     eprintln!("insn table = {} entries, liveness stream = {} bytes, for {count} jitcodes", insns.len(), all_liveness.len(),);
 }
+
+/// The compiled driver carries the loop's own green and red description.
+///
+/// A run-time driver has to be told which merge-point operand is green and
+/// which red, and what kind each is. `build/majit_prepass.rs` declares that,
+/// and jtransform checks the declaration against the operands the portal graph
+/// actually has -- so the answer that comes back out of the build is the
+/// graph's, checked. Re-typing it on this side would be a second declaration
+/// that agrees only until one of them is edited.
+#[test]
+fn the_compiled_driver_describes_its_own_greens_and_reds() {
+    let Some(driver) = jitcodes::driver() else {
+        assert_eq!(jitcodes::count(), 0, "a build that lowered jitcodes must also name the driver that owns them",);
+        return;
+    };
+
+    assert_eq!(driver.greens, ["pc", "program"]);
+    assert_eq!(driver.reds, ["vm", "scope", "base", "reached"]);
+    assert_eq!(driver.green_args_spec, [majit_ir::Type::Int, majit_ir::Type::Ref],);
+    assert_eq!(driver.red_args_types, [majit_ir::Type::Ref, majit_ir::Type::Ref, majit_ir::Type::Int, majit_ir::Type::Ref,],);
+    assert!(driver.virtualizables.is_empty(), "this VM declares no virtualizable red",);
+    eprintln!("driver names portal {} with {} greens and {} reds", driver.main_jitcode_index, driver.greens.len(), driver.reds.len(),);
+}

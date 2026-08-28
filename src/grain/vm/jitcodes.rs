@@ -94,6 +94,19 @@ pub fn install() {
     init_global_build_descr_pool(table());
 }
 
+/// The driver the lowering compiled, or `None` when it compiled none.
+///
+/// Everything a run-time driver needs to describe this loop is decided at
+/// build time and travels in here: which jitcode is the portal, and the green
+/// and red names paired with the operand kinds the merge point's own operands
+/// had. Re-deriving any of it on this side would be a second answer that
+/// nothing keeps in step with the first.
+pub fn driver() -> Option<majit_translate::CompiledJitDriver> {
+    let drivers: Vec<majit_translate::CompiledJitDriver> =
+        bincode::deserialize(JIT_DRIVERS).expect("the driver table decodes");
+    drivers.into_iter().next()
+}
+
 /// The index of the portal jitcode — the one carrying the merge point.
 ///
 /// Read from the driver table the lowering wrote rather than rediscovered by
@@ -101,9 +114,7 @@ pub fn install() {
 /// is the portal, and a second answer here could disagree with the operands
 /// that were numbered against the first.
 pub fn portal_index() -> Option<usize> {
-    let drivers: Vec<majit_translate::CompiledJitDriver> =
-        bincode::deserialize(JIT_DRIVERS).expect("the driver table decodes");
-    drivers.first().map(|driver| driver.main_jitcode_index)
+    driver().map(|driver| driver.main_jitcode_index)
 }
 
 /// Where the portal's `jit_merge_point` opcode byte sits in its own body.
