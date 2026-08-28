@@ -93,8 +93,8 @@ bin-features = ["decimal", "metadata", "serde", "debugging", "rustyline"]
 fuzz = ["arbitrary", "rust_decimal?/rust-fuzz", "serde", "grain"]
 ## Enable the experimental [`grain`](grain/index.html) bytecode VM
 grain = []
-## Emit the tracing-JIT merge point in the `grain` dispatch loop, for a consumer
-## that lowers the VM. Costs a call per instruction and compiles nothing else.
+## Emit and consult the tracing-JIT merge point in the `grain` dispatch loop.
+## Compiled entry remains disabled until residual function addresses are bound.
 grain-jit = ["grain", "dep:majit-translate", "dep:majit-metainterp", "dep:majit-ir", "dep:majit-charon-reader", "dep:bincode"]
 
 #! ### System Configuration Features

@@ -11,16 +11,59 @@
 //! declaration against the portal graph's own operands; a second declaration
 //! here would agree with that one only until one of the two was edited.
 //!
-//! What this does NOT yet do is enter: `jit_merge_point` is still an empty
-//! marker, so no live `Vm` ever reaches these methods. The scaffolding is
-//! separable from that step and is exercised on the build artefact alone --
-//! whether the metainterp accepts the tables this crate ships is a question
-//! that can be answered before anything traces.
+//! Compiled entry is deliberately disabled while the embedded jitcodes still
+//! carry unbound symbolic function addresses. Recording such a call would be
+//! safe, but majit's current walker also invokes it to obtain a concrete
+//! shadow. The trace path stops before that instruction, and the state refuses
+//! the driver's compatibility check before any backend body can run.
 
 use majit_ir::{OpRef, Type};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use super::jitcodes;
+
+/// What the grain driver did on this thread since [`reset_stats`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GrainJitStats {
+    /// Dispatch-loop markers that reached the runtime consultation.
+    pub merge_points_consulted: usize,
+    /// Entry-door calls that kept interpreting without starting a trace.
+    pub entry_door_interpret: usize,
+    /// Entry-door calls declined because a trace was already active.
+    pub entry_door_already_tracing: usize,
+    /// Warm-loop decisions that opened a trace.
+    pub traces_started: usize,
+    /// Traces the metainterpreter abandoned before compilation.
+    pub traces_aborted: usize,
+    /// Loop traces successfully compiled.
+    pub loops_compiled: usize,
+    /// Operations appended by portal walks, before optimization.
+    pub ops_recorded: usize,
+    /// Largest active trace observed after one portal walk.
+    pub max_trace_ops: usize,
+    /// Calls that reached majit's immediately-before-backend-entry hook.
+    pub compiled_entries: usize,
+    /// Compiled artifacts rejected by this state's compatibility gate.
+    pub compiled_entries_refused: usize,
+    /// Walks stopped before an unbound symbolic residual callee was invoked.
+    pub symbolic_residual_aborts: usize,
+    /// Nested consultations skipped instead of panicking on a TLS borrow.
+    pub reentrant_consultations_declined: usize,
+    /// Consultations skipped because another thread owns the process's driver.
+    pub non_owner_consultations_declined: usize,
+    /// Majit's abort-reason counter deltas for the observation window.
+    pub abort_reasons: String,
+}
+
+/// Snapshot this thread's grain-JIT counters.
+pub fn stats() -> GrainJitStats {
+    super::jit::stats()
+}
+
+/// Start a fresh observation window for this thread's grain-JIT counters.
+pub fn reset_stats() {
+    super::jit::reset_stats();
+}
 
 /// The compiled driver, held for the life of the process.
 ///
@@ -122,11 +165,10 @@ impl JitCodeSym for GrainSym {
 pub struct GrainJitState {
     /// What the last [`JitState::restore`] was handed.
     ///
-    /// Kept rather than dropped: the write-back into the live `Vm` and `Scope`
-    /// belongs to the step that makes `jit_merge_point` a real call, and until
-    /// then there is no such VM here to write into. Discarding the values
-    /// instead would leave a method that looks implemented and silently loses
-    /// every deopt.
+    /// Kept rather than dropped: compiled entry is disabled in this slice, so
+    /// no deoptimization path calls `restore` yet. The later binding/entry work
+    /// must define how these raw words are written back into the live `Vm` and
+    /// `Scope`; silently discarding them here would conceal that missing step.
     pub last_restored: Vec<i64>,
 }
 
@@ -169,13 +211,14 @@ impl JitState for GrainJitState {
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        // Every shape this loop can vary in is already a guard in the traced
-        // body: a local read is `base + slot` bounds-checked against
-        // `scope.len()`, and the dispatch is a switch on the instruction byte.
-        // A second predicate here would either duplicate one of those or
-        // decline entries the guards would have accepted.
+        // This is the last state-owned gate before each compiled-entry path
+        // calls the backend. Every symbolic residual target in the embedded
+        // table is still unbound, so refuse here until the host supplies real
+        // ABI shims. Returning false does not disable recording or compilation;
+        // it invalidates/declines the artifact before execute_assembler.
         let _ = meta;
-        true
+        super::jit::record_compiled_entry_refusal();
+        false
     }
 
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
