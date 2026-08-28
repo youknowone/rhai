@@ -139,6 +139,15 @@ pub fn body_byte(index: usize, offset: usize) -> Option<u8> {
         .and_then(|jc| jc.code.get(offset).copied())
 }
 
+/// Every lowered jitcode, in allocation order.
+///
+/// This is the list `MetaInterp::install_jitcodes` takes, and the order is the
+/// contract: a `j` operand is an index into it, so a caller that reorders or
+/// filters it resolves callees to the wrong bodies and says nothing about it.
+pub fn all() -> Vec<Arc<majit_metainterp::JitCode>> {
+    table().jitcodes().to_vec()
+}
+
 /// How many jitcodes the build lowered. Zero when it lowered none.
 pub fn count() -> usize {
     table().jitcodes().len()

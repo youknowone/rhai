@@ -253,6 +253,11 @@ name = "grain_jitcodes"
 path = "tests/grain/jitcodes.rs"
 required-features = ["grain-jit"]
 
+[[test]]
+name = "grain_jit_driver"
+path = "tests/grain/jit_driver.rs"
+required-features = ["grain-jit"]
+
 # The `grain-jit` lowering runs inside `build.rs`, and it is the longest step
 # of a cold build by a wide margin. Cargo compiles build dependencies at
 # `opt-level = 0` by default, which is the wrong trade for an analysis pass
