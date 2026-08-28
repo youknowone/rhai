@@ -16,13 +16,28 @@
 use majit_translate::codewriter::insns;
 use rhai::grain::jitcodes;
 
+/// The build lowered no tables, so table-dependent assertions are vacuous.
+fn no_tables() -> bool {
+    let empty = jitcodes::count() == 0;
+    if empty {
+        assert_ne!(
+            std::env::var("RHAI_GRAIN_JIT_REQUIRE_TABLES").as_deref(),
+            Ok("1"),
+            "RHAI_GRAIN_JIT_REQUIRE_TABLES=1 requires jitcode tables lowered from the \
+             MAJIT_MIR_FRONTEND_LLBC artefact, but this build loaded 0 jitcodes"
+        );
+    }
+    empty
+}
+
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_lowered_tables_round_trip_and_name_their_portal() {
     jitcodes::install();
     let count = jitcodes::count();
     let portal = jitcodes::portal_index();
 
-    if count == 0 {
+    if no_tables() {
         assert_eq!(portal, None, "no jitcodes were lowered, so no driver can name a portal among them");
         eprintln!(
             "loaded 0 jitcodes: no LLBC artefact was named at build time. Set \
@@ -64,7 +79,11 @@ fn the_lowered_tables_round_trip_and_name_their_portal() {
 /// built from these tables would have walked bodies whose `-live-` offsets
 /// index an empty stream and whose opcodes resolve to no name.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_liveness_parts_are_present_exactly_when_the_bodies_are() {
+    if no_tables() {
+        return;
+    }
     jitcodes::install();
     let (insns, all_liveness) = jitcodes::liveness_parts();
     let count = jitcodes::count();
@@ -99,7 +118,11 @@ fn the_liveness_parts_are_present_exactly_when_the_bodies_are() {
 /// graph's, checked. Re-typing it on this side would be a second declaration
 /// that agrees only until one of them is edited.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_compiled_driver_describes_its_own_greens_and_reds() {
+    if no_tables() {
+        return;
+    }
     let Some(driver) = jitcodes::driver() else {
         assert_eq!(jitcodes::count(), 0, "a build that lowered jitcodes must also name the driver that owns them",);
         return;

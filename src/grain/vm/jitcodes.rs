@@ -46,6 +46,20 @@ fn entries<'a>(bodies: &'a [u8], offsets: &'a [u32]) -> impl Iterator<Item = &'a
         .map(|bounds| &bodies[bounds[0] as usize..bounds[1] as usize])
 }
 
+/// The build-time symbolic address table, retained for the diagnostic resolver.
+fn symbolic_fnaddrs() -> &'static Vec<(i64, String)> {
+    static PATHS: once_cell::race::OnceBox<Vec<(i64, String)>> = once_cell::race::OnceBox::new();
+    PATHS.get_or_init(|| {
+        Box::new(bincode::deserialize(SYMBOLIC_FNADDRS).expect("the symbolic fnaddr table decodes"))
+    })
+}
+
+fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
+    symbolic_fnaddrs()
+        .iter()
+        .find_map(|(symbolic, path)| (*symbolic == fnaddr).then_some(path.as_str()))
+}
+
 /// The build-time tables, joined into runtime shells.
 ///
 /// Published once and never rebuilt: the tables are a frozen build artefact,
@@ -68,9 +82,6 @@ fn table() -> &'static EmbeddedJitCodeTable {
             .map(|body| bincode::deserialize::<BhDescr>(body).expect("a descr decodes"))
             .collect();
 
-        let symbolic: Vec<(i64, String)> =
-            bincode::deserialize(SYMBOLIC_FNADDRS).expect("the symbolic fnaddr table decodes");
-
         // No runtime bindings yet: nothing on this side publishes an ABI shim
         // for a symbolic path, so every unbound callee keeps the build's
         // sentinel and a trace that reaches one is expected to decline rather
@@ -78,7 +89,7 @@ fn table() -> &'static EmbeddedJitCodeTable {
         Box::new(EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs(
             &jitcodes,
             descrs,
-            &symbolic,
+            symbolic_fnaddrs(),
             &[],
         ))
     })
@@ -91,6 +102,7 @@ fn table() -> &'static EmbeddedJitCodeTable {
 /// empty and every `j` operand resolves to nothing. Idempotent, and cheap
 /// after the first call.
 pub fn install() {
+    majit_metainterp::set_symbolic_fnaddr_path_resolver(Some(resolve_symbolic_fnaddr_path));
     init_global_build_descr_pool(table());
 }
 

@@ -22,6 +22,12 @@ const THRESHOLD: u32 = 1039;
 fn no_tables() -> bool {
     let empty = jitcodes::count() == 0;
     if empty {
+        assert_ne!(
+            std::env::var("RHAI_GRAIN_JIT_REQUIRE_TABLES").as_deref(),
+            Ok("1"),
+            "RHAI_GRAIN_JIT_REQUIRE_TABLES=1 requires jitcode tables lowered from the \
+             MAJIT_MIR_FRONTEND_LLBC artefact, but this build loaded 0 jitcodes"
+        );
         eprintln!(
             "no LLBC artefact was named at build time; set MAJIT_MIR_FRONTEND_LLBC to a \
              `--features grain-jit` extraction to exercise the driver."
@@ -31,6 +37,7 @@ fn no_tables() -> bool {
 }
 
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_descriptor_is_the_shape_the_build_recorded() {
     if no_tables() {
         return;
@@ -55,6 +62,7 @@ fn the_descriptor_is_the_shape_the_build_recorded() {
 /// `live_value_types` types every red `Int`, which for this VM is wrong for
 /// three of four, so this is what the override buys.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_live_values_carry_the_kinds_the_descriptor_declares() {
     if no_tables() {
         return;
@@ -74,6 +82,7 @@ fn the_live_values_carry_the_kinds_the_descriptor_declares() {
 
 /// The state gate refuses an artifact before majit's backend-entry hook.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_state_actively_refuses_compiled_entry() {
     if no_tables() {
         return;
@@ -91,6 +100,7 @@ fn the_state_actively_refuses_compiled_entry() {
 
 /// The symbolic values the trace carries across the back edge.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_symbolic_reds_are_input_args_in_declaration_order() {
     if no_tables() {
         return;
@@ -114,6 +124,7 @@ fn the_symbolic_reds_are_input_args_in_declaration_order() {
 /// staticdata through `Arc::get_mut` and panic once any trace has cloned it, so
 /// they run before anything could have.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn the_driver_accepts_the_tables_this_crate_ships() {
     if no_tables() {
         return;
@@ -154,6 +165,7 @@ fn the_driver_accepts_the_tables_this_crate_ships() {
 /// symbolic fnaddr bindings, so `GrainJitState::is_compatible` must keep the
 /// backend-entry hook at zero even if this or a later portal walk compiles.
 #[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
 fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
     if no_tables() {
         return;

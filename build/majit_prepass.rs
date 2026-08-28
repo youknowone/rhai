@@ -44,6 +44,7 @@ const RHAI_ERROR_CARRIER: majit_translate::ErrorCarrierSpec<'static> =
 /// end, not by this build, so a consumer pointing several artefacts at one
 /// lowering uses the platform path separator as it would for `PATH`.
 const LLBC_ENV: &str = "MAJIT_MIR_FRONTEND_LLBC";
+const REQUIRE_TABLES_ENV: &str = "RHAI_GRAIN_JIT_REQUIRE_TABLES";
 
 /// Every file this build script writes into `OUT_DIR`.
 ///
@@ -64,12 +65,19 @@ const OUTPUTS: &[&str] = &[
 
 pub fn main() {
     println!("cargo:rerun-if-env-changed={LLBC_ENV}");
+    println!("cargo:rerun-if-env-changed={REQUIRE_TABLES_ENV}");
+    println!("cargo:rustc-check-cfg=cfg(rhai_grain_jit_tables)");
+    println!("cargo:rustc-check-cfg=cfg(rhai_grain_jit_require_tables)");
+    if std::env::var(REQUIRE_TABLES_ENV).as_deref() == Ok("1") {
+        println!("cargo:rustc-cfg=rhai_grain_jit_require_tables");
+    }
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR is set");
 
     let Some(llbc) = std::env::var_os(LLBC_ENV) else {
         write_empty_tables(&out_dir);
         return;
     };
+    println!("cargo:rustc-cfg=rhai_grain_jit_tables");
     let paths: Vec<std::path::PathBuf> = std::env::split_paths(&llbc).collect();
     assert!(!paths.is_empty(), "{LLBC_ENV} is set but names no artefact");
     for path in &paths {
