@@ -59,16 +59,7 @@ fn table() -> &'static EmbeddedJitCodeTable {
         let (_names, offsets): (Vec<String>, Vec<u32>) =
             bincode::deserialize(JITCODES_INDEX).expect("the jitcode index decodes");
         let jitcodes: Vec<Arc<JitCode>> = entries(JITCODES, &offsets)
-            .map(|body| {
-                let mut jitcode = bincode::deserialize::<JitCode>(body).expect("a jitcode decodes");
-                // The build-side codewriter serializes its portal back-pointer,
-                // but runtime registration is the operation that validates the
-                // merge payload and publishes the driver's own staticdata slot.
-                // JitCode's field is once-only, so clear the build-process value
-                // before the runtime process installs that same relationship.
-                jitcode.replace_jitdriver_sd(None);
-                Arc::new(jitcode)
-            })
+            .map(|body| Arc::new(bincode::deserialize::<JitCode>(body).expect("a jitcode decodes")))
             .collect();
 
         let descr_offsets: Vec<u32> =

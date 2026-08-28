@@ -38,7 +38,6 @@ struct Runtime {
     portal: Arc<majit_metainterp::JitCode>,
     portal_merge_point: usize,
     green_types: Vec<GreenType>,
-    symbolic_residual_opcodes: [bool; 256],
 }
 
 impl Runtime {
@@ -70,12 +69,6 @@ impl Runtime {
         driver
             .meta_interp_mut()
             .install_liveness_from_build_parts(&insns, all_liveness);
-        let mut symbolic_residual_opcodes = [false; 256];
-        for (name, opcode) in &insns {
-            if name.starts_with("residual_call") {
-                symbolic_residual_opcodes[*opcode as usize] = true;
-            }
-        }
 
         let table = jitcodes::all();
         let portal_index = jitcodes::portal_index().expect("the driver names its portal");
@@ -108,7 +101,6 @@ impl Runtime {
             portal_merge_point: jitcodes::portal_merge_point_offset()
                 .expect("the registered portal names its merge point"),
             green_types,
-            symbolic_residual_opcodes,
         })
     }
 }
@@ -125,10 +117,10 @@ struct Counters {
     max_trace_ops: usize,
     compiled_entries: usize,
     compiled_entries_refused: usize,
-    symbolic_residual_aborts: usize,
     reentrant_consultations_declined: usize,
     non_owner_consultations_declined: usize,
     abort_reasons_before: Vec<(&'static str, u64)>,
+    symbolic_residual_aborts_before: u64,
 }
 
 thread_local! {
@@ -151,6 +143,7 @@ pub(super) fn reset_stats() {
     COUNTERS.with(|cell| {
         *cell.borrow_mut() = Counters {
             abort_reasons_before: majit_metainterp::embed::abort_reasons(),
+            symbolic_residual_aborts_before: majit_metainterp::symbolic_residual_trace_aborts(),
             ..Counters::default()
         };
     });
@@ -163,13 +156,16 @@ pub(super) fn stats() -> jit_state::GrainJitStats {
             &stats.abort_reasons_before,
             &majit_metainterp::embed::abort_reasons(),
         );
-        if stats.symbolic_residual_aborts > 0 {
+        let symbolic_residual_aborts = majit_metainterp::symbolic_residual_trace_aborts()
+            .saturating_sub(stats.symbolic_residual_aborts_before)
+            as usize;
+        if symbolic_residual_aborts > 0 {
             if !abort_reasons.is_empty() {
                 abort_reasons.push(' ');
             }
             abort_reasons.push_str(&format!(
                 "unbound_symbolic_residual={}",
-                stats.symbolic_residual_aborts
+                symbolic_residual_aborts
             ));
         }
         jit_state::GrainJitStats {
@@ -183,7 +179,7 @@ pub(super) fn stats() -> jit_state::GrainJitStats {
             max_trace_ops: stats.max_trace_ops,
             compiled_entries: stats.compiled_entries,
             compiled_entries_refused: stats.compiled_entries_refused,
-            symbolic_residual_aborts: stats.symbolic_residual_aborts,
+            symbolic_residual_aborts,
             reentrant_consultations_declined: stats.reentrant_consultations_declined,
             non_owner_consultations_declined: stats.non_owner_consultations_declined,
             abort_reasons,
@@ -288,7 +284,6 @@ impl GrainJitDriver {
                 let portal = Arc::clone(&runtime.portal);
                 let header_pc = runtime.portal_merge_point;
                 let green_types = runtime.green_types.clone();
-                let symbolic_residual_opcodes = runtime.symbolic_residual_opcodes;
                 runtime.driver.merge_point(|meta, sym| {
                     let ctx = meta.trace_ctx().expect("an active trace owns a context");
                     let before = ctx.num_ops();
@@ -362,21 +357,6 @@ impl GrainJitDriver {
                     majit_metainterp::JitCodeSym::begin_portal_op(sym, header_pc);
 
                     let action = loop {
-                        let Some(frame) = stack.frames.frames.last() else {
-                            break TraceAction::Continue;
-                        };
-                        if let Some(opcode) = frame.jitcode.code.get(frame.code_cursor) {
-                            if symbolic_residual_opcodes[*opcode as usize] {
-                                // The current majit walker executes residuals
-                                // to obtain their concrete shadows while it
-                                // records them. An unbound symbolic target
-                                // therefore cannot be stepped safely: stop at
-                                // the call boundary, retaining the prefix the
-                                // real walker recorded so far.
-                                bump_stats(|stats| stats.symbolic_residual_aborts += 1);
-                                break TraceAction::Abort;
-                            }
-                        }
                         let step = {
                             let mut machine = majit_metainterp::JitCodeMachine::<
                                 jit_state::GrainSym,

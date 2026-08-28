@@ -11,7 +11,7 @@
 //! this VM would hit first, because three of its four reds are Ref and the
 //! `JitState` default types every red Int.
 
-use majit_metainterp::JitState;
+use majit_metainterp::{JitDriver, JitState};
 use rhai::grain::{jit_state, jitcodes, Compiler, Vm};
 use rhai::{Engine, Scope};
 
@@ -106,19 +106,46 @@ fn the_symbolic_reds_are_input_args_in_declaration_order() {
     assert!(jit_state::GrainJitState::validate_close(&sym, &meta));
 }
 
-/// The build artifact names a complete portal before the live driver adopts it.
+/// The whole bring-up, in the order the steps have to run in.
+///
+/// `install` publishes the tables as the global build pool, which is the seed
+/// `register_dispatch_jitcode_shared` adopts the portal out of.
+/// `install_liveness_from_build_parts` and the registration both take the
+/// staticdata through `Arc::get_mut` and panic once any trace has cloned it, so
+/// they run before anything could have.
 #[test]
 fn the_driver_accepts_the_tables_this_crate_ships() {
     if no_tables() {
         return;
     }
     jitcodes::install();
+
+    let mut driver: JitDriver<jit_state::GrainJitState> = JitDriver::with_descriptor(THRESHOLD, jit_state::grain_driver_descriptor());
+    driver.ensure_descriptor_registered();
+    assert_eq!(driver.index(), Some(0), "the first registered driver is the one the lowered bodies name index 0",);
+
+    let (insns, all_liveness) = jitcodes::liveness_parts();
+    driver.meta_interp_mut().install_liveness_from_build_parts(&insns, all_liveness);
+
     let table = jitcodes::all();
     let portal = jitcodes::portal_index().expect("a lowered table is named by a driver");
     let portal_jitcode = table.get(portal).expect("the driver names a portal the lowered table reaches").clone();
-    assert_eq!(portal_jitcode.exec.jit_merge_point_offset, jitcodes::portal_merge_point_offset(),);
-    assert_eq!(jitcodes::count(), table.len());
-    eprintln!("embedded table holds {} jitcodes, portal {portal}", table.len());
+    // Not `install_jitcodes`: this is the door that cross-checks the portal's
+    // `BC_JIT_MERGE_POINT` payload partition against the reds the descriptor
+    // declares, and sets both halves of the `call.py grab_initial_jitcodes`
+    // back-pointer. Publishing the table alone leaves the portal not answering
+    // to `is_main_jitcode`.
+    driver.register_dispatch_jitcode_shared(&portal_jitcode);
+
+    let named = driver.dispatch_jitcode().expect("registration names this driver's portal");
+    assert!(
+        std::sync::Arc::ptr_eq(named, &portal_jitcode),
+        "the driver's portal is the table's own entry, not a copy of it -- every `j` operand at \
+         that index resolves through this identity",
+    );
+    assert_eq!(named.exec.jit_merge_point_offset, jitcodes::portal_merge_point_offset(),);
+    assert_eq!(driver.meta_interp_mut().jitcodes().len(), table.len(), "registration publishes the whole seeded table, not just the portal",);
+    eprintln!("driver 0 accepted {} jitcodes, portal {portal}", table.len());
 }
 
 /// A real VM loop reaches warmstate, opens a trace and records portal ops.
