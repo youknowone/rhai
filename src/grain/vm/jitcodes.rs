@@ -26,6 +26,14 @@ static DESCRS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs.bin"));
 static DESCRS_INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descrs_index.bin"));
 static JIT_DRIVERS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jit_drivers.bin"));
 static SYMBOLIC_FNADDRS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/symbolic_fnaddrs.bin"));
+/// Opcode name to opcode byte, as the lowering numbered them.
+static INSNS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/insns.bin"));
+/// The `(live_i, live_r, live_f)` byte stream, verbatim.
+///
+/// Every `-live-` op in a lowered body carries a two-byte offset into this,
+/// baked at build time, so it is stored and handed over unencoded — a length
+/// prefix would shift every one of those offsets by its own width.
+static ALL_LIVENESS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/all_liveness.bin"));
 
 /// One table's entries, as byte ranges over its concatenated bodies.
 ///
@@ -123,4 +131,27 @@ pub fn body_byte(index: usize, offset: usize) -> Option<u8> {
 /// How many jitcodes the build lowered. Zero when it lowered none.
 pub fn count() -> usize {
     table().jitcodes().len()
+}
+
+/// The two halves of `MetaInterp::install_liveness_from_build_parts`.
+///
+/// A body lowered ahead of time carries its liveness as an offset into one
+/// shared stream, and its opcodes as the numbers the lowering assigned. Both
+/// are decided at build time, so a driver that walks such a body has to be
+/// handed them rather than deriving them from a runtime `Assembler` — that is
+/// the difference between this and the proc-macro route's
+/// `install_canonical_liveness`.
+///
+/// The map is rebuilt on each call, so a caller installs once and keeps the
+/// driver rather than asking again.
+pub fn liveness_parts() -> (
+    majit_metainterp::indexmap::IndexMap<String, u8>,
+    &'static [u8],
+) {
+    // Written through a `BTreeMap` for reproducible bytes; the order it comes
+    // back in carries no meaning, because each entry's VALUE is the opcode
+    // number `setup_insns` indexes its table by.
+    let insns: std::collections::BTreeMap<String, u8> =
+        bincode::deserialize(INSNS).expect("the insn table decodes");
+    (insns.into_iter().collect(), ALL_LIVENESS)
 }

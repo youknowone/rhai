@@ -54,3 +54,38 @@ fn the_lowered_tables_round_trip_and_name_their_portal() {
          point opcode {opcode} sits at offset {offset}"
     );
 }
+
+/// The two halves a driver has to be handed for a body lowered ahead of time.
+///
+/// Both are build outputs of the same pass that wrote the bodies, so they are
+/// present or absent together with them. Asserting that pairing is what
+/// catches the state this repository was actually in: `insns.bin` was written
+/// and never read, and `all_liveness.bin` was not written at all, so a driver
+/// built from these tables would have walked bodies whose `-live-` offsets
+/// index an empty stream and whose opcodes resolve to no name.
+#[test]
+fn the_liveness_parts_are_present_exactly_when_the_bodies_are() {
+    jitcodes::install();
+    let (insns, all_liveness) = jitcodes::liveness_parts();
+    let count = jitcodes::count();
+
+    assert_eq!(
+        insns.is_empty(),
+        count == 0,
+        "{} jitcodes were lowered but the insn table holds {} entries; \
+         `setup_insns` sizes its opcode-name table by the numbers in here, so \
+         an empty one leaves every op in those bodies unnamed",
+        count,
+        insns.len(),
+    );
+    assert_eq!(
+        all_liveness.is_empty(),
+        count == 0,
+        "{} jitcodes were lowered but the liveness stream is {} bytes; every \
+         `-live-` op in those bodies carries a baked offset into it",
+        count,
+        all_liveness.len(),
+    );
+
+    eprintln!("insn table = {} entries, liveness stream = {} bytes, for {count} jitcodes", insns.len(), all_liveness.len(),);
+}

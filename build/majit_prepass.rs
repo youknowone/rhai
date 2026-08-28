@@ -56,6 +56,7 @@ const OUTPUTS: &[&str] = &[
     "jitcodes_index.bin",
     "jit_drivers.bin",
     "insns.bin",
+    "all_liveness.bin",
     "descrs.bin",
     "descrs_index.bin",
     "symbolic_fnaddrs.bin",
@@ -234,6 +235,10 @@ fn write_tables(out_dir: &str, pipeline: &majit_translate::ProgramPipelineResult
     // or a cached one cannot be reused.
     let insns: std::collections::BTreeMap<&String, &u8> = pipeline.insns.iter().collect();
     write(out_dir, "insns.bin", &bincode::serialize(&insns).unwrap());
+    // Raw, not encoded: every `-live-` op in a lowered body carries a baked
+    // two-byte offset into this stream, so the file has to be the stream. A
+    // length prefix would shift every one of those offsets by its own width.
+    write(out_dir, "all_liveness.bin", &pipeline.all_liveness);
 }
 
 /// The no-artefact shape of every table.
@@ -275,6 +280,7 @@ fn write_empty_tables(out_dir: &str) {
         "insns.bin",
         &bincode::serialize(&std::collections::BTreeMap::<String, u8>::new()).unwrap(),
     );
+    write(out_dir, "all_liveness.bin", &empty);
 }
 
 fn write(out_dir: &str, name: &str, bytes: &[u8]) {
