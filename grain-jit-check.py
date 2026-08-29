@@ -45,6 +45,10 @@ Usage:
     ./grain-jit-check.py --no-build      # reuse the binaries already built
     ./grain-jit-check.py --llbc PATH     # the `--features grain-jit` extraction
 
+`--llbc` is required unless `--no-build` reuses binaries that already have
+their tables: a build without it writes every table empty and the binary then
+panics before it measures anything.
+
 `--check` exits 1 when a case is over its ceiling or has vanished from the
 benchmark, and 2 when nothing breached but some case was too noisy to grade.
 """
@@ -233,9 +237,16 @@ def main():
     args = ap.parse_args()
 
     if not args.no_build:
-        if args.llbc and not all(
-            pathlib.Path(p).exists() for p in args.llbc.split(os.pathsep)
-        ):
+        if not args.llbc:
+            sys.exit(
+                "no LLBC extraction named. Pass --llbc PATH (or set "
+                "MAJIT_MIR_FRONTEND_LLBC) to a `--features grain-jit` "
+                "extraction. Without it the build script writes every table "
+                "empty and the binary panics at startup -- `jit_state.rs`: "
+                "\"the build lowered no JIT driver\" -- so there is nothing "
+                "to measure, not merely nothing to trace."
+            )
+        if not all(pathlib.Path(p).exists() for p in args.llbc.split(os.pathsep)):
             sys.exit(f"--llbc names {args.llbc}, which does not exist")
         build(PLAIN_TARGET, "grain", {}, args.quiet_build)
         jit_env = {"MAJIT_MIR_FRONTEND_LLBC": args.llbc} if args.llbc else {}
@@ -293,6 +304,9 @@ def main():
             f"{p['speedup']:>7.2f}x {j['speedup']:>8.2f}x {tax:>6.2f}x "
             f"{ceil_text:>7} {spread * 100:>6.0f}%"
         )
+        # `grain_bench` reports the worse of the two legs that make up its
+        # `speedup`, and this takes the worse of the two runs on top: a walker
+        # leg that ran under load is what turns machine noise into a `tax`.
         if spread > SPREAD_LIMIT:
             unstable.append(f"{name} (spread {spread * 100:.0f}%)")
         elif ceiling is not None and tax > ceiling:
