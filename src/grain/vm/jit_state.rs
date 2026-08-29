@@ -47,6 +47,11 @@ pub struct GrainJitStats {
     pub compiled_entries_refused: usize,
     /// Walks stopped before an unbound symbolic residual callee was invoked.
     pub symbolic_residual_aborts: usize,
+    /// Consultations answered without asking the driver, because `pc` had
+    /// advanced on its own and no trace was open. The door is what upstream
+    /// reaches from `can_enter_jit`; these are the steps that are not back
+    /// edges, and each one costs a compare rather than four allocations.
+    pub forward_steps_skipped: usize,
     /// Nested consultations skipped instead of panicking on a TLS borrow.
     pub reentrant_consultations_declined: usize,
     /// Consultations skipped because another thread owns the process's driver.
@@ -63,6 +68,23 @@ pub fn stats() -> GrainJitStats {
 /// Start a fresh observation window for this thread's grain-JIT counters.
 pub fn reset_stats() {
     super::jit::reset_stats();
+}
+
+/// Majit's own warm-up census, as `label=count` pairs, non-zero slots only.
+///
+/// Process-global and cumulative -- the counters live in majit, not here, so
+/// [`reset_stats`] does not scope them. What it answers is which of the
+/// driver's doors refused: `mst_entered` beside `mst_sync_before_false` and
+/// `mst_live_values_mismatch` says whether a trace was turned away before it
+/// could start, which no counter on this side can distinguish from a warm
+/// threshold that was never crossed.
+#[must_use]
+pub fn majit_diag_summary() -> String {
+    majit_metainterp::mc_diag_summary()
+        .split_whitespace()
+        .filter(|pair| !pair.ends_with("=0"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The compiled driver, held for the life of the process.

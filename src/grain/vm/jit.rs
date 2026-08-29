@@ -18,7 +18,7 @@
 //! replaces the call itself with the merge-point opcode, which is why the type
 //! name, signature and `inline(never)` remain part of the build contract.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{GreenKey, GreenType};
@@ -123,12 +123,33 @@ struct Counters {
     symbolic_residual_aborts_before: u64,
 }
 
+/// What the cheap half of the merge point reads, before the driver is asked.
+///
+/// One group rather than three thread-locals: this is read once per dispatched
+/// instruction and each `thread_local!` is an access of its own.
+struct Step {
+    /// The `pc` the previous consultation carried.
+    prev_pc: Cell<usize>,
+    /// Whether the driver was tracing when the door last ran. A mirror, not a
+    /// second source: tracing can only start or stop inside the door.
+    tracing: Cell<bool>,
+    /// Consultations answered without opening the door.
+    skipped: Cell<usize>,
+}
+
 thread_local! {
     // JitDriver contains thread-affine tracing state. A trace can call back
     // into interpreter code, so `try_borrow_mut` declines a nested
     // consultation instead of panicking while the outer trace remains active.
     static RUNTIME: RefCell<Option<Runtime>> = const { RefCell::new(None) };
     static COUNTERS: RefCell<Counters> = RefCell::new(Counters::default());
+    static STEP: Step = const {
+        Step {
+            prev_pc: Cell::new(usize::MAX),
+            tracing: Cell::new(false),
+            skipped: Cell::new(0),
+        }
+    };
 }
 
 fn bump_stats(f: impl FnOnce(&mut Counters)) {
@@ -140,6 +161,10 @@ pub(super) fn record_compiled_entry_refusal() {
 }
 
 pub(super) fn reset_stats() {
+    STEP.with(|step| {
+        step.skipped.set(0);
+        step.prev_pc.set(usize::MAX);
+    });
     COUNTERS.with(|cell| {
         *cell.borrow_mut() = Counters {
             abort_reasons_before: majit_metainterp::embed::abort_reasons(),
@@ -169,6 +194,7 @@ pub(super) fn stats() -> jit_state::GrainJitStats {
             ));
         }
         jit_state::GrainJitStats {
+            forward_steps_skipped: STEP.with(|step| step.skipped.get()),
             merge_points_consulted: stats.merge_points_consulted,
             entry_door_interpret: stats.entry_door_interpret,
             entry_door_already_tracing: stats.entry_door_already_tracing,
@@ -215,6 +241,32 @@ impl GrainJitDriver {
         base: usize,
         reached: &usize,
     ) {
+        // The door below resolves a celltable cell, builds a driver descriptor
+        // and extracts the live values before it decides to interpret -- four
+        // heap blocks per call, on a path taken once per *dispatched
+        // instruction*. Upstream is not asked that often. `jit_merge_point`
+        // sits at the top of the dispatch loop there too, but what ticks the
+        // counter is `can_enter_jit`, and `pyopcode.py jump_absolute` calls
+        // that only on a backward jump.
+        //
+        // There is no separate `can_enter_jit` on this driver, so the back edge
+        // is recognised instead of being told: `pc` advances on its own every
+        // instruction and only a jump can fail to advance it, so a jump that
+        // did not advance it went backwards. Entering or returning from a frame
+        // can also fail to advance it, which costs one door call that decides
+        // nothing. While a trace is open the door runs unconditionally -- the
+        // tracer records every instruction, not every loop.
+        let opened = STEP.with(|step| {
+            if pc > step.prev_pc.replace(pc) && !step.tracing.get() {
+                step.skipped.set(step.skipped.get() + 1);
+                return false;
+            }
+            true
+        });
+        if !opened {
+            return;
+        }
+
         bump_stats(|stats| stats.merge_points_consulted += 1);
 
         let env = [
@@ -243,7 +295,11 @@ impl GrainJitDriver {
                 return;
             };
 
-            let green_values = vec![pc as i64, program as *const Program as usize as i64];
+            // On the stack: this runs once per back edge, and the door it
+            // feeds is already the allocating part. `green_key_hash_typed`
+            // takes a slice, and the owned `GreenKey` is built only inside the
+            // factory below, which the door calls only when it needs one.
+            let green_values = [pc as i64, program as *const Program as usize as i64];
             assert_eq!(
                 green_values.len(),
                 runtime.green_types.len(),
@@ -252,7 +308,7 @@ impl GrainJitDriver {
             let green_hash =
                 majit_metainterp::green_key_hash_typed(&green_values, &runtime.green_types);
             let green_key = || GreenKey {
-                values: green_values.clone(),
+                values: green_values.to_vec(),
                 types: runtime.green_types.clone(),
             };
 
@@ -381,8 +437,13 @@ impl GrainJitDriver {
                 });
             }
 
+            // The mirror the gate above reads. Set from the driver here, the
+            // one place tracing can have started or stopped.
+            let tracing = runtime.driver.is_tracing();
+            STEP.with(|step| step.tracing.set(tracing));
+
             if started {
-                report_event = Some(if runtime.driver.is_tracing() {
+                report_event = Some(if tracing {
                     "trace started"
                 } else {
                     "trace decision"

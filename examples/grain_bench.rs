@@ -20,6 +20,8 @@
 
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "grain-jit")]
+use rhai::grain::{jit_state, jitcodes};
 use rhai::grain::{Compiler, Program, Vm};
 use rhai::{Dynamic, Engine, Scope};
 
@@ -178,6 +180,33 @@ const CASES: &[Case] = &[
     },
 ];
 
+/// Which of the two builds this binary is.
+///
+/// The merge point the tracer is consulted from sits behind
+/// `#[cfg(feature = "grain-jit")]`, so one binary cannot measure both sides.
+/// A comparison is therefore two processes, and a run that does not say which
+/// build it came from cannot be told from the other afterwards.
+/// `grain-jit-check.py` reads this line and refuses to compare two runs that
+/// report the same build.
+#[cfg(not(feature = "grain-jit"))]
+const BUILD: &str = "vm=plain jit=absent";
+#[cfg(feature = "grain-jit")]
+const BUILD: &str = "vm=jit jit=consulted";
+
+/// The build line, with the lowered table count measured rather than assumed.
+///
+/// `rhai_grain_jit_tables` says only that an artefact was named at build time;
+/// how many jitcodes came out of it is a runtime fact, and a `grain-jit` build
+/// that loaded none consults a driver that declines immediately. The two
+/// measure different things, so the count is on the line.
+fn build_line() -> String {
+    #[cfg(feature = "grain-jit")]
+    let tables = format!(" jitcodes={}", jitcodes::count());
+    #[cfg(not(feature = "grain-jit"))]
+    let tables = String::new();
+    format!("build: {BUILD}{tables}")
+}
+
 fn time(mut run: impl FnMut()) -> Timing {
     let mut samples: Vec<Duration> = (0..RUNS)
         .map(|_| {
@@ -226,6 +255,7 @@ fn main() {
     let mut slow_engine = Engine::new();
     slow_engine.set_fast_operators(false);
 
+    println!("{}", build_line());
     println!("load average before: {}", load_average());
     println!(
         "{:<22} {:>11} {:>11} {:>9} {:>7} {:>8} {:>11} {:>10}",
@@ -233,6 +263,9 @@ fn main() {
     );
 
     let mut below_floor = Vec::new();
+    // Collected rather than printed inline, so the table above stays a table.
+    #[cfg(feature = "grain-jit")]
+    let mut jit_rows: Vec<String> = Vec::new();
 
     for case in CASES {
         let ast = engine.compile(case.source).expect("must compile");
@@ -246,6 +279,13 @@ fn main() {
             Some(shared) => Vm::new(&engine).eval_with_callbacks(&mut Scope::new(), shared),
             None => Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program),
         };
+
+        // Ahead of the correctness run, not just the timed leg. A warm cell
+        // that this case's first VM run already opened and aborted a trace on
+        // does not open a second one, so a window that starts after that run
+        // reports zero traces for a case that traced.
+        #[cfg(feature = "grain-jit")]
+        jit_state::reset_stats();
 
         // Same result, or the comparison is meaningless.
         let expected = engine
@@ -272,6 +312,34 @@ fn main() {
                 let _ = run_vm().unwrap();
             }
         });
+        #[cfg(feature = "grain-jit")]
+        {
+            let jit = jit_state::stats();
+            jit_rows.push(format!(
+                "[jit] {}: consulted={} skipped={} interpret={} already={} traces={} \
+                 aborted={} compiled={} ops={} max_ops={} entries={} refused={} \
+                 reentrant={} non_owner={} reasons={}",
+                case.name,
+                jit.merge_points_consulted,
+                jit.forward_steps_skipped,
+                jit.entry_door_interpret,
+                jit.entry_door_already_tracing,
+                jit.traces_started,
+                jit.traces_aborted,
+                jit.loops_compiled,
+                jit.ops_recorded,
+                jit.max_trace_ops,
+                jit.compiled_entries,
+                jit.compiled_entries_refused,
+                jit.reentrant_consultations_declined,
+                jit.non_owner_consultations_declined,
+                if jit.abort_reasons.is_empty() {
+                    "-"
+                } else {
+                    jit.abort_reasons.as_str()
+                },
+            ));
+        }
 
         let slow_ast = slow_engine.compile(case.source).expect("must compile");
         let walker_slow = time(|| {
@@ -307,6 +375,16 @@ fn main() {
             ));
         }
     }
+
+    #[cfg(feature = "grain-jit")]
+    for row in &jit_rows {
+        println!("{row}");
+    }
+    // Whole-process and cumulative, so it sits under the per-case rows rather
+    // than beside them. It is the only account of *why* a case that consulted
+    // the door millions of times started no trace.
+    #[cfg(feature = "grain-jit")]
+    println!("[jit] mc_diag: {}", jit_state::majit_diag_summary());
 
     println!("\nload average after:  {}", load_average());
 
