@@ -67,37 +67,34 @@ BIN = "release/examples/grain_bench"
 
 # The most the JIT build may cost, per case, as a multiple of the plain build.
 #
-# Today every one of these is a tax and none is a speedup: the tracer opens a
-# trace, records five portal ops, refuses an unbound symbolic residual and
-# aborts, and after `MAX_TRACE_ABORT_COUNT` aborts the green key is banned for
-# good -- after which every back edge still walks majit's warm-up door, which
-# builds a meta, a descriptor and a live-value vector before the ban is
-# consulted. The measured cost is ~12ns per back edge, so a case's tax tracks
-# how many back edges it runs per unit of work and nothing else. `native
-# callbacks` is lowest because most of its time is spent outside the loop
-# entirely; `tight integer loop` is highest because almost none of it is.
+# Still a tax and still no speedup: the tracer opens a trace, records five
+# portal ops, refuses an unbound symbolic residual and aborts, and after
+# `MAX_TRACE_ABORT_COUNT` aborts the green key is banned. What the door costs
+# now is the counter decision and nothing else -- majit stopped building a
+# state meta, a driver descriptor and a live-value vector ahead of it -- so a
+# case's tax tracks how many back edges it runs per unit of work.
 #
-# Taken from the run that measured this tree, rounded up by roughly 15% -- the
-# same margin `grain_bench` puts under its own floors. `primes` gets more
-# because its samples never settle: it allocates a million-element array once
-# per run and its spread has been 44%, 65% and 71% on three consecutive runs
-# while every other case stayed under 10%.
+# Taken from the run that measured this tree, rounded up by about 20%. A
+# sample inflated further than that by a loaded machine is also spread further
+# than `SPREAD_LIMIT`, so it is refused rather than read as a breach. `switch,
+# 4 arms` carries its twin's ceiling: its own sample was the one contaminated
+# in that run, and the two cases differ only in arm count.
 #
-# These are ceilings on a cost, not floors under a benefit. When the door stops
-# allocating, the whole column should collapse toward 1.00 and these come down
-# in the commit that earns it. Lowering one otherwise, or raising one to make a
-# run pass, defeats the point of having them.
+# These are ceilings on a cost, not floors under a benefit. They came down
+# once already, in the commit that earned it, and should come down again when
+# the trace stops dying at `__len`. Lowering one otherwise, or raising one to
+# make a run pass, defeats the point of having them.
 CEILINGS = {
-    "tight integer loop": 4.15,
-    "float arithmetic": 2.10,
-    "script fn calls": 2.85,
-    "recursive fibonacci": 3.10,
-    "switch, 4 arms": 3.45,
-    "switch, 16 arms": 3.10,
-    "branch heavy": 3.40,
-    "native function calls": 2.00,
-    "native callbacks": 1.90,
-    "primes": 3.00,
+    "tight integer loop": 2.25,
+    "float arithmetic": 1.55,
+    "script fn calls": 1.65,
+    "recursive fibonacci": 1.70,
+    "switch, 4 arms": 2.20,
+    "switch, 16 arms": 2.20,
+    "branch heavy": 1.95,
+    "native function calls": 1.55,
+    "native callbacks": 1.45,
+    "primes": 1.80,
 }
 
 # Above this, the sample the number came from was contaminated enough that the
