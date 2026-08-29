@@ -350,10 +350,12 @@ fn main() {
             }
         });
 
-        // The spread reported is the VM's, because that is the number the
-        // floor is about. A walker sample knocked sideways shows up in the
-        // speedup anyway.
+        // `speedup` is a ratio, so its contamination is whichever of its two
+        // legs was dirtier -- reporting only the VM's hid a walker leg that
+        // ran under load, and a walker knocked sideways is indistinguishable
+        // from a VM that got slower once the number reaches a `tax` column.
         let speedup = walker.secs() / vm.secs();
+        let spread = walker.spread().max(vm.spread());
         println!(
             "{:<22} {:>9.1}ms {:>9.1}ms {:>8.2}x {:>6.2}x {:>7.0}% {:>9.1}ms {:>10}",
             case.name,
@@ -361,17 +363,17 @@ fn main() {
             vm.secs() * 1000.0,
             speedup,
             case.floor,
-            vm.spread() * 100.0,
+            spread * 100.0,
             walker_slow.secs() * 1000.0,
             program.residual_nodes(),
         );
 
         if speedup < case.floor {
             below_floor.push(format!(
-                "\n  {}: {speedup:.2}x, floor {:.2}x (VM samples spread {:.0}%)",
+                "\n  {}: {speedup:.2}x, floor {:.2}x (worst leg spread {:.0}%)",
                 case.name,
                 case.floor,
-                vm.spread() * 100.0,
+                spread * 100.0,
             ));
         }
     }
