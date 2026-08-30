@@ -122,6 +122,10 @@ impl Compiler {
         #[cfg(feature = "no_function")]
         let (functions, skipped): (Vec<LoweredFn>, usize) = (Vec::new(), 0);
 
+        // After the functions, because they share one instruction list and a
+        // chain of jumps can cross out of a function body into it.
+        lowering.thread_jumps();
+
         // Assembly can fail the same way the slot model can, for a script with
         // more distinct names or constants than a `u16` operand can index — so
         // it takes the same exit. The fallback is a single instruction and
@@ -2493,6 +2497,72 @@ impl Lowering {
         }
     }
 
+    /// Point every jump past the jumps it lands on.
+    ///
+    /// An `if` or `switch` arm ends by jumping to where the arms converge, and
+    /// when the statement is the last thing in a loop body that convergence
+    /// point *is* the back edge -- so the arm dispatches `Jump` twice in a row
+    /// to reach the loop header. One of the two does nothing but arrive.
+    ///
+    /// Run after everything is emitted, so it sees whole chains and does not
+    /// have to keep [`Lowering::patched_max`] honest.
+    fn thread_jumps(&mut self) {
+        for site in 0..self.code.len() {
+            // Not a handler: its target is where a throw lands, so what was
+            // dispatched before it is whatever raised, and the reasoning in
+            // [`Lowering::threaded_target`] has no predecessor to stand on.
+            if matches!(self.code[site], Op::PushHandler { .. }) {
+                continue;
+            }
+            let Some(target) = jump_target_mut(&mut self.code[site]).map(|target| *target) else {
+                continue;
+            };
+            let Some(threaded) = self.threaded_target(site, target) else {
+                continue;
+            };
+            if let Some(slot) = jump_target_mut(&mut self.code[site]) {
+                *slot = threaded;
+            }
+        }
+    }
+
+    /// Where a jump at `site` to `target` really arrives, or `None` when
+    /// sending it straight there would change what the JIT driver sees.
+    ///
+    /// The grain driver has no `can_enter_jit`. It recognises a back edge
+    /// instead, by the program counter failing to advance from the last
+    /// instruction dispatched (`vm/jit.rs`), so a chain of jumps opens its
+    /// door once for every hop that arrives at or below where it came from.
+    /// Removing hops is only sound while that count is unchanged: threading
+    /// `100 -> 50 -> 200` would turn one opening into none.
+    ///
+    /// For the shape this exists for -- a forward jump to a convergence point
+    /// that jumps back to a loop header -- the count is one either way, and
+    /// the opening lands on the same instruction.
+    fn threaded_target(&self, site: usize, target: u32) -> Option<u32> {
+        let mut arrivals = 0;
+        let mut from = site as u32;
+        let mut at = target;
+
+        // Bounded by the instruction count: `loop {}` lowers to a jump to
+        // itself, and a chain of them can be a cycle.
+        for _ in 0..self.code.len() {
+            if at <= from {
+                arrivals += 1;
+            }
+            match self.code.get(at as usize) {
+                Some(Op::Jump(next)) if *next != at => {
+                    from = at;
+                    at = *next;
+                }
+                _ => break,
+            }
+        }
+
+        let direct = u32::from(at <= site as u32);
+        (at != target && arrivals == direct).then_some(at)
+    }
+
     /// Where the instruction list currently ends, for [`Lowering::rewind`].
     fn mark(&self) -> usize {
         self.code.len()
@@ -3074,8 +3144,10 @@ mod tests {
             // A back edge is a `Jump` to an address at or below its own. The
             // highest address any of them names is the innermost loop's
             // header, and the body that runs every iteration reaches from
-            // there to the *last* back edge naming it -- a `continue` is a
-            // second one, so taking the first cuts the body off at it.
+            // there to the last back edge naming it. A loop has several: a
+            // `continue` is one, and `Lowering::thread_jumps` turns each arm's
+            // jump into another, so taking the first cuts the body off at the
+            // first arm.
             let edges: Vec<(usize, usize)> = decoded
                 .iter()
                 .filter_map(|(at, op)| match op {
