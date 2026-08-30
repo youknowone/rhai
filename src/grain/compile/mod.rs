@@ -339,6 +339,19 @@ struct Lowering {
     defeated: bool,
 }
 
+/// What the code around a statement wants of the value that statement has.
+///
+/// Rhai gives every statement a value, but only the last one in a block is
+/// ever read. Telling the lowering which position it is in is what lets the
+/// value of the rest never be pushed, rather than be pushed and popped again.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Wants {
+    /// Leave it on the operand stack.
+    Value,
+    /// Leave nothing behind.
+    Effect,
+}
+
 impl Lowering {
     /// Lower a statement list as a whole chunk. Returns false if something
     /// defeated the slot model and the caller should fall back.
@@ -1035,6 +1048,12 @@ impl Lowering {
     /// node as well, so such a statement stops twice at the same place. Driving
     /// the residual count to zero is what removes that.
     fn statement(&mut self, stmt: &Stmt) -> bool {
+        self.statement_wanting(stmt, Wants::Value)
+    }
+
+    /// The lowering [`Lowering::statement`] and
+    /// [`Lowering::statement_discarding`] both are.
+    fn statement_wanting(&mut self, stmt: &Stmt, wants: Wants) -> bool {
         #[cfg(feature = "debugging")]
         let enclosing = {
             let depth = self.stmt_depth;
@@ -1046,7 +1065,19 @@ impl Lowering {
             depth
         };
 
-        let lowered = self.lower_statement(stmt);
+        // A statement whose value comes out of a block can take the discard
+        // into that block, so nothing is pushed for the pop below to take off
+        // again. The rest leave their value here.
+        let lowered = match self.lower_statement_for_effect(stmt, wants) {
+            Some(lowered) => lowered,
+            None => {
+                let lowered = self.lower_statement(stmt);
+                if lowered && wants == Wants::Effect {
+                    self.discard_value();
+                }
+                lowered
+            }
+        };
 
         #[cfg(feature = "debugging")]
         {
@@ -1054,6 +1085,54 @@ impl Lowering {
         }
 
         lowered
+    }
+
+    /// Lower a statement in a position where its value is thrown away, when
+    /// it is one that produces that value by lowering a block — so the
+    /// discard reaches the blocks themselves and none of them pushes.
+    ///
+    /// `None` for every other statement, and for every statement in value
+    /// position: the caller takes the value off instead.
+    fn lower_statement_for_effect(&mut self, stmt: &Stmt, wants: Wants) -> Option<bool> {
+        if wants == Wants::Value {
+            return None;
+        }
+        match stmt {
+            Stmt::Block(block) => Some(self.block_wanting(block.statements(), Wants::Effect)),
+            Stmt::If(payload, ..) => Some(self.if_statement(payload, Wants::Effect)),
+            _ => None,
+        }
+    }
+
+    /// Lower `if c { .. } else { .. }`, leaving one value behind or — in
+    /// statement position — nothing.
+    ///
+    /// With nothing wanted and no `else` written there is no unit to stand in
+    /// for the branch not taken, and so nothing for the branch that is taken
+    /// to jump over: the false edge lands where the true one does.
+    fn if_statement(&mut self, flow: &FlowControl, wants: Wants) -> bool {
+        let FlowControl { expr, body, branch } = flow;
+
+        self.expression(expr);
+        let to_else = self.emit_jump_if_false(expr.position());
+
+        if !self.block_wanting(body.statements(), wants) {
+            return false;
+        }
+
+        if wants == Wants::Effect && branch.statements().is_empty() {
+            self.patch_here(to_else);
+            return true;
+        }
+
+        let past_else = self.emit_jump();
+
+        self.patch_here(to_else);
+        if !self.block_wanting(branch.statements(), wants) {
+            return false;
+        }
+        self.patch_here(past_else);
+        true
     }
 
     /// The lowering itself, one arm per kind of statement.
@@ -1241,7 +1320,7 @@ impl Lowering {
                 true
             }
 
-            Stmt::Block(block) => self.block(block.statements()),
+            Stmt::Block(block) => self.block_wanting(block.statements(), Wants::Value),
 
             // `try { .. } catch (e) { .. }`.
             //
@@ -1398,24 +1477,7 @@ impl Lowering {
                 self.switch(subject, cases)
             }
 
-            Stmt::If(payload, ..) => {
-                let FlowControl { expr, body, branch } = &**payload;
-
-                self.expression(expr);
-                let to_else = self.emit_jump_if_false(expr.position());
-
-                if !self.block(body.statements()) {
-                    return false;
-                }
-                let past_else = self.emit_jump();
-
-                self.patch_here(to_else);
-                if !self.block(branch.statements()) {
-                    return false;
-                }
-                self.patch_here(past_else);
-                true
-            }
+            Stmt::If(payload, ..) => self.if_statement(payload, Wants::Value),
 
             // `loop` and `while true` are the same node: Rhai marks an
             // unconditional loop with a unit or `true` guard
@@ -2309,10 +2371,23 @@ impl Lowering {
     /// Lower a block, leaving its value — the last statement's, or unit if
     /// empty — on the stack, and dropping anything it declared.
     fn block(&mut self, statements: &[Stmt]) -> bool {
+        self.block_wanting(statements, Wants::Value)
+    }
+
+    /// The lowering [`Lowering::block`] and [`Lowering::block_discarding`]
+    /// both are, with the discard — when there is one — carried into the last
+    /// statement rather than applied to what it left.
+    ///
+    /// Carrying it in is what keeps the value from being pushed at all, and it
+    /// puts the discard in front of the [`Op::UnwindTo`] instead of behind it,
+    /// where [`Lowering::drop_trailing_unit`] can still see the unit it drops.
+    fn block_wanting(&mut self, statements: &[Stmt], wants: Wants) -> bool {
         let depth = self.slots.depth();
 
         let Some((last, leading)) = statements.split_last() else {
-            self.emit(Op::Unit);
+            if wants == Wants::Value {
+                self.emit(Op::Unit);
+            }
             return true;
         };
 
@@ -2321,7 +2396,7 @@ impl Lowering {
                 return false;
             }
         }
-        if !self.statement(last) {
+        if !self.statement_wanting(last, wants) {
             return false;
         }
 
@@ -2334,20 +2409,12 @@ impl Lowering {
     /// Loop bodies discard their value: Rhai's loops yield unit or whatever a
     /// `break` supplied, never the body's last statement.
     fn block_discarding(&mut self, statements: &[Stmt]) -> bool {
-        if !self.block(statements) {
-            return false;
-        }
-        self.discard_value();
-        true
+        self.block_wanting(statements, Wants::Effect)
     }
 
     /// Lower a statement whose value is thrown away, leaving nothing behind.
     fn statement_discarding(&mut self, stmt: &Stmt) -> bool {
-        if !self.statement(stmt) {
-            return false;
-        }
-        self.discard_value();
-        true
+        self.statement_wanting(stmt, Wants::Effect)
     }
 
     /// Take the value on top of the operand stack off again — by not putting
@@ -2892,6 +2959,137 @@ mod tests {
             [("alpha", 1), ("alpha", 2), ("mike", 0), ("zulu", 1)],
             "functions must be lowered by name and arity, not by hash",
         );
+    }
+
+    /// What each benchmark source actually compiles to.
+    ///
+    /// `residual_count` falling is this module's stated progress metric, and a
+    /// program with any residual makes `run_frame` set `always_search_scope`.
+    /// The op histogram is the other half: these programs are a loop and little
+    /// else, so the ops below are very nearly the ops executed per iteration,
+    /// and both numbers are deterministic — they can be read on a busy machine
+    /// where a timing cannot.
+    #[test]
+    fn benchmark_sources_shape_census() {
+        // The `grain_bench` cases, verbatim, and the op count each one's
+        // hot body lowers to. A ceiling rather than an equality: lowering a
+        // body to fewer instructions is the point, and only raising one of
+        // these numbers should have to be argued for.
+        const SOURCES: &[(&str, usize, &str)] = &[
+            ("tight integer loop", 7, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
+            ("float arithmetic", 12, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
+            ("script fn calls", 6, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
+            ("recursive fibonacci", 14, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
+            (
+                "switch, 4 arms",
+                21,
+                "let s = 0; for i in 0..20000 { \
+                 switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } \
+                 } s",
+            ),
+            (
+                "switch, 16 arms",
+                69,
+                "let s = 0; for i in 0..20000 { \
+                 switch i % 16 { \
+                 0 => s += 1, 1 => s += 2, 2 => s += 3, 3 => s += 4, \
+                 4 => s += 5, 5 => s += 6, 6 => s += 7, 7 => s += 8, \
+                 8 => s += 9, 9 => s += 10, 10 => s += 11, 11 => s += 12, \
+                 12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
+                 } s",
+            ),
+            ("branch heavy", 19, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
+            ("native function calls", 8, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
+            (
+                "native callbacks",
+                6,
+                "let a = []; for i in 0..500 { a.push(i); } \
+                 let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
+            ),
+            (
+                "primes",
+                7,
+                r#"
+            const SIZE = 1_000_000;
+
+            let prime_mask = [];
+            prime_mask.pad(SIZE + 1, true);
+
+            prime_mask[0] = false;
+            prime_mask[1] = false;
+
+            let total_primes_found = 0;
+
+            for p in 2..=SIZE {
+                if !prime_mask[p] { continue; }
+
+                total_primes_found += 1;
+
+                for i in range(2 * p, SIZE + 1, p) {
+                    prime_mask[i] = false;
+                }
+            }
+
+            total_primes_found
+        "#,
+            ),
+        ];
+
+        let engine = crate::Engine::new();
+        for (name, ceiling, source) in SOURCES {
+            let ast = engine.compile(source).expect("must compile");
+            let program = Compiler::new().compile(&ast);
+            program
+                .verify()
+                .unwrap_or_else(|err| panic!("{name} does not verify: {err:?}"));
+            let decoded: Vec<_> =
+                crate::grain::bytecode::code::disassemble(program.code()).collect();
+            // A back edge is a `Jump` to an address at or below its own, so the
+            // innermost one brackets the body that runs every iteration. That
+            // range, not the whole chunk, is what a per-iteration cost is.
+            let body = decoded
+                .iter()
+                .filter_map(|(at, op)| match op {
+                    Op::Jump(target) if (*target as usize) <= *at => Some((*target as usize, *at)),
+                    _ => None,
+                })
+                .max_by_key(|(from, to)| (*from, std::cmp::Reverse(*to)));
+            let mut histogram: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            let mut total = 0;
+            for (at, op) in &decoded {
+                if let Some((from, to)) = body {
+                    if *at < from || *at > to {
+                        continue;
+                    }
+                }
+                let rendered = format!("{op:?}");
+                let head = rendered
+                    .split(|c: char| c == '(' || c == ' ' || c == '{')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string();
+                *histogram.entry(head).or_default() += 1;
+                total += 1;
+            }
+            let mut ranked: Vec<_> = histogram.into_iter().collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            let top: Vec<String> = ranked
+                .iter()
+                .take(8)
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect();
+            println!(
+                "[shape] {name}: residuals={} body_ops={total} whole={} | {}",
+                program.residual_count(),
+                decoded.len(),
+                top.join(" "),
+            );
+            assert!(
+                total <= *ceiling,
+                "{name} lowers its body to {total} instructions, up from {ceiling}"
+            );
+        }
     }
 
     #[test]
