@@ -611,7 +611,7 @@ impl Lowering {
     /// continues with ranges before the default (`eval/stmt.rs:546-571`).
     /// Nearly every arm anyone writes has no guard, and those cost no chain at
     /// all.
-    fn switch(&mut self, subject: &Expr, sw: &SwitchCasesCollection) -> bool {
+    fn switch(&mut self, subject: &Expr, sw: &SwitchCasesCollection, wants: Wants) -> bool {
         if self.slots.is_full() {
             return false;
         }
@@ -747,7 +747,7 @@ impl Lowering {
             body_at.push((block, self.here()));
             // An arm body is an ordinary expression, and a block one goes
             // through the same path as `let y = { .. }`.
-            self.expression(&sw.expressions[block].rhs);
+            self.expression_wanting(&sw.expressions[block].rhs, wants);
             if self.defeated {
                 self.unwind_to(unwind_depth);
                 return false;
@@ -774,7 +774,9 @@ impl Lowering {
             Some(block) => at(block),
             None => {
                 let target = self.here();
-                self.emit(Op::Unit);
+                if wants == Wants::Value {
+                    self.emit(Op::Unit);
+                }
                 target
             }
         };
@@ -1087,6 +1089,27 @@ impl Lowering {
         lowered
     }
 
+    /// Lower an expression, leaving its value behind or — when nothing reads
+    /// it — nothing.
+    ///
+    /// A block expression is where a `switch` arm's statements live, and it
+    /// produces its value the way a block statement does, so the discard goes
+    /// into the block rather than after it. Everything else pushes and is
+    /// popped.
+    fn expression_wanting(&mut self, expr: &Expr, wants: Wants) {
+        if let (Wants::Effect, Expr::Stmt(block)) = (wants, expr) {
+            if !self.block_wanting(block.statements(), Wants::Effect) {
+                self.defeated = true;
+            }
+            return;
+        }
+
+        self.expression(expr);
+        if wants == Wants::Effect {
+            self.discard_value();
+        }
+    }
+
     /// Lower a statement in a position where its value is thrown away, when
     /// it is one that produces that value by lowering a block — so the
     /// discard reaches the blocks themselves and none of them pushes.
@@ -1100,6 +1123,10 @@ impl Lowering {
         match stmt {
             Stmt::Block(block) => Some(self.block_wanting(block.statements(), Wants::Effect)),
             Stmt::If(payload, ..) => Some(self.if_statement(payload, Wants::Effect)),
+            Stmt::Switch(payload, ..) => {
+                let (subject, cases) = &**payload;
+                Some(self.switch(subject, cases, Wants::Effect))
+            }
             _ => None,
         }
     }
@@ -1474,7 +1501,7 @@ impl Lowering {
 
             Stmt::Switch(payload, ..) => {
                 let (subject, cases) = &**payload;
-                self.switch(subject, cases)
+                self.switch(subject, cases, Wants::Value)
             }
 
             Stmt::If(payload, ..) => self.if_statement(payload, Wants::Value),
@@ -2982,14 +3009,14 @@ mod tests {
             ("recursive fibonacci", 14, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
                 "switch, 4 arms",
-                21,
+                16,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } \
                  } s",
             ),
             (
                 "switch, 16 arms",
-                69,
+                52,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 16 { \
                  0 => s += 1, 1 => s += 2, 2 => s += 3, 3 => s += 4, \
