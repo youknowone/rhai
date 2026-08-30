@@ -496,6 +496,28 @@ pub const CASES: &[Case] = &[
     case("unary_neg_expr", "let i = 7; let j = 2; -(i * j)"),
     // --- control flow -----------------------------------------------------
     case("if_else", "let a = 5; if a > 3 { \"big\" } else { \"small\" }"),
+    // A statement-position `if` is lowered for effect, so neither arm pushes
+    // the value the statement after it would have popped. What the walker
+    // says these are is what says that was only ever a pop of a unit: the
+    // ones ending in an expression still discard a real value, and the ones
+    // that leave the block early never reach the join at all.
+    case("if_stmt_no_else", "let s = 0; if s == 0 { s = 1; } s"),
+    case("if_stmt_no_else_untaken", "let s = 9; if s == 0 { s = 1; } s"),
+    case("if_stmt_chain", "let s = 0; let i = 7; if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } s"),
+    case("if_stmt_arm_is_expression", "let s = 0; if s == 0 { 42 } else { 7 }; s"),
+    case("if_stmt_arm_returns", "fn f(n) { if n > 0 { return n * 2; } n - 1 } f(3) + f(-3)"),
+    case("if_stmt_arm_breaks", "let s = 0; for i in 0..10 { if i > 4 { break; } s += i; } s"),
+    case("if_stmt_declares", "let s = 0; if s == 0 { let t = 5; s = t; } s"),
+    case("if_stmt_nested", "let s = 0; for i in 0..6 { if i % 2 == 0 { if i > 2 { s += 10; } } else { s += 1; } } s"),
+    case("if_value_position_kept", "let a = 5; let b = if a > 3 { 1 } else { 2 }; b"),
+    case("bare_block_stmt", "let s = 0; { let t = 3; s = t; } s"),
+    // A statement-position `switch` is lowered the same way, arm bodies
+    // included, and the unit standing in for an absent `_` is not emitted.
+    case("switch_stmt_all_arms", "let s = 0; for i in 0..8 { switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } } s"),
+    case("switch_stmt_no_default", "let s = 0; for i in 0..8 { switch i % 4 { 0 => s += 1, 1 => s += 2 } } s"),
+    case("switch_stmt_range_arm", "let s = 0; for i in 0..8 { switch i { 3 => s += 2, 0..=2 => s += 1, _ => s += 3 } } s"),
+    case("switch_stmt_guarded", "let s = 0; for i in 0..8 { switch i % 4 { 0 if i > 3 => s += 1, 0 => s += 2, _ => s += 3 } } s"),
+    case("switch_value_position_kept", "let i = 2; let s = switch i { 0 => \"a\", 2 => \"c\", _ => \"z\" }; s"),
     case("while_loop", "let i = 0; let s = 0; while i < 5 { s += i; i += 1; } s"),
     case("do_while", "let i = 0; do { i += 1; } while i < 3; i"),
     case("do_until", "let i = 0; do { i += 1; } until i >= 3; i"),
