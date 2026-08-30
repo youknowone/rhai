@@ -3071,16 +3071,31 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name} does not verify: {err:?}"));
             let decoded: Vec<_> =
                 crate::grain::bytecode::code::disassemble(program.code()).collect();
-            // A back edge is a `Jump` to an address at or below its own, so the
-            // innermost one brackets the body that runs every iteration. That
-            // range, not the whole chunk, is what a per-iteration cost is.
-            let body = decoded
+            // A back edge is a `Jump` to an address at or below its own. The
+            // highest address any of them names is the innermost loop's
+            // header, and the body that runs every iteration reaches from
+            // there to the *last* back edge naming it -- a `continue` is a
+            // second one, so taking the first cuts the body off at it.
+            let edges: Vec<(usize, usize)> = decoded
                 .iter()
                 .filter_map(|(at, op)| match op {
                     Op::Jump(target) if (*target as usize) <= *at => Some((*target as usize, *at)),
                     _ => None,
                 })
-                .max_by_key(|(from, to)| (*from, std::cmp::Reverse(*to)));
+                .collect();
+            let body = edges
+                .iter()
+                .map(|(header, ..)| *header)
+                .max()
+                .map(|header| {
+                    let last = edges
+                        .iter()
+                        .filter(|(naming, ..)| *naming == header)
+                        .map(|(.., at)| *at)
+                        .max()
+                        .expect("the header came from one of these");
+                    (header, last)
+                });
             let mut histogram: std::collections::BTreeMap<String, usize> =
                 std::collections::BTreeMap::new();
             let mut total = 0;
@@ -3106,8 +3121,15 @@ mod tests {
                 .take(8)
                 .map(|(k, v)| format!("{k}={v}"))
                 .collect();
+            // How much pushing-to-pop is left anywhere in the chunk, hot or
+            // not: `Unit` and `Pop` are what a statement whose value nothing
+            // reads costs when the discard could not be carried into it.
+            let discards = decoded
+                .iter()
+                .filter(|(.., op)| matches!(op, Op::Unit | Op::Pop))
+                .count();
             println!(
-                "[shape] {name}: residuals={} body_ops={total} whole={} | {}",
+                "[shape] {name}: residuals={} body_ops={total} whole={} discards={discards} | {}",
                 program.residual_count(),
                 decoded.len(),
                 top.join(" "),
