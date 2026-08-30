@@ -90,7 +90,13 @@ fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
     assert_eq!(info.identity_ref_bank_index, Some(0));
     assert_eq!(
         info.static_fields.iter().map(|field| (field.name.as_str(), field.field_type)).collect::<Vec<_>>(),
-        [("scope", majit_ir::Type::Ref), ("base", majit_ir::Type::Int), ("reached", majit_ir::Type::Int), ("stack_base", majit_ir::Type::Int),],
+        [
+            ("scope", majit_ir::Type::Ref),
+            ("base", majit_ir::Type::Int),
+            ("reached", majit_ir::Type::Int),
+            ("stack_base", majit_ir::Type::Int),
+            ("jit_resume_pc_plus_one", majit_ir::Type::Int),
+        ],
     );
 }
 
@@ -186,13 +192,6 @@ fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
     }
 
     jit_state::reset_stats();
-    if std::env::var_os("RHAI_GRAIN_JIT_TRACE").is_some() {
-        for jitcode in jitcodes::all() {
-            if matches!(jitcode.name(), "store_builtin" | "apply_assign" | "int_assign") {
-                eprintln!("[grain-jitcode-dump] {}\n{}", jitcode.name(), jitcode.dump());
-            }
-        }
-    }
     let engine = Engine::new();
     let ast = engine
         .compile(
@@ -218,8 +217,8 @@ fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
     assert_eq!(stats.loops_compiled, 0, "the unbound residual boundary is reached before loop compilation: {stats:?}",);
     assert_eq!(stats.traces_aborted, stats.traces_started, "every trace attempt must end at the observed abort boundary: {stats:?}",);
     assert_eq!(stats.symbolic_residual_aborts, stats.traces_started, "the abort reason must be the actively refused symbolic residual: {stats:?}",);
-    assert_eq!(stats.max_trace_ops, 1, "tracing starts at the merge point instead of replaying run_frame's max_stack/reserve_stack prologue: {stats:?}",);
-    assert_eq!(stats.ops_recorded, stats.max_trace_ops * stats.traces_started, "each attempt records the same one-op prefix before Cow.deref: {stats:?}",);
+    assert_eq!(stats.max_trace_ops, 236, "the trace must pass comparison/value construction and both assignment setup paths before the next unbound residual: {stats:?}",);
+    assert_eq!(stats.ops_recorded, stats.max_trace_ops * stats.traces_started, "each attempt records the same prefix through the first built-in assignment: {stats:?}",);
     assert_eq!(stats.compiled_entries, 0, "the immediately-before-backend-entry hook must remain unreachable: {stats:?}",);
     assert_eq!(stats.non_owner_consultations_declined, 0, "the observation run must own its driver: {stats:?}",);
     assert_eq!(stats.reentrant_consultations_declined, 0, "the observation run must not hide nested consultations: {stats:?}",);

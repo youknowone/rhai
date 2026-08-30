@@ -293,6 +293,11 @@ impl JitState for GrainJitState {
             Type::Int,
             core::mem::offset_of!(GrainFrame<'static, 'static>, stack_base),
         );
+        info.add_field(
+            "jit_resume_pc_plus_one",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, jit_resume_pc_plus_one),
+        );
         Some(
             info.finalize_arc(majit_ir::descr::make_size_descr(core::mem::size_of::<
                 GrainFrame<'static, 'static>,

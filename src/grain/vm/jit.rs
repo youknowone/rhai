@@ -24,14 +24,14 @@ use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{GreenKey, GreenType};
-use majit_metainterp::{JitDriver, TraceAction};
+use majit_metainterp::{JitDriver, JitState, TraceAction};
 
 use super::{jit_state, jitcodes};
 use super::{GrainFrame, Vm};
 use crate::grain::bytecode::AssignOp;
 use crate::grain::Program;
 use crate::types::dynamic::Union;
-use crate::{Dynamic, Position, RhaiResultOf, Scope};
+use crate::{Dynamic, Position, Scope};
 
 /// Write the scalar payload of an existing integer `Dynamic`.
 ///
@@ -164,11 +164,12 @@ pub(super) extern "C" fn fast_operators(vm: &Vm<'_>) -> i64 {
 }
 
 #[inline]
-pub(super) fn track_operation(vm: &mut Vm<'_>, position: Position) -> RhaiResultOf<()> {
-    match track_operation_abi(vm, position_bits(position)) {
-        None => Ok(()),
-        Some(error) => Err(error),
-    }
+pub(super) fn track_operation_error(
+    vm: &mut Vm<'_>,
+    program: &Program<'_>,
+    at: usize,
+) -> Option<Box<crate::EvalAltResult>> {
+    track_operation_abi(vm, code_position_bits(program, at))
 }
 
 /// Read the length of the frame-local array without exposing `ThinVec`'s
@@ -519,6 +520,7 @@ impl GrainJitDriver {
 
         let mut report_event = None;
         let mut restored = Vec::new();
+        let mut resume_pc = None;
         RUNTIME.with(|cell| {
             let Ok(mut slot) = cell.try_borrow_mut() else {
                 bump_stats(|stats| stats.reentrant_consultations_declined += 1);
@@ -684,6 +686,46 @@ impl GrainJitDriver {
                 });
             }
 
+            // The jitcode walk above is the concrete execution of the traced
+            // portal interval.  RPython returns from it through
+            // `raise_continue_running_normally`; take majit's equivalent
+            // single-pass handoff so `run_frame` resumes at the closing merge
+            // point instead of replaying those side effects natively.
+            let mut outcome = runtime.driver.take_single_pass_outcome();
+            // `pyjitpl.py run_blackhole_interp_to_cancel_tracing`: an abort
+            // can stop in the middle of one source opcode. Finish that opcode
+            // and the rest of the portal interval in the blackhole, then use
+            // the next merge point it reports. This must outrank the walk's
+            // source-PC snapshot or the native loop replays the committed
+            // prefix and applies its heap effects twice.
+            if let Some(pc) = runtime
+                .driver
+                .run_pending_abort_blackhole(&mut runtime.state, &env)
+            {
+                outcome = Some((pc, Vec::new()));
+            }
+            if let Some((pc, reds)) = outcome {
+                runtime
+                    .driver
+                    .writeback_scalar_state_fields(&mut runtime.state);
+                runtime
+                    .driver
+                    .writeback_ref_scalar_state_fields(&mut runtime.state);
+                runtime
+                    .driver
+                    .writeback_virt_array_state_fields(&mut runtime.state);
+                debug_assert!(
+                    reds.is_empty(),
+                    "Grain's red operands are live frame/VM references, not a scalar state bank",
+                );
+                runtime.state.recover_after_compiled_run();
+                runtime
+                    .driver
+                    .arm_single_pass_label_entry_on_next_back_edge(&runtime.state);
+                runtime.driver.discard_single_pass_resume();
+                resume_pc = Some(pc);
+            }
+
             // The mirror the gate above reads. Set from the driver here, the
             // one place tracing can have started or stopped.
             let tracing = runtime.driver.is_tracing();
@@ -702,6 +744,9 @@ impl GrainJitDriver {
 
         if !restored.is_empty() {
             frame.restore_from_jit(&restored, vm);
+        }
+        if let Some(pc) = resume_pc {
+            frame.jit_resume_pc_plus_one = pc + 1;
         }
 
         if let Some(event) = report_event {

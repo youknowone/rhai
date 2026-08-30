@@ -21,7 +21,7 @@
 //! [`get_builtin_op_assignment_fn`]: crate::func::get_builtin_op_assignment_fn
 
 use crate::grain::bytecode::BinOpKind;
-use crate::types::dynamic::Union;
+use crate::types::dynamic::{AccessMode, Union};
 use crate::{Dynamic, RhaiResultOf, INT};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
@@ -41,7 +41,7 @@ use crate::FLOAT;
 ///
 /// [`get_builtin_binary_op_fn`]: crate::func::get_builtin_binary_op_fn
 #[inline]
-fn int_arithmetic(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<INT>> {
+fn int_arithmetic(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<INT>> {
     use BinOpKind::{
         Add, And, Divide, Modulo, Multiply, Or, Power, ShiftLeft, ShiftRight, Subtract, Xor,
     };
@@ -51,24 +51,24 @@ fn int_arithmetic(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<INT>> 
     use crate::packages::arithmetic::arith_basic::INT::functions::*;
 
     #[cfg(not(feature = "unchecked"))]
-    return Some(match kind {
-        Add => add(x, y),
-        Subtract => subtract(x, y),
-        Multiply => multiply(x, y),
-        Divide => divide(x, y),
-        Modulo => modulo(x, y),
-        Power => power(x, y),
-        ShiftRight => Ok(shift_right(x, y)),
-        ShiftLeft => Ok(shift_left(x, y)),
-        And => Ok(binary_and(x, y)),
-        Or => Ok(binary_or(x, y)),
-        Xor => Ok(binary_xor(x, y)),
-        _ => return None,
-    });
+    return match kind {
+        Add => add(x, y).map(Some),
+        Subtract => subtract(x, y).map(Some),
+        Multiply => multiply(x, y).map(Some),
+        Divide => divide(x, y).map(Some),
+        Modulo => modulo(x, y).map(Some),
+        Power => power(x, y).map(Some),
+        ShiftRight => Ok(Some(shift_right(x, y))),
+        ShiftLeft => Ok(Some(shift_left(x, y))),
+        And => Ok(Some(binary_and(x, y))),
+        Or => Ok(Some(binary_or(x, y))),
+        Xor => Ok(Some(binary_xor(x, y))),
+        _ => Ok(None),
+    };
 
     #[cfg(feature = "unchecked")]
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    return Some(Ok(match kind {
+    return Ok(Some(match kind {
         Add => x + y,
         Subtract => x - y,
         Multiply => x * y,
@@ -92,7 +92,7 @@ fn int_arithmetic(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<INT>> 
         And => x & y,
         Or => x | y,
         Xor => x ^ y,
-        _ => return None,
+        _ => return Ok(None),
     }));
 }
 
@@ -115,14 +115,18 @@ fn int_comparison(kind: BinOpKind, x: INT, y: INT) -> Option<bool> {
 /// `x op y` for two integers, or `None` if the arm has no entry for the
 /// operator — in which case the caller dispatches.
 #[inline]
-pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<Dynamic>> {
-    if let Some(value) = int_arithmetic(kind, x, y) {
-        return Some(value.map(Into::into));
+pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<Dynamic>> {
+    if let Some(value) = int_arithmetic(kind, x, y)? {
+        // `Dynamic::from(INT)` is exactly this variant construction. Spell it
+        // here so the generated interpreter graph keeps the concrete value
+        // construction instead of routing two distinct `From::from`
+        // monomorphizations through one leaf-named jitcode.
+        return Ok(Some(Dynamic(Union::Int(value, 0, AccessMode::ReadWrite))));
     }
-    match int_comparison(kind, x, y) {
-        Some(held) => Some(Ok(held.into())),
+    Ok(match int_comparison(kind, x, y) {
+        Some(value) => Some(Dynamic(Union::Bool(value, 0, AccessMode::ReadWrite))),
         None => None,
-    }
+    })
 }
 
 /// `x op= y` for two integers, returning the value to write back.
@@ -144,7 +148,7 @@ pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<Dynami
 ///
 /// [`get_builtin_op_assignment_fn`]: crate::func::get_builtin_op_assignment_fn
 #[inline]
-pub fn int_assign(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<INT>> {
+pub fn int_assign(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<INT>> {
     int_arithmetic(kind, x, y)
 }
 

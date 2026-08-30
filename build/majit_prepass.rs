@@ -125,17 +125,23 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
     let config = majit_translate::AnalyzeConfig {
         pipeline: majit_translate::PipelineConfig {
             transform: majit_translate::GraphTransformConfig {
-                vable_fields: ["scope", "base", "reached", "stack_base"]
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, name)| {
-                        majit_translate::VirtualizableFieldDescriptor::new(
-                            name,
-                            Some("GrainFrame".to_string()),
-                            index,
-                        )
-                    })
-                    .collect(),
+                vable_fields: [
+                    "scope",
+                    "base",
+                    "reached",
+                    "stack_base",
+                    "jit_resume_pc_plus_one",
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    majit_translate::VirtualizableFieldDescriptor::new(
+                        name,
+                        Some("GrainFrame".to_string()),
+                        index,
+                    )
+                })
+                .collect(),
                 // The merge point is a method on this VM's own driver type, so
                 // the recogniser is pointed at it. Left at its default the
                 // marker is not recognised as a marker, the portal lowers with

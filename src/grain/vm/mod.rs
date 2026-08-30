@@ -583,7 +583,7 @@ fn call_site<'m>(
 /// cover float/int and int/float but never int/int, and widening two integers
 /// would answer a question Rhai answers with integer arithmetic.
 #[inline]
-fn apply_binary(kind: BinOpKind, lhs: &Dynamic, rhs: &Dynamic) -> Option<RhaiResultOf<Dynamic>> {
+fn apply_binary(kind: BinOpKind, lhs: &Dynamic, rhs: &Dynamic) -> RhaiResultOf<Option<Dynamic>> {
     if let (Union::Int(x, ..), Union::Int(y, ..)) = (&lhs.0, &rhs.0) {
         return arith::int_binary(kind, *x, *y);
     }
@@ -593,11 +593,11 @@ fn apply_binary(kind: BinOpKind, lhs: &Dynamic, rhs: &Dynamic) -> Option<RhaiRes
         (arith::as_float_operand(lhs), arith::as_float_operand(rhs))
     {
         if x_is_float || y_is_float {
-            return arith::float_binary(kind, x, y).map(Ok);
+            return Ok(arith::float_binary(kind, x, y));
         }
     }
 
-    None
+    Ok(None)
 }
 
 /// The same for `op x`.
@@ -626,51 +626,49 @@ fn apply_unary(kind: UnOpKind, operand: &Dynamic) -> Option<Dynamic> {
 /// an integer target with a float operand has no built-in op-assignment and
 /// expands into `i = i + 1.5`, which is a different answer and Rhai's.
 #[inline]
-fn apply_assign(kind: BinOpKind, target: &mut Dynamic, rhs: &Dynamic) -> Option<RhaiResultOf<()>> {
+fn apply_assign(kind: BinOpKind, target: &mut Dynamic, rhs: &Dynamic) -> RhaiResultOf<Option<()>> {
     match (&mut target.0, &rhs.0) {
         (Union::Int(x, ..), Union::Int(y, ..)) => {
             let (x, y) = (*x, *y);
-            Some(match arith::int_assign(kind, x, y)? {
-                Ok(value) => {
+            match arith::int_assign(kind, x, y)? {
+                Some(value) => {
                     #[cfg(feature = "grain-jit")]
                     jit::dynamic_store_int(target, value);
                     #[cfg(not(feature = "grain-jit"))]
                     if let Union::Int(held, ..) = &mut target.0 {
                         *held = value;
                     }
-                    Ok(())
+                    Ok(Some(()))
                 }
-                Err(err) => Err(err),
-            })
+                None => Ok(None),
+            }
         }
         #[cfg(not(feature = "no_float"))]
         (Union::Float(x, ..), Union::Float(y, ..)) => {
             let (x, y) = (**x, **y);
-            arith::float_assign(kind, x, y).map(|value| {
+            Ok(arith::float_assign(kind, x, y).map(|value| {
                 #[cfg(feature = "grain-jit")]
                 jit::dynamic_store_float(target, value);
                 #[cfg(not(feature = "grain-jit"))]
                 if let Union::Float(held, ..) = &mut target.0 {
                     **held = value;
                 }
-                Ok(())
-            })
+            }))
         }
         #[cfg(not(feature = "no_float"))]
         #[allow(clippy::cast_precision_loss)]
         (Union::Float(x, ..), Union::Int(y, ..)) => {
             let (x, y) = (**x, *y as crate::FLOAT);
-            arith::float_assign(kind, x, y).map(|value| {
+            Ok(arith::float_assign(kind, x, y).map(|value| {
                 #[cfg(feature = "grain-jit")]
                 jit::dynamic_store_float(target, value);
                 #[cfg(not(feature = "grain-jit"))]
                 if let Union::Float(held, ..) = &mut target.0 {
                     **held = value;
                 }
-                Ok(())
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -721,6 +719,19 @@ enum RootValue<'s> {
     /// outright. Moved rather than borrowed for the same reason [`Self::This`]
     /// is — the stack is part of `self`.
     Temporary(Dynamic),
+}
+
+/// Outcome of the built-in assignment fast path.
+///
+/// Keep the handled bit separate from the nullable error pointer.  Rust's
+/// `Option<Result<(), Box<_>>>` otherwise lowers a successful `?` through a
+/// transient `ControlFlow<Result<..>>` shell; RPython's exception-edge graph
+/// has no corresponding object.  This spelling carries the same three states
+/// while leaving success on ordinary control flow and failure as one nullable
+/// exception pointer.
+struct StoreBuiltinOutcome {
+    handled: bool,
+    error: Option<Box<EvalAltResult>>,
 }
 
 impl RootValue<'_> {
@@ -1052,6 +1063,16 @@ pub(super) struct GrainFrame<'a, 'scope> {
     base: usize,
     reached: usize,
     stack_base: usize,
+    /// Source-PC handoff from the synchronous meta-interpreter walk.
+    ///
+    /// RPython's `raise_continue_running_normally` unwinds out of the tracing
+    /// portal after the walk has already performed its concrete effects. Rust
+    /// cannot raise across this marker call, so the live red frame carries the
+    /// equivalent one-shot coordinate back to the dispatch loop. Zero means
+    /// that this merge point only observed the native iteration; a real
+    /// source PC is stored plus one so PC zero remains representable without
+    /// materialising Rust's associated `usize::MAX` constant in jitcode.
+    jit_resume_pc_plus_one: usize,
 }
 
 #[cfg(feature = "grain-jit")]
@@ -2785,13 +2806,16 @@ impl<'e> Vm<'e> {
         target: &mut Dynamic,
         rhs: &mut Dynamic,
         pos: impl Fn() -> Position,
-    ) -> Option<Result<(), Box<EvalAltResult>>> {
+    ) -> StoreBuiltinOutcome {
         #[cfg(feature = "grain-jit")]
         let fast_operators = jit::fast_operators(self) != 0;
         #[cfg(not(feature = "grain-jit"))]
         let fast_operators = self.engine.fast_operators();
         if !fast_operators {
-            return None;
+            return StoreBuiltinOutcome {
+                handled: false,
+                error: None,
+            };
         }
 
         // `AssignOp::kind` is the `+=` token already decoded, pooled beside the
@@ -2805,30 +2829,49 @@ impl<'e> Vm<'e> {
         // is the op-assignment table's, not the operator table's — see
         // `apply_assign`.
         if let Some(kind) = op.kind {
-            if let Some(done) = apply_assign(kind, target, rhs) {
-                return Some(match done {
-                    Ok(()) => Ok(()),
-                    Err(mut err) => {
-                        if err.position().is_none() {
-                            err.set_position(pos());
-                        }
-                        Err(err)
+            match apply_assign(kind, target, rhs) {
+                Ok(Some(())) => {
+                    return StoreBuiltinOutcome {
+                        handled: true,
+                        error: None,
+                    };
+                }
+                Ok(None) => {}
+                Err(mut err) => {
+                    if err.position().is_none() {
+                        err.set_position(pos());
                     }
-                });
+                    return StoreBuiltinOutcome {
+                        handled: true,
+                        error: Some(err),
+                    };
+                }
             }
         }
 
-        let (func, need_context) = get_builtin_op_assignment_fn(&op.op_assign, target, rhs)?;
+        let Some((func, need_context)) = get_builtin_op_assignment_fn(&op.op_assign, target, rhs)
+        else {
+            return StoreBuiltinOutcome {
+                handled: false,
+                error: None,
+            };
+        };
         let context = need_context.then(|| (self.engine, "", None, &self.global, pos()).into());
-        Some(match func(context, &mut [target, rhs]) {
-            Ok(_) => Ok(()),
+        match func(context, &mut [target, rhs]) {
+            Ok(_) => StoreBuiltinOutcome {
+                handled: true,
+                error: None,
+            },
             Err(mut err) => {
                 if err.position().is_none() {
                     err.set_position(pos());
                 }
-                Err(err)
+                StoreBuiltinOutcome {
+                    handled: true,
+                    error: Some(err),
+                }
             }
-        })
+        }
     }
 
     fn store(
@@ -2844,8 +2887,12 @@ impl<'e> Vm<'e> {
             return Ok(());
         };
 
-        if let Some(done) = self.store_builtin(op, target, &mut rhs, || pos) {
-            return done;
+        let done = self.store_builtin(op, target, &mut rhs, || pos);
+        if done.handled {
+            return match done.error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         }
 
         let op_assign_name = or_raise!(
@@ -3070,17 +3117,19 @@ impl<'e> Vm<'e> {
         // mismatch against that argument, not against the target, which is why
         // the position moves with it.
         let mut receiver_at = None;
-        if method && !self.stack[at].is::<FnPtr>() {
+        if method && !operand_ref(&self.stack[at]).is::<FnPtr>() {
             receiver_at = Some(at);
             at += 1;
             if at >= self.depth {
-                return Err(self.mismatch::<FnPtr>(self.stack[at - 1].type_name(), pos));
+                return Err(
+                    self.mismatch::<FnPtr>(operand_ref(&self.stack[at - 1]).type_name(), pos)
+                );
             }
         }
 
         let pointer = or_raise!(
             clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
-            self.mismatch::<FnPtr>(self.stack[at].type_name(), pos)
+            self.mismatch::<FnPtr>(operand_ref(&self.stack[at]).type_name(), pos)
         );
 
         let taken = self.depth - at - 1;
@@ -4151,6 +4200,7 @@ impl<'e> Vm<'e> {
             base,
             reached: chunk.entry() as usize,
             stack_base: self.depth,
+            jit_resume_pc_plus_one: 0,
         };
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
@@ -4504,7 +4554,14 @@ impl<'e> Vm<'e> {
             // the state an instruction starts from and a loop that jumps back
             // to `pc` arrives here holding exactly what it held last time.
             #[cfg(feature = "grain-jit")]
-            jit_driver.jit_merge_point(pc, program.jit_identity(), program, frame, self);
+            {
+                frame.jit_resume_pc_plus_one = 0;
+                jit_driver.jit_merge_point(pc, program.jit_identity(), program, frame, self);
+                if frame.jit_resume_pc_plus_one != 0 {
+                    pc = frame.jit_resume_pc_plus_one - 1;
+                    continue;
+                }
+            }
 
             // Re-read every loop-carried value from the marker's green program
             // or red frame/VM after the marker.  Keeping one of these in a
@@ -4722,7 +4779,9 @@ impl<'e> Vm<'e> {
                     if target <= pc {
                         #[cfg(feature = "grain-jit")]
                         {
-                            jit::track_operation(self, pos!())?;
+                            if let Some(error) = jit::track_operation_error(self, program, pc) {
+                                return Err(error);
+                            }
                             jit_driver.can_enter_jit(
                                 target,
                                 program.jit_identity(),
@@ -4927,10 +4986,15 @@ impl<'e> Vm<'e> {
                         let done = match op {
                             Some(op) => self
                                 .store_builtin(op, entry, &mut rhs, move || program.position(pc)),
-                            None => None,
+                            None => StoreBuiltinOutcome {
+                                handled: false,
+                                error: None,
+                            },
                         };
-                        if let Some(done) = done {
-                            done?;
+                        if done.handled {
+                            if let Some(error) = done.error {
+                                return Err(error);
+                            }
                             pc += width;
                             continue;
                         }
@@ -5169,20 +5233,19 @@ impl<'e> Vm<'e> {
                         // and answers whatever it answers, which is what a
                         // verified program's byte can never make it do.
                         if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
-                            let applied = apply_binary(
+                            let applied = match apply_binary(
                                 kind,
                                 stack_ref(self, under),
                                 stack_ref(self, top - 1),
-                            );
+                            ) {
+                                Ok(applied) => applied,
+                                Err(error) => return Err(error),
+                            };
                             if let Some(value) = applied {
                                 // No position stamped on the way out: under
                                 // `fast_operators` Rhai returns a built-in's
                                 // error untouched, which is why `1 / 0` has
                                 // none. See `dispatch_failure`.
-                                let value = match value {
-                                    Ok(value) => value,
-                                    Err(error) => return Err(error),
-                                };
                                 truncate_stack!(under);
                                 self.push(value);
                                 pc += width;
@@ -5554,7 +5617,7 @@ impl<'e> Vm<'e> {
                     );
                     let mut pointer = or_raise!(
                         clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
-                        self.mismatch::<FnPtr>(self.stack[at].type_name(), pos!())
+                        self.mismatch::<FnPtr>(operand_ref(&self.stack[at]).type_name(), pos!())
                     );
                     for value in self.take_values_from(at + 1) {
                         pointer.add_curry(value);
@@ -5685,7 +5748,9 @@ impl<'e> Vm<'e> {
 
                 code::tag::TICK => {
                     #[cfg(feature = "grain-jit")]
-                    jit::track_operation(self, pos!())?;
+                    if let Some(error) = jit::track_operation_error(self, program, pc) {
+                        return Err(error);
+                    }
                     #[cfg(not(feature = "grain-jit"))]
                     self.engine.track_operation(&mut self.global, pos!())?;
                 }
@@ -5875,6 +5940,7 @@ mod tests {
             base: 1,
             reached: 2,
             stack_base: 3,
+            jit_resume_pc_plus_one: 0,
         };
         let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;
