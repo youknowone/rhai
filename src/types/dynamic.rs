@@ -52,6 +52,7 @@ const DEFAULT_TAG_VALUE: Tag = 0;
 
 /// Dynamic type containing any value.
 #[must_use]
+#[repr(transparent)]
 pub struct Dynamic(pub(crate) Union);
 
 /// Internal [`Dynamic`] representation.

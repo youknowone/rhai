@@ -1051,10 +1051,7 @@ fn an_operator_of_no_known_kind_is_refused() {
     // that takes its operands off the stack, and the one that names them. The
     // second source keeps a plain `Op::BinOp` because its right-hand operand
     // is another operator's result rather than a local or a constant.
-    for source in [
-        "let a = 7; let b = 3; a * b",
-        "let a = 7; let b = 3; a * (b + 1)",
-    ] {
+    for source in ["let a = 7; let b = 3; a * b", "let a = 7; let b = 3; a * (b + 1)"] {
         let engine = Engine::new();
         let ast = engine.compile(source).expect("must parse");
         let program = Compiler::new().compile(&ast);
@@ -1065,14 +1062,7 @@ fn an_operator_of_no_known_kind_is_refused() {
         // makes this fail loudly rather than testing nothing.
         let code = program.code().to_vec();
         let at = rhai::grain::bytecode::disassemble(&code)
-            .find_map(|(at, op)| {
-                matches!(
-                    op,
-                    rhai::grain::bytecode::Op::BinOp { .. }
-                        | rhai::grain::bytecode::Op::BinOpFrom { .. }
-                )
-                .then_some(at)
-            })
+            .find_map(|(at, op)| matches!(op, rhai::grain::bytecode::Op::BinOp { .. } | rhai::grain::bytecode::Op::BinOpFrom { .. }).then_some(at))
             .unwrap_or_else(|| panic!("{source} must compile to a typed operator"));
         let section = bytes
             .windows(code.len())

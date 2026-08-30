@@ -10,6 +10,63 @@ use std::{
     marker::PhantomData,
 };
 
+// PyPy's frame locals and value stack are arrays of `W_Root` references.  The
+// generated meta-tracer has the same `getarrayitem_gc_r` contract, so the JIT
+// build stores each `Dynamic` behind one stable, pointer-sized slot.  The
+// ordinary interpreter keeps Rhai's compact inline representation.
+#[cfg(feature = "grain-jit")]
+type ScopeValue = Box<Dynamic>;
+#[cfg(not(feature = "grain-jit"))]
+type ScopeValue = Dynamic;
+
+#[inline(always)]
+fn scope_value(value: Dynamic) -> ScopeValue {
+    #[cfg(feature = "grain-jit")]
+    {
+        Box::new(value)
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        value
+    }
+}
+
+#[inline(always)]
+fn scope_ref(value: &ScopeValue) -> &Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        value.as_ref()
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        value
+    }
+}
+
+#[inline(always)]
+fn scope_mut(value: &mut ScopeValue) -> &mut Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        value.as_mut()
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        value
+    }
+}
+
+#[inline(always)]
+fn scope_into(value: ScopeValue) -> Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        *value
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        value
+    }
+}
+
 /// Minimum number of entries in the [`Scope`] to avoid reallocations.
 pub const MIN_SCOPE_ENTRIES: usize = 8;
 
@@ -61,7 +118,7 @@ pub const MIN_SCOPE_ENTRIES: usize = 8;
 #[derive(Debug, Hash, Default)]
 pub struct Scope<'a> {
     /// Current value of the entry.
-    values: ThinVec<Dynamic>,
+    values: ThinVec<ScopeValue>,
     /// Name of the entry.
     names: ThinVec<ImmutableString>,
     /// Aliases of the entry.
@@ -127,7 +184,7 @@ impl IntoIterator for Scope<'_> {
                             .chain(iter::repeat(Vec::new())),
                     ),
                 )
-                .map(|(value, (name, alias))| (name.to_string(), value, alias)),
+                .map(|(value, (name, alias))| (name.to_string(), scope_into(value), alias)),
         )
     }
 }
@@ -148,7 +205,7 @@ impl<'a> IntoIterator for &'a Scope<'_> {
                             .chain(iter::repeat(&[][..])),
                     ),
                 )
-                .map(|(value, (name, alias))| (name.as_str(), value, alias)),
+                .map(|(value, (name, alias))| (name.as_str(), scope_ref(value), alias)),
         )
     }
 }
@@ -360,7 +417,7 @@ impl Scope<'_> {
         }
         self.names.push(name);
         value.set_access_mode(access);
-        self.values.push(value);
+        self.values.push(scope_value(value));
         self
     }
     /// Remove the last entry from the [`Scope`].
@@ -409,7 +466,7 @@ impl Scope<'_> {
         self.values.pop().map(|value| {
             (
                 self.names.pop().unwrap(),
-                value,
+                scope_into(value),
                 if self.aliases.len() > self.values.len() {
                     self.aliases.pop().unwrap().to_vec()
                 } else {
@@ -636,7 +693,7 @@ impl Scope<'_> {
             }
             Some((index, AccessMode::ReadWrite)) => {
                 let value_ref = self.values.get_mut(index).unwrap();
-                *value_ref = Dynamic::from(value);
+                *scope_mut(value_ref) = Dynamic::from(value);
             }
         }
         self
@@ -679,7 +736,7 @@ impl Scope<'_> {
             Some((.., AccessMode::ReadOnly)) => panic!("variable {} is constant", name.as_ref()),
             Some((index, AccessMode::ReadWrite)) => {
                 let value_ref = self.values.get_mut(index).unwrap();
-                *value_ref = Dynamic::from(value);
+                *scope_mut(value_ref) = Dynamic::from(value);
             }
         }
         self
@@ -706,7 +763,8 @@ impl Scope<'_> {
     #[inline(always)]
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&Dynamic> {
-        self.search(name).map(|index| &self.values[index])
+        self.search(name)
+            .map(|index| scope_ref(&self.values[index]))
     }
     /// Get a reference to an entry in the [`Scope`] based on the index.
     ///
@@ -718,7 +776,7 @@ impl Scope<'_> {
     pub(crate) fn get_entry_by_index(&self, index: usize) -> (&str, &Dynamic, &[ImmutableString]) {
         (
             &self.names[index],
-            &self.values[index],
+            scope_ref(&self.values[index]),
             if self.aliases.len() > index {
                 &self.aliases[index]
             } else {
@@ -760,7 +818,7 @@ impl Scope<'_> {
             if self.aliases.len() > index {
                 self.aliases.remove(index);
             }
-            self.values.remove(index).try_cast()
+            scope_into(self.values.remove(index)).try_cast()
         })
     }
     /// Get a mutable reference to the value of an entry in the [`Scope`].
@@ -820,7 +878,7 @@ impl Scope<'_> {
     /// Panics if the index is out of bounds.
     #[inline(always)]
     pub(crate) fn get_mut_by_index(&mut self, index: usize) -> &mut Dynamic {
-        &mut self.values[index]
+        scope_mut(&mut self.values[index])
     }
     /// Add an alias to an entry in the [`Scope`].
     ///
@@ -881,7 +939,7 @@ impl Scope<'_> {
             let index = len - 1 - i;
             let v1 = &self.values[index];
 
-            scope.push_entry(name.clone(), v1.access_mode(), v1.clone());
+            scope.push_entry(name.clone(), v1.access_mode(), scope_ref(v1).clone());
 
             if self.aliases.len() > index {
                 scope.aliases.resize(scope.len() - 1, <_>::default());
@@ -935,7 +993,7 @@ impl Scope<'_> {
         self.names
             .iter()
             .zip(self.values.iter())
-            .map(|(name, value)| (name, value.is_read_only(), value))
+            .map(|(name, value)| (name, value.is_read_only(), scope_ref(value)))
     }
     /// Get a reverse iterator to entries in the [`Scope`].
     /// Shared values are not expanded.
@@ -947,7 +1005,7 @@ impl Scope<'_> {
             .iter()
             .rev()
             .zip(self.values.iter().rev())
-            .map(|(name, value)| (name, value.is_read_only(), value))
+            .map(|(name, value)| (name, value.is_read_only(), scope_ref(value)))
     }
     /// Remove a range of entries within the [`Scope`].
     ///
@@ -1011,5 +1069,27 @@ impl<K: Into<Identifier>> FromIterator<(K, bool, Dynamic)> for Scope<'_> {
         let mut scope = Self::new();
         scope.extend(iter);
         scope
+    }
+}
+
+#[cfg(all(test, feature = "grain-jit"))]
+mod jit_tests {
+    use super::*;
+    use crate::INT;
+
+    #[test]
+    fn jit_scope_values_are_pointer_sized_and_reused() {
+        assert_eq!(
+            core::mem::size_of::<ScopeValue>(),
+            core::mem::size_of::<usize>()
+        );
+
+        let mut scope = Scope::new();
+        scope.push("value", 1 as INT);
+        let address = scope_ref(&scope.values[0]) as *const Dynamic;
+        scope.set_value("value", 2 as INT);
+
+        assert_eq!(address, scope_ref(&scope.values[0]) as *const Dynamic);
+        assert_eq!(scope.get_value::<INT>("value"), Some(2));
     }
 }

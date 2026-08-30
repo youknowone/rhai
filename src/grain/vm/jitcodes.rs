@@ -35,6 +35,18 @@ static INSNS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/insns.bin"));
 /// prefix would shift every one of those offsets by its own width.
 static ALL_LIVENESS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/all_liveness.bin"));
 
+fn insns() -> &'static std::collections::BTreeMap<String, u8> {
+    static TABLE: once_cell::race::OnceBox<std::collections::BTreeMap<String, u8>> =
+        once_cell::race::OnceBox::new();
+    TABLE.get_or_init(|| Box::new(bincode::deserialize(INSNS).expect("the opcode table decodes")))
+}
+
+pub(super) fn insn_name(opcode: u8) -> Option<&'static str> {
+    insns()
+        .iter()
+        .find_map(|(name, value)| (*value == opcode).then_some(name.as_str()))
+}
+
 /// One table's entries, as byte ranges over its concatenated bodies.
 ///
 /// `offsets` has one more entry than there are records, so a record's bounds
@@ -60,6 +72,85 @@ fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
         .find_map(|(symbolic, path)| (*symbolic == fnaddr).then_some(path.as_str()))
 }
 
+/// Scalar ABI shims owned by this interpreter.
+///
+/// Build-time addresses are symbolic because build.rs runs in another
+/// process.  These are the matching final-process addresses; every signature
+/// is C ABI and returns one machine word, so no Rust enum or fat pointer
+/// crosses the compiled-code boundary.
+fn runtime_bindings() -> Vec<(&'static str, i64)> {
+    vec![
+        (
+            "rhai::grain::vm::jit::code_byte",
+            super::jit::code_byte as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::code_width",
+            super::jit::code_width as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::code_u16",
+            super::jit::code_u16 as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::code_u32",
+            super::jit::code_u32 as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::code_position_bits",
+            super::jit::code_position_bits as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_constant",
+            super::jit::program_constant as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_assign_op",
+            super::jit::program_assign_op as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::track_operation_abi",
+            super::jit::track_operation_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::fast_operators",
+            super::jit::fast_operators as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::scope_len",
+            super::jit::scope_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_len",
+            super::jit::operand_stack_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_entry",
+            super::jit::operand_stack_entry as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_entry_mut",
+            super::jit::operand_stack_entry_mut as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_take",
+            super::jit::operand_stack_take as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_store",
+            super::jit::operand_stack_store as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::truncate_stack",
+            super::jit::truncate_stack as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::scope_entry",
+            super::jit::scope_entry as *const () as usize as i64,
+        ),
+    ]
+}
+
 /// The build-time tables, joined into runtime shells.
 ///
 /// Published once and never rebuilt: the tables are a frozen build artefact,
@@ -81,16 +172,29 @@ fn table() -> &'static EmbeddedJitCodeTable {
         let descrs: Vec<BhDescr> = entries(DESCRS, &descr_offsets)
             .map(|body| bincode::deserialize::<BhDescr>(body).expect("a descr decodes"))
             .collect();
+        if std::env::var_os("MAJIT_DESCR_TRACE").is_some() {
+            for (index, descr) in descrs.iter().enumerate() {
+                let rendered = format!("{descr:?}");
+                if (215..=230).contains(&index)
+                    || rendered.contains("__pos_2")
+                    || rendered.contains("access")
+                {
+                    eprintln!("[majit-descr] {index} {rendered}");
+                }
+            }
+        }
 
-        // No runtime bindings yet: nothing on this side publishes an ABI shim
-        // for a symbolic path, so every unbound callee keeps the build's
-        // sentinel and a trace that reaches one is expected to decline rather
-        // than call it. Binding them is what makes those callees reachable.
+        let bindings = runtime_bindings();
+        if std::env::var_os("MAJIT_RESIDUAL_TRACE").is_some() {
+            for (name, address) in &bindings {
+                eprintln!("[majit-binding] {address:#x} {name}");
+            }
+        }
         Box::new(EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs(
             &jitcodes,
             descrs,
             symbolic_fnaddrs(),
-            &[],
+            &bindings,
         ))
     })
 }

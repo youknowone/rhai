@@ -999,8 +999,8 @@ impl Engine {
                         let args = &mut [target.as_mut(), &mut new_val];
 
                         self.exec_native_fn_call(
-                            global, caches, setter, None, *hash_set, args, is_ref_mut, false,
-                            *pos, None,
+                            global, caches, setter, None, *hash_set, args, is_ref_mut, false, *pos,
+                            None,
                         )
                         .or_else(|err| match *err {
                             // Try an indexer if property does not exist
@@ -1028,8 +1028,8 @@ impl Engine {
                         let args = &mut [target.as_mut()];
 
                         self.exec_native_fn_call(
-                            global, caches, getter, None, *hash_get, args, is_ref_mut, false,
-                            *pos, None,
+                            global, caches, getter, None, *hash_get, args, is_ref_mut, false, *pos,
+                            None,
                         )
                         .map_or_else(
                             |err| match *err {

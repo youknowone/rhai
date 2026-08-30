@@ -6,9 +6,11 @@
 //! the machine state is at that moment. Everything the tracer needs to decide
 //! "have I been here before" is in the arguments.
 //!
-//! The arguments split two ways. `pc` and `program` are *green*: constant for
-//! any one trace, so the tracer specialises on their values and a loop that
-//! comes back to the same instruction of the same program is the same loop.
+//! The arguments split two ways. `pc`, `program_identity` and `program` are
+//! *green*: constant for any one trace, so the tracer specialises on their
+//! values and a loop that comes back to the same instruction of the same
+//! program is the same loop.  The identity prevents a dropped stack-local
+//! program's address from aliasing the next program allocated in that slot.
 //! The rest are *red*: they vary per iteration and the trace carries them as
 //! live values. Neither the split nor the order is inferable from the source,
 //! so a consumer that lowers this VM declares both, and the declaration and
@@ -24,10 +26,228 @@ use std::sync::{Arc, OnceLock};
 use majit_ir::{GreenKey, GreenType};
 use majit_metainterp::{JitDriver, TraceAction};
 
-use super::Vm;
 use super::{jit_state, jitcodes};
+use super::{GrainFrame, Vm};
+use crate::grain::bytecode::AssignOp;
 use crate::grain::Program;
-use crate::Scope;
+use crate::types::dynamic::Union;
+use crate::{Dynamic, Position, RhaiResultOf, Scope};
+
+/// Write the scalar payload of an existing integer `Dynamic`.
+///
+/// The MAJIT frontend lowers this named boundary to a `setfield_gc_i` on
+/// `Union::Int::__pos_0`.  Keeping the target variant in place preserves its
+/// tag/access fields and avoids representing Rust's `&mut INT` as a JIT ref.
+#[inline(always)]
+pub(super) fn dynamic_store_int(target: &mut Dynamic, value: crate::INT) {
+    let Union::Int(held, ..) = &mut target.0 else {
+        unreachable!("dynamic_store_int target changed variant")
+    };
+    *held = value;
+}
+
+/// Float twin of [`dynamic_store_int`].
+#[cfg(not(feature = "no_float"))]
+#[inline(always)]
+pub(super) fn dynamic_store_float(target: &mut Dynamic, value: crate::FLOAT) {
+    let Union::Float(held, ..) = &mut target.0 else {
+        unreachable!("dynamic_store_float target changed variant")
+    };
+    **held = value;
+}
+
+fn position_bits(position: Position) -> i64 {
+    let line = position.line().unwrap_or(0) as u16;
+    let column = position.position().unwrap_or(0) as u16;
+    i64::from((u32::from(line) << 16) | u32::from(column))
+}
+
+fn position_from_bits(bits: i64) -> Position {
+    let bits = bits as u32;
+    let line = (bits >> 16) as u16;
+    if line == 0 {
+        Position::NONE
+    } else {
+        Position::new(line, bits as u16)
+    }
+}
+
+/// Read one bytecode byte across the residual-call ABI.
+///
+/// `Program::code()` returns a Rust slice, whose `(data, len)` fat pointer
+/// cannot be carried in one majit register.  Keep that representation inside
+/// ordinary Rust and expose only scalar results to the trace, like PyPy's
+/// elidable bytecode accessors.  Returning `-1` spells `None` without putting
+/// `Option<u8>`'s enum layout on the ABI.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn code_byte(program: &Program<'_>, at: usize) -> i64 {
+    program.code().get(at).map_or(-1, |byte| i64::from(*byte))
+}
+
+/// Return the verified instruction width, or `-1` for an invalid/truncated
+/// instruction.  See [`code_byte`] for why this is an opaque scalar helper.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn code_width(program: &Program<'_>, at: usize) -> i64 {
+    crate::grain::bytecode::code::width(program.code(), at).map_or(-1, |n| n as i64)
+}
+
+/// Read a little-endian `u16` operand, or `-1` when it is truncated.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn code_u16(program: &Program<'_>, at: usize) -> i64 {
+    crate::grain::bytecode::code::u16_at(program.code(), at).map_or(-1, i64::from)
+}
+
+/// Read a little-endian `u32` operand, or `-1` when it is truncated.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn code_u32(program: &Program<'_>, at: usize) -> i64 {
+    crate::grain::bytecode::code::u32_at(program.code(), at).map_or(-1, i64::from)
+}
+
+/// Return `Position` as two packed `u16` scalars (`line << 16 | column`).
+/// `Position::NONE` is zero.  The aggregate itself stays out of the residual
+/// ABI, while the wrapper below reconstructs the exact public value.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn code_position_bits(program: &Program<'_>, at: usize) -> i64 {
+    position_bits(program.position(at))
+}
+
+/// Resolve an immutable constant-pool entry without exposing the backing
+/// slice's fat pointer to generated code.
+#[majit_macros::elidable_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn program_constant<'a>(
+    program: &'a Program<'_>,
+    index: u32,
+) -> Option<&'a Dynamic> {
+    program.constant(index)
+}
+
+/// Resolve an immutable assignment-operator descriptor without exposing its
+/// backing `Vec` and `slice::get` implementation to the trace.
+#[majit_macros::elidable_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn program_assign_op<'a>(
+    program: &'a Program<'_>,
+    index: u32,
+) -> Option<&'a AssignOp> {
+    program.assign_op(index)
+}
+
+#[inline]
+pub(super) fn code_position(program: &Program<'_>, at: usize) -> crate::Position {
+    position_from_bits(code_position_bits(program, at))
+}
+
+/// Execute Rhai's operation-limit/progress hook outside the trace.
+///
+/// `Engine` owns callbacks and nested containers whose concrete Rust layout is
+/// not a translated GC object.  `Option<Box<_>>` is the same nullable pointer
+/// word the Ref result bank carries; the wrapper restores the exact
+/// `RhaiResultOf<()>` seen by the interpreter without raw-pointer ownership
+/// tricks.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn track_operation_abi(
+    vm: &mut Vm<'_>,
+    position: i64,
+) -> Option<Box<crate::EvalAltResult>> {
+    vm.engine
+        .track_operation(&mut vm.global, position_from_bits(position))
+        .err()
+}
+
+/// Read the engine's immutable fast-operator option without tracing through
+/// the `bitflags` implementation used by `LangOptions`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn fast_operators(vm: &Vm<'_>) -> i64 {
+    i64::from(vm.engine.fast_operators())
+}
+
+#[inline]
+pub(super) fn track_operation(vm: &mut Vm<'_>, position: Position) -> RhaiResultOf<()> {
+    match track_operation_abi(vm, position_bits(position)) {
+        None => Ok(()),
+        Some(error) => Err(error),
+    }
+}
+
+/// Read the length of the frame-local array without exposing `ThinVec`'s
+/// allocator-specific header to generated code.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn scope_len(scope: &Scope<'_>) -> i64 {
+    scope.len() as i64
+}
+
+/// Resolve one pointer-stable frame-local slot across the residual ABI.
+///
+/// The caller checks the index against [`scope_len`] first. Under
+/// `grain-jit`, each `Dynamic` is boxed, so growing the surrounding `ThinVec`
+/// cannot invalidate the reference carried by the trace.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn scope_entry<'a>(
+    scope: &'a mut Scope<'_>,
+    index: usize,
+) -> &'a mut Dynamic {
+    scope.get_mut_by_index(index)
+}
+
+/// Read the operand-stack allocation length without exposing `Vec`'s
+/// allocator-specific header to generated code. Unlike immutable `Program`
+/// accessors, this is execution state owned by the red `Vm`, so it remains an
+/// opaque, non-elidable residual call.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn operand_stack_len(vm: &Vm<'_>) -> i64 {
+    vm.stack.len() as i64
+}
+
+/// Resolve one pointer-stable operand slot across the residual ABI.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn operand_stack_entry<'a>(vm: &'a Vm<'_>, index: usize) -> &'a Dynamic {
+    super::operand_ref(&vm.stack[index])
+}
+
+/// Resolve one pointer-stable mutable operand slot across the residual ABI.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn operand_stack_entry_mut<'a>(
+    vm: &'a mut Vm<'_>,
+    index: usize,
+) -> &'a mut Dynamic {
+    super::operand_mut(&mut vm.stack[index])
+}
+
+/// Move one value out of a pointer-stable operand slot.
+///
+/// Keep `mem::take::<Dynamic>` behind this named ABI just as stores are kept
+/// behind [`operand_stack_store`].  A generic standard-library path has no
+/// stable, monomorphisation-specific symbolic name for the embedded table to
+/// bind, while this wrapper has exactly one concrete Rust ABI. `Dynamic` is
+/// an aggregate in the native Rust ABI, so use an out parameter instead of
+/// pretending its translated Ref result is a native pointer return.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, index: usize, value: &mut Dynamic) {
+    *value = core::mem::take(super::operand_mut(&mut vm.stack[index]));
+}
+
+/// Move one `Dynamic` into a pointer-stable operand slot.
+///
+/// A whole-value `*slot = value` currently reaches the MIR frontend as the
+/// synthetic `__deref_write` marker, for which no executable host address can
+/// exist. Keep that Rust aggregate store inside the opaque container ABI. The
+/// mutable source makes this a move (`mem::take`), not an observable clone.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn operand_stack_store(vm: &mut Vm<'_>, index: usize, value: &mut Dynamic) {
+    *super::operand_mut(&mut vm.stack[index]) = core::mem::take(value);
+}
+
+/// Drop every operand above `depth` and update the red VM's stack depth.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn truncate_stack(vm: &mut Vm<'_>, depth: usize) {
+    vm.truncate_stack(depth);
+}
 
 /// RPython's default warm-loop threshold (`warmstate.rs` uses the same value).
 const THRESHOLD: u32 = 1039;
@@ -228,18 +448,36 @@ fn report_if_enabled(event: &str) {
 pub struct GrainJitDriver;
 
 impl GrainJitDriver {
+    /// A control-flow transfer is about to enter a loop header.
+    ///
+    /// The untranslated marker is inert, as RPython's `JitDriver` hint is.
+    /// The translator recognises this receiver and lowers the call to
+    /// `loop_header`; the following [`Self::jit_merge_point`] performs the
+    /// native warm-state consultation with the target state.
+    #[inline(never)]
+    pub fn can_enter_jit(
+        &self,
+        pc: usize,
+        program_identity: u64,
+        program: &Program,
+        frame: &mut GrainFrame<'_, '_>,
+        vm: &Vm<'_>,
+    ) {
+        let _ = (pc, program_identity, program, frame, vm);
+    }
+
     /// One iteration of the dispatch loop is about to run.
     ///
-    /// Greens `(pc, program)` first, then reds `(vm, scope, base, reached)`.
+    /// Greens `(pc, program_identity, program)` first, then reds
+    /// `(frame, vm)`.
     #[inline(never)]
     pub fn jit_merge_point(
         &self,
         pc: usize,
+        program_identity: u64,
         program: &Program,
+        frame: &mut GrainFrame<'_, '_>,
         vm: &Vm<'_>,
-        scope: &Scope<'_>,
-        base: usize,
-        reached: &usize,
     ) {
         // The door below resolves a celltable cell, builds a driver descriptor
         // and extracts the live values before it decides to interpret -- four
@@ -270,10 +508,8 @@ impl GrainJitDriver {
         bump_stats(|stats| stats.merge_points_consulted += 1);
 
         let env = [
+            frame as *const GrainFrame<'_, '_> as usize as i64,
             vm as *const Vm<'_> as usize as i64,
-            scope as *const Scope<'_> as usize as i64,
-            base as i64,
-            reached as *const usize as usize as i64,
         ];
         assert_eq!(
             env.len(),
@@ -282,6 +518,7 @@ impl GrainJitDriver {
         );
 
         let mut report_event = None;
+        let mut restored = Vec::new();
         RUNTIME.with(|cell| {
             let Ok(mut slot) = cell.try_borrow_mut() else {
                 bump_stats(|stats| stats.reentrant_consultations_declined += 1);
@@ -299,7 +536,11 @@ impl GrainJitDriver {
             // feeds is already the allocating part. `green_key_hash_typed`
             // takes a slice, and the owned `GreenKey` is built only inside the
             // factory below, which the door calls only when it needs one.
-            let green_values = [pc as i64, program as *const Program as usize as i64];
+            let green_values = [
+                pc as i64,
+                program_identity as i64,
+                program as *const Program as usize as i64,
+            ];
             assert_eq!(
                 green_values.len(),
                 runtime.green_types.len(),
@@ -349,64 +590,44 @@ impl GrainJitDriver {
                         "the symbolic state carries every declared red",
                     );
 
-                    // `trace_jitcode`'s empty-argument form is only usable for
-                    // a zero-argument portal. `run_frame` starts with
-                    // (vm, program, scope, base, reached, start); seed those
-                    // registers from the marker's greens and reds, and verify
-                    // their kinds against the jitcode's own call descriptor.
-                    let green_ir: Vec<_> = green_types
+                    // A warm-loop trace begins at the marker, not at
+                    // `run_frame`'s function entry.  Seed the registers named
+                    // by that marker from its typed greens/reds; ordinary
+                    // `setup_call` would reset the cursor to zero and replay
+                    // the frame-allocation prologue on every hot iteration.
+                    let green_kinds: Vec<_> = green_types
                         .iter()
                         .copied()
                         .map(majit_ir::green_type_to_ir)
+                        .map(|tp| {
+                            majit_metainterp::JitArgKind::from_type(tp)
+                                .expect("a green portal argument is not void")
+                        })
                         .collect();
-                    let red_ir = jit_state::red_kinds();
-                    let typed = [
-                        (red_ir[0], sym.reds[0], env[0]),
-                        (
-                            green_ir[1],
-                            ctx.const_ref(program as *const Program as usize as i64),
-                            program as *const Program as usize as i64,
-                        ),
-                        (red_ir[1], sym.reds[1], env[1]),
-                        (red_ir[2], sym.reds[2], env[2]),
-                        (red_ir[3], sym.reds[3], env[3]),
-                        (green_ir[0], ctx.const_int(pc as i64), pc as i64),
+                    let green_args = [
+                        (green_kinds[0], pc as i64),
+                        (green_kinds[1], program_identity as i64),
+                        (green_kinds[2], program as *const Program as usize as i64),
                     ];
-                    let argboxes: Vec<_> = typed
-                        .into_iter()
-                        .map(|(tp, op, value)| {
-                            (
-                                majit_metainterp::JitArgKind::from_type(tp)
-                                    .expect("a portal argument is not void"),
-                                op,
-                                value,
-                            )
+                    let red_args: Vec<_> = jit_state::red_kinds()
+                        .iter()
+                        .copied()
+                        .zip(sym.reds.iter().copied())
+                        .zip(env.iter().copied())
+                        .map(|((tp, opref), value)| {
+                            let kind = majit_metainterp::JitArgKind::from_type(tp)
+                                .expect("a red portal argument is not void");
+                            (kind, opref, value)
                         })
                         .collect();
-                    let descriptor_kinds: Vec<_> = portal
-                        .calldescr
-                        .arg_classes
-                        .bytes()
-                        .map(|kind| match kind {
-                            b'i' => majit_metainterp::JitArgKind::Int,
-                            b'r' => majit_metainterp::JitArgKind::Ref,
-                            b'f' => majit_metainterp::JitArgKind::Float,
-                            other => panic!("unsupported portal argument class {other:?}"),
-                        })
-                        .collect();
-                    assert_eq!(
-                        argboxes.iter().map(|arg| arg.0).collect::<Vec<_>>(),
-                        descriptor_kinds,
-                        "the live portal arguments match the lowered function signature",
-                    );
 
-                    let mut frame = majit_metainterp::MIFrame::setup(
+                    let frame = majit_metainterp::setup_frame_from_merge_point(
+                        ctx,
                         Arc::clone(&portal),
                         header_pc,
-                        None,
-                        Some(ctx),
+                        &green_args,
+                        &red_args,
                     );
-                    frame.setup_call(&argboxes);
                     let mut stack = majit_metainterp::StandaloneFrameStack::new();
                     stack.frames.push(frame);
                     let trace_runtime = majit_metainterp::ClosureRuntime::new(|label| label);
@@ -424,7 +645,33 @@ impl GrainJitDriver {
                         };
                         match step {
                             TraceAction::Continue => {}
-                            other => break other,
+                            other => {
+                                if std::env::var_os("RHAI_GRAIN_JIT_TRACE").is_some() {
+                                    let current = stack.frames.frames.last();
+                                    eprintln!(
+                                        "[grain-jit-trace] depth={} stack={:?} after={:?} action={other:?}",
+                                        stack.frames.len(),
+                                        stack
+                                            .frames
+                                            .frames
+                                            .iter()
+                                            .map(|frame| (frame.jitcode.name(), frame.code_cursor))
+                                            .collect::<Vec<_>>(),
+                                        current.map(|frame| (
+                                            frame.jitcode.name(),
+                                            frame.pc,
+                                            frame.code_cursor,
+                                            frame.jitcode.code.get(frame.last_opcode_position).copied(),
+                                            frame
+                                                .jitcode
+                                                .code
+                                                .get(frame.last_opcode_position)
+                                                .and_then(|opcode| jitcodes::insn_name(*opcode)),
+                                        )),
+                                    );
+                                }
+                                break other;
+                            }
                         }
                     };
                     let after = ctx.num_ops();
@@ -449,7 +696,13 @@ impl GrainJitDriver {
                     "trace decision"
                 });
             }
+
+            restored = runtime.state.take_restored();
         });
+
+        if !restored.is_empty() {
+            frame.restore_from_jit(&restored, vm);
+        }
 
         if let Some(event) = report_event {
             report_if_enabled(event);

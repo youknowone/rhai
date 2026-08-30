@@ -628,13 +628,47 @@ fn apply_unary(kind: UnOpKind, operand: &Dynamic) -> Option<Dynamic> {
 #[inline]
 fn apply_assign(kind: BinOpKind, target: &mut Dynamic, rhs: &Dynamic) -> Option<RhaiResultOf<()>> {
     match (&mut target.0, &rhs.0) {
-        (Union::Int(x, ..), Union::Int(y, ..)) => arith::int_assign(kind, x, *y),
+        (Union::Int(x, ..), Union::Int(y, ..)) => {
+            let (x, y) = (*x, *y);
+            Some(match arith::int_assign(kind, x, y)? {
+                Ok(value) => {
+                    #[cfg(feature = "grain-jit")]
+                    jit::dynamic_store_int(target, value);
+                    #[cfg(not(feature = "grain-jit"))]
+                    if let Union::Int(held, ..) = &mut target.0 {
+                        *held = value;
+                    }
+                    Ok(())
+                }
+                Err(err) => Err(err),
+            })
+        }
         #[cfg(not(feature = "no_float"))]
-        (Union::Float(x, ..), Union::Float(y, ..)) => arith::float_assign(kind, x, **y).map(Ok),
+        (Union::Float(x, ..), Union::Float(y, ..)) => {
+            let (x, y) = (**x, **y);
+            arith::float_assign(kind, x, y).map(|value| {
+                #[cfg(feature = "grain-jit")]
+                jit::dynamic_store_float(target, value);
+                #[cfg(not(feature = "grain-jit"))]
+                if let Union::Float(held, ..) = &mut target.0 {
+                    **held = value;
+                }
+                Ok(())
+            })
+        }
         #[cfg(not(feature = "no_float"))]
         #[allow(clippy::cast_precision_loss)]
         (Union::Float(x, ..), Union::Int(y, ..)) => {
-            arith::float_assign(kind, x, *y as crate::FLOAT).map(Ok)
+            let (x, y) = (**x, *y as crate::FLOAT);
+            arith::float_assign(kind, x, y).map(|value| {
+                #[cfg(feature = "grain-jit")]
+                jit::dynamic_store_float(target, value);
+                #[cfg(not(feature = "grain-jit"))]
+                if let Union::Float(held, ..) = &mut target.0 {
+                    **held = value;
+                }
+                Ok(())
+            })
         }
         _ => None,
     }
@@ -903,6 +937,146 @@ pub struct Fault {
     pub slot: Option<u32>,
 }
 
+/// One operand-stack cell in the interpreter build selected for this crate.
+///
+/// RPython's value stack is an array of object references.  Rust's `Dynamic`
+/// is instead a 16-byte inline enum, so exposing `Vec<Dynamic>` to majit makes
+/// `getarrayitem_gc_r` load only the first word of each value.  The JIT build
+/// gives every preallocated stack cell a stable box and mutates its contents;
+/// the vector then contains genuine pointer-width elements without allocating
+/// on push/pop.  The non-JIT Grain interpreter keeps its original inline
+/// representation and cost model.
+#[cfg(feature = "grain-jit")]
+type OperandSlot = Box<Dynamic>;
+#[cfg(not(feature = "grain-jit"))]
+type OperandSlot = Dynamic;
+
+#[inline(always)]
+fn operand_slot(value: Dynamic) -> OperandSlot {
+    #[cfg(feature = "grain-jit")]
+    {
+        Box::new(value)
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        value
+    }
+}
+
+#[inline(always)]
+fn operand_ref(slot: &OperandSlot) -> &Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        slot.as_ref()
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        slot
+    }
+}
+
+#[inline(always)]
+fn operand_mut(slot: &mut OperandSlot) -> &mut Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        slot.as_mut()
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        slot
+    }
+}
+
+#[inline(always)]
+fn clone_operand(slot: &OperandSlot) -> Dynamic {
+    operand_ref(slot).clone()
+}
+
+#[inline(always)]
+fn set_operand(slot: &mut OperandSlot, value: Dynamic) {
+    *operand_mut(slot) = value;
+}
+
+#[inline(always)]
+fn stack_ref<'a>(vm: &'a Vm<'_>, index: usize) -> &'a Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        jit::operand_stack_entry(vm, index)
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        operand_ref(&vm.stack[index])
+    }
+}
+
+#[inline(always)]
+fn stack_mut<'a>(vm: &'a mut Vm<'_>, index: usize) -> &'a mut Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        jit::operand_stack_entry_mut(vm, index)
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        operand_mut(&mut vm.stack[index])
+    }
+}
+
+#[inline(always)]
+fn stack_take(vm: &mut Vm<'_>, index: usize) -> Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        // Spell the aggregate here instead of loading `Dynamic::UNIT` through
+        // its associated-const shim. The latter has no executable address in
+        // Charon's symbolic call table; the enum construction is ordinary
+        // translated allocation plus field stores.
+        let mut value = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
+        jit::operand_stack_take(vm, index, &mut value);
+        value
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        mem::take(stack_mut(vm, index))
+    }
+}
+
+/// The live state belonging to one interpreted call frame.
+///
+/// PyPy threads one `PyFrame` red through every invocation of its dispatch
+/// loop.  Keeping these values as unrelated portal reds aliases an inlined
+/// callee back onto its caller's `Vm`/`Scope`; a frame object gives every
+/// recursive [`Vm::execute`] its own identity and its own locals base, fault
+/// position and operand floor.
+#[repr(C)]
+pub(super) struct GrainFrame<'a, 'scope> {
+    scope: &'a mut Scope<'scope>,
+    base: usize,
+    reached: usize,
+    stack_base: usize,
+}
+
+#[cfg(feature = "grain-jit")]
+impl GrainFrame<'_, '_> {
+    /// Apply the canonical compiled-loop image while the merge point still
+    /// owns the safe mutable borrow of this stack-resident frame.
+    fn restore_from_jit(&mut self, values: &[i64], vm: &Vm<'_>) {
+        let [frame, restored_vm, scope, base, reached, stack_base, ..] = values else {
+            return;
+        };
+        let frame_addr = self as *mut Self as usize;
+        let scope_addr = self.scope as *mut Scope<'_> as usize;
+        let vm_addr = vm as *const Vm<'_> as usize;
+        if *frame as usize != frame_addr
+            || *restored_vm as usize != vm_addr
+            || *scope as usize != scope_addr
+        {
+            return;
+        }
+        self.base = *base as usize;
+        self.reached = *reached as usize;
+        self.stack_base = *stack_base as usize;
+    }
+}
+
 /// Executes a [`Program`] against an `Engine`.
 ///
 /// Holds one `GlobalRuntimeState` and one `Caches` for its whole lifetime, so
@@ -923,7 +1097,7 @@ pub struct Vm<'e> {
     /// value leaving the stack is cleared out of its slot rather than
     /// abandoned, because a `Dynamic` holds a reference and nothing else
     /// would drop it.
-    stack: Vec<Dynamic>,
+    stack: Vec<OperandSlot>,
     /// One past the top operand — `pyframe.py:88 valuestackdepth`.
     depth: usize,
     #[cfg_attr(any(feature = "no_index", feature = "no_object"), allow(unused))]
@@ -1627,12 +1801,16 @@ impl<'e> Vm<'e> {
     #[inline(never)]
     fn grow_stack(&mut self, extra: usize) {
         let want = (self.depth + extra.max(1)).next_power_of_two();
-        self.stack.resize(want, Dynamic::UNIT);
+        self.stack.resize_with(want, || operand_slot(Dynamic::UNIT));
     }
 
     #[inline]
     fn reserve_stack(&mut self, extra: usize) {
-        if self.depth + extra > self.stack.len() {
+        #[cfg(feature = "grain-jit")]
+        let stack_len = jit::operand_stack_len(self) as usize;
+        #[cfg(not(feature = "grain-jit"))]
+        let stack_len = self.stack.len();
+        if self.depth + extra > stack_len {
             self.grow_stack(extra);
         }
     }
@@ -1640,12 +1818,24 @@ impl<'e> Vm<'e> {
     /// `pyframe.py:390 pushvalue` — a store into the slot the depth names,
     /// and the depth moved on.
     #[inline]
-    fn push(&mut self, value: Dynamic) {
+    #[allow(unused_mut)]
+    fn push(&mut self, mut value: Dynamic) {
         let depth = self.depth;
-        if depth == self.stack.len() {
+        #[cfg(feature = "grain-jit")]
+        let stack_len = jit::operand_stack_len(self) as usize;
+        #[cfg(not(feature = "grain-jit"))]
+        let stack_len = self.stack.len();
+        if depth == stack_len {
             self.grow_stack(1);
         }
-        self.stack[depth] = value;
+        #[cfg(feature = "grain-jit")]
+        {
+            jit::operand_stack_store(self, depth, &mut value);
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        {
+            *stack_mut(self, depth) = value;
+        }
         self.depth = depth + 1;
     }
 
@@ -1659,12 +1849,12 @@ impl<'e> Vm<'e> {
     /// The operands, without the slots above the top — those hold unit and
     /// belong to nobody.
     #[inline]
-    fn values(&self) -> &[Dynamic] {
+    fn values(&self) -> &[OperandSlot] {
         &self.stack[..self.depth]
     }
 
     #[inline]
-    fn values_mut(&mut self) -> &mut [Dynamic] {
+    fn values_mut(&mut self) -> &mut [OperandSlot] {
         &mut self.stack[..self.depth]
     }
 
@@ -1679,7 +1869,7 @@ impl<'e> Vm<'e> {
         }
         let mut slot = depth;
         while slot < self.depth {
-            self.stack[slot] = Dynamic::UNIT;
+            *stack_mut(self, slot) = Dynamic::UNIT;
             slot += 1;
         }
         self.depth = depth;
@@ -1696,7 +1886,7 @@ impl<'e> Vm<'e> {
         let mut taken = FnArgsVec::new();
         let mut slot = first;
         while slot < self.depth {
-            taken.push(mem::take(&mut self.stack[slot]));
+            taken.push(stack_take(self, slot));
             slot += 1;
         }
         self.depth = first;
@@ -1709,7 +1899,8 @@ impl<'e> Vm<'e> {
         let mut slot = self.depth;
         while slot > at {
             slot -= 1;
-            self.stack[slot + count] = mem::take(&mut self.stack[slot]);
+            let value = stack_take(self, slot);
+            *stack_mut(self, slot + count) = value;
         }
         self.depth += count;
     }
@@ -1724,7 +1915,7 @@ impl<'e> Vm<'e> {
         match self.depth.checked_sub(1) {
             Some(depth) => {
                 self.depth = depth;
-                mem::take(&mut self.stack[depth])
+                stack_take(self, depth)
             }
             None => Dynamic::UNIT,
         }
@@ -1736,12 +1927,12 @@ impl<'e> Vm<'e> {
             malformed("operand stack underflow".to_string())
         );
         self.depth = depth;
-        Ok(mem::take(&mut self.stack[depth]))
+        Ok(stack_take(self, depth))
     }
 
     fn inspect(&mut self) -> Result<&Dynamic, Box<EvalAltResult>> {
         Ok(or_raise!(
-            self.values().last(),
+            self.values().last().map(operand_ref),
             malformed("operand stack underflow".to_string())
         ))
     }
@@ -1857,14 +2048,14 @@ impl<'e> Vm<'e> {
             }),
             // Rhai flattens the right-hand side before assigning, so a shared
             // cell is copied out rather than aliased in.
-            (true, _) => Ok(Some(self.stack[self.depth - 1].clone().flatten())),
+            (true, _) => Ok(Some(clone_operand(&self.stack[self.depth - 1]).flatten())),
         };
 
         let result = value.and_then(|value| {
             let mut operands: FnArgsVec<Dynamic> = self.values()
                 [operands_at..operands_at + chain.operands as usize]
                 .iter()
-                .cloned()
+                .map(clone_operand)
                 .collect();
 
             // A shared cell cannot be walked directly. `get_indexed_mut`
@@ -2007,7 +2198,7 @@ impl<'e> Vm<'e> {
             // floor.
             Root::Temporary => Ok(ChainRoot {
                 value: RootValue::Temporary(
-                    mem::take(&mut self.stack[operands_at + chain.operands as usize]).flatten(),
+                    stack_take(self, operands_at + chain.operands as usize).flatten(),
                 ),
                 pos,
             }),
@@ -2595,7 +2786,11 @@ impl<'e> Vm<'e> {
         rhs: &mut Dynamic,
         pos: impl Fn() -> Position,
     ) -> Option<Result<(), Box<EvalAltResult>>> {
-        if !self.engine.fast_operators() {
+        #[cfg(feature = "grain-jit")]
+        let fast_operators = jit::fast_operators(self) != 0;
+        #[cfg(not(feature = "grain-jit"))]
+        let fast_operators = self.engine.fast_operators();
+        if !fast_operators {
             return None;
         }
 
@@ -2611,27 +2806,29 @@ impl<'e> Vm<'e> {
         // `apply_assign`.
         if let Some(kind) = op.kind {
             if let Some(done) = apply_assign(kind, target, rhs) {
-                return Some(done.map_err(|mut err| {
-                    if err.position().is_none() {
-                        err.set_position(pos());
+                return Some(match done {
+                    Ok(()) => Ok(()),
+                    Err(mut err) => {
+                        if err.position().is_none() {
+                            err.set_position(pos());
+                        }
+                        Err(err)
                     }
-                    err
-                }));
+                });
             }
         }
 
         let (func, need_context) = get_builtin_op_assignment_fn(&op.op_assign, target, rhs)?;
         let context = need_context.then(|| (self.engine, "", None, &self.global, pos()).into());
-        Some(
-            func(context, &mut [target, rhs])
-                .map(|_| ())
-                .map_err(|mut err| {
-                    if err.position().is_none() {
-                        err.set_position(pos());
-                    }
-                    err
-                }),
-        )
+        Some(match func(context, &mut [target, rhs]) {
+            Ok(_) => Ok(()),
+            Err(mut err) => {
+                if err.position().is_none() {
+                    err.set_position(pos());
+                }
+                Err(err)
+            }
+        })
     }
 
     fn store(
@@ -2882,7 +3079,7 @@ impl<'e> Vm<'e> {
         }
 
         let pointer = or_raise!(
-            self.stack[at].clone().try_cast::<FnPtr>(),
+            clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
             self.mismatch::<FnPtr>(self.stack[at].type_name(), pos)
         );
 
@@ -2900,7 +3097,7 @@ impl<'e> Vm<'e> {
         // above `at`, so the receiver's index is unaffected either way.
         let (mut bound, write_back) = match receiver_at {
             Some(index) => {
-                let (value, write_back) = bind_this(&mut self.stack[index]);
+                let (value, write_back) = bind_this(operand_mut(&mut self.stack[index]));
                 (Some(value), write_back)
             }
             None => (None, false),
@@ -2913,7 +3110,7 @@ impl<'e> Vm<'e> {
             let curried = pointer.curry();
             self.open_slots(first, curried.len());
             for (offset, value) in curried.iter().enumerate() {
-                self.stack[first + offset] = value.clone();
+                set_operand(&mut self.stack[first + offset], value.clone());
             }
 
             // A function pointer call always starts with an empty scope.
@@ -2950,9 +3147,9 @@ impl<'e> Vm<'e> {
         // Before `?`, as everywhere else: Rhai binds the receiver by reference,
         // so a closure that writes and then raises has already written.
         if let Some(index) = receiver_at {
-            unbind_this(&mut self.stack[index], bound, write_back);
+            unbind_this(operand_mut(&mut self.stack[index]), bound, write_back);
             if write_back {
-                let updated = self.stack[index].clone();
+                let updated = clone_operand(&self.stack[index]);
                 self.return_receiver(program, receiver, updated, scope, frame_base)?;
             }
         }
@@ -3261,7 +3458,10 @@ impl<'e> Vm<'e> {
 
                 // Call into Rhai.
                 let top = self.depth;
-                let mut args = self.stack[first..top].iter_mut().collect::<FnArgsVec<_>>();
+                let mut args = self.stack[first..top]
+                    .iter_mut()
+                    .map(operand_mut)
+                    .collect::<FnArgsVec<_>>();
 
                 let answer = self
                     .engine
@@ -3321,7 +3521,8 @@ impl<'e> Vm<'e> {
         // consumes them, replacing each with unit, so the caller truncates
         // afterwards rather than reusing them.
         let top = self.depth;
-        let mut args: FnArgsVec<&mut Dynamic> = self.stack[first..top].iter_mut().collect();
+        let mut args: FnArgsVec<&mut Dynamic> =
+            self.stack[first..top].iter_mut().map(operand_mut).collect();
 
         // What this site resolved to when it last ran, which is what Rhai has
         // to work out again for a site with nothing to read back. See
@@ -3470,7 +3671,7 @@ impl<'e> Vm<'e> {
             if let Site::Slot(index) = at {
                 let value = scope.get_mut_by_index(index).flatten_clone();
                 self.open_slots(first, 1);
-                self.stack[first] = value;
+                set_operand(&mut self.stack[first], value);
             }
             let value = self.call_syntactic_or_stacked(
                 program, name_index, name, argc, first, scope, capture, pos,
@@ -3495,7 +3696,7 @@ impl<'e> Vm<'e> {
                 ),
             };
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
-                .chain(self.stack[rest..top].iter_mut())
+                .chain(self.stack[rest..top].iter_mut().map(operand_mut))
                 .collect();
             // Keyed the same way [`Vm::call_stacked`] keys it, because it is
             // the same call: passing the receiver by reference is how Rhai
@@ -3586,7 +3787,7 @@ impl<'e> Vm<'e> {
             // Argument zero is the snapshot, dead now that there is a register
             // to reach through.
             let mut args: FnArgsVec<&mut Dynamic> = core::iter::once(entry)
-                .chain(self.stack[first + 1..top].iter_mut())
+                .chain(self.stack[first + 1..top].iter_mut().map(operand_mut))
                 .collect();
             let memo = call_site(
                 &mut self.call_memo,
@@ -3942,6 +4143,16 @@ impl<'e> Vm<'e> {
         self.last_generation = self.last_generation.wrapping_add(1);
         let outer_generation = mem::replace(&mut self.generation, self.last_generation);
 
+        // One red frame per invocation, including non-portal callees inlined by
+        // the meta-tracer.  Its address remains stable until this execute call
+        // has completed or unwound.
+        let mut frame = GrainFrame {
+            scope,
+            base,
+            reached: chunk.entry() as usize,
+            stack_base: self.depth,
+        };
+
         // The dispatch loop uses `?` throughout, so an error leaves it rather
         // than being examined inside it. Catching therefore happens out here:
         // the loop stops, a handler this frame armed gets the error, and the
@@ -3951,9 +4162,9 @@ impl<'e> Vm<'e> {
         // path anything.
         let mut start = chunk.entry() as usize;
         let result = loop {
-            match self.run_frame(program, scope, base, reached, start) {
+            match self.run_frame(program, &mut frame, start) {
                 Ok(value) => break Ok(value),
-                Err(err) => match self.catch(program, err, handler_base, scope) {
+                Err(err) => match self.catch(program, err, handler_base, frame.scope) {
                     // Metered like a backward jump, and for the same reason:
                     // a catch block that sits before the throw is a cycle the
                     // dispatch loop never sees as one, because control got
@@ -3977,8 +4188,9 @@ impl<'e> Vm<'e> {
         self.sizes.truncate(size_base);
 
         if result.is_err() {
-            self.unwind_after_error(scope);
+            self.unwind_after_error(frame.scope);
         }
+        *reached = frame.reached;
         self.unwind_floor = outer_floor;
         self.generation = outer_generation;
         result
@@ -4257,14 +4469,9 @@ impl<'e> Vm<'e> {
     fn run_frame(
         &mut self,
         program: &Program,
-        scope: &mut Scope,
-        base: usize,
-        reached: &mut usize,
+        frame: &mut GrainFrame<'_, '_>,
         start: usize,
     ) -> VmResult {
-        // A called function pushes its operands above the caller's rather than
-        // starting a stack of its own, so this records where its own begin.
-        let stack_base = self.depth;
         self.reserve_stack(program.max_stack() as usize);
 
         // A residual's `Expr::Variable` nodes carry offsets Rhai's parser
@@ -4276,25 +4483,81 @@ impl<'e> Vm<'e> {
             self.global.always_search_scope = true;
         }
 
-        let code = program.code();
-        // What this frame's memo entries are stamped with. Nothing else can
-        // carry it, so nothing else can read them back. See [`Vm::generation`].
-        let generation = self.generation;
         // The chunk's entry the first time round, a catch block's address when
         // resumed after one.
         let mut pc = start;
+
+        // The marker receiver is a zero-sized declaration object, like
+        // RPython's JitDriver.  Construct it in the frame prologue so a trace
+        // that starts at the merge point never encounters Rust's synthetic
+        // unit-struct constructor on the closing back edge.
+        #[cfg(feature = "grain-jit")]
+        let jit_driver = jit::GrainJitDriver;
 
         loop {
             // Nothing inside an iteration moves `pc` except a jump, and a jump
             // only happens after the instruction succeeded — so recording it
             // here names whichever instruction fails.
-            *reached = pc;
+            frame.reached = pc;
 
             // Before anything is decoded, so the state the tracer records is
             // the state an instruction starts from and a loop that jumps back
             // to `pc` arrives here holding exactly what it held last time.
             #[cfg(feature = "grain-jit")]
-            jit::GrainJitDriver.jit_merge_point(pc, program, self, scope, base, reached);
+            jit_driver.jit_merge_point(pc, program.jit_identity(), program, frame, self);
+
+            // Re-read every loop-carried value from the marker's green program
+            // or red frame/VM after the marker.  Keeping one of these in a
+            // prologue local makes the lowered body read an unseeded register
+            // when tracing correctly starts at the merge point instead of
+            // replaying the function entry.
+            let base = frame.base;
+            let stack_base = frame.stack_base;
+            // What this frame's memo entries are stamped with. Nothing else
+            // can carry it, so nothing else can read them back. See
+            // [`Vm::generation`].
+            let generation = self.generation;
+
+            // Borrow the locals only after the marker has seen the whole
+            // frame; the borrow ends at the iteration boundary before the next
+            // marker.
+            let scope = &mut *frame.scope;
+            macro_rules! scope_len {
+                () => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::scope_len(scope) as usize
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        scope.len()
+                    }
+                }};
+            }
+            macro_rules! scope_entry {
+                ($index:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::scope_entry(scope, $index)
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        scope.get_mut_by_index($index)
+                    }
+                }};
+            }
+            macro_rules! truncate_stack {
+                ($depth:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::truncate_stack(self, $depth);
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        self.truncate_stack($depth);
+                    }
+                }};
+            }
 
             // No check against the chunk's end. Verification proves execution
             // cannot leave it — every path reaches a `Return`, no jump goes
@@ -4303,7 +4566,18 @@ impl<'e> Vm<'e> {
             // No address in the message: `reached` is written every iteration,
             // so the fault trace already names this instruction. Read it from
             // `Vm::fault_pc`, corrupt artifact or not.
-            let tag = *or_raise!(code.get(pc), {
+            #[cfg(feature = "grain-jit")]
+            let tag = match jit::code_byte(program, pc) {
+                -1 => {
+                    return Err(Box::new(EvalAltResult::ErrorRuntime(
+                        "ran off the end of a chunk".into(),
+                        Position::NONE,
+                    )))
+                }
+                byte => byte as u8,
+            };
+            #[cfg(not(feature = "grain-jit"))]
+            let tag = *or_raise!(program.code().get(pc), {
                 Box::new(EvalAltResult::ErrorRuntime(
                     "ran off the end of a chunk".into(),
                     Position::NONE,
@@ -4315,8 +4589,14 @@ impl<'e> Vm<'e> {
             // and nothing allocated. The bounds checks are what let this run
             // straight off an artifact without trusting it; the verifier has
             // already made them unreachable for anything that loaded.
+            #[cfg(feature = "grain-jit")]
+            let width = match jit::code_width(program, pc) {
+                -1 => return Err(malformed("undecodable instruction".to_string())),
+                width => width as usize,
+            };
+            #[cfg(not(feature = "grain-jit"))]
             let width = or_raise!(
-                code::width(code, pc),
+                code::width(program.code(), pc),
                 malformed("undecodable instruction".to_string())
             );
             // Macros rather than closures, for the reason the position lookup
@@ -4330,20 +4610,40 @@ impl<'e> Vm<'e> {
             // The bounds check stays. It is what lets this run straight off an
             // artifact without trusting it, and `mutated_artifacts_load_or_fail            //_but_never_misbehave` is the claim it carries.
             macro_rules! small {
-                ($offset:expr) => {
-                    match code::u16_at(code, pc + $offset) {
-                        Some(operand) => operand,
-                        None => return Err(malformed("truncated operand".to_string())),
+                ($offset:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        match jit::code_u16(program, pc + $offset) {
+                            -1 => return Err(malformed("truncated operand".to_string())),
+                            operand => operand as u16,
+                        }
                     }
-                };
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        match code::u16_at(program.code(), pc + $offset) {
+                            Some(operand) => operand,
+                            None => return Err(malformed("truncated operand".to_string())),
+                        }
+                    }
+                }};
             }
             macro_rules! wide {
-                ($offset:expr) => {
-                    match code::u32_at(code, pc + $offset) {
-                        Some(operand) => operand,
-                        None => return Err(malformed("truncated operand".to_string())),
+                ($offset:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        match jit::code_u32(program, pc + $offset) {
+                            -1 => return Err(malformed("truncated operand".to_string())),
+                            operand => operand as u32,
+                        }
                     }
-                };
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        match code::u32_at(program.code(), pc + $offset) {
+                            Some(operand) => operand,
+                            None => return Err(malformed("truncated operand".to_string())),
+                        }
+                    }
+                }};
             }
 
             // Instructions carry no position; the table does, keyed on the
@@ -4359,9 +4659,46 @@ impl<'e> Vm<'e> {
             // whether or not the instruction ever asked for a position. The one
             // site that needs a callable builds one there.
             macro_rules! pos {
-                () => {
-                    program.position(pc)
-                };
+                () => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::code_position(program, pc)
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        program.position(pc)
+                    }
+                }};
+            }
+            macro_rules! byte {
+                ($offset:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        match jit::code_byte(program, pc + $offset) {
+                            -1 => return Err(malformed("truncated operand".to_string())),
+                            operand => operand as u8,
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        match program.code().get(pc + $offset) {
+                            Some(operand) => *operand,
+                            None => return Err(malformed("truncated operand".to_string())),
+                        }
+                    }
+                }};
+            }
+            macro_rules! fast_operators {
+                () => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::fast_operators(self) != 0
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        self.engine.fast_operators()
+                    }
+                }};
             }
 
             // Every transfer of control goes through this, and a backward one
@@ -4383,6 +4720,18 @@ impl<'e> Vm<'e> {
                 ($target:expr) => {{
                     let target: usize = $target;
                     if target <= pc {
+                        #[cfg(feature = "grain-jit")]
+                        {
+                            jit::track_operation(self, pos!())?;
+                            jit_driver.can_enter_jit(
+                                target,
+                                program.jit_identity(),
+                                program,
+                                frame,
+                                self,
+                            );
+                        }
+                        #[cfg(not(feature = "grain-jit"))]
                         self.engine.track_operation(&mut self.global, pos!())?;
                     }
                     pc = target;
@@ -4392,10 +4741,11 @@ impl<'e> Vm<'e> {
             match tag {
                 code::tag::CONST => {
                     let index = u32::from(small!(1));
-                    let value = or_raise!(
-                        program.constant(index),
-                        malformed(format!("no constant {index}"))
-                    );
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    let value = or_raise!(constant, malformed(format!("no constant {index}")));
                     self.push(value.clone());
                 }
 
@@ -4406,19 +4756,19 @@ impl<'e> Vm<'e> {
                 code::tag::LOAD_LOCAL => {
                     let slot = small!(1);
                     let index = base + slot as usize;
-                    if index >= scope.len() {
+                    if index >= scope_len!() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     // Reads clone out, matching how Rhai's own variable reads
                     // leave the scope entry alone (`eval/expr.rs:276-278`), and
                     // flattening any shared cell the way a read should.
-                    self.push(scope.get_mut_by_index(index).flatten_clone());
+                    self.push(scope_entry!(index).flatten_clone());
                 }
 
                 code::tag::STORE_LOCAL | code::tag::STORE_CONST => {
                     let slot = small!(1);
                     let index = base + slot as usize;
-                    if index >= scope.len() {
+                    if index >= scope_len!() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     let mut value = self.pop()?;
@@ -4428,7 +4778,7 @@ impl<'e> Vm<'e> {
                         AccessMode::ReadWrite
                     });
                     // Through the cell, not over it — see `place`.
-                    *place(scope.get_mut_by_index(index), "", pos!())? = value;
+                    *place(scope_entry!(index), "", pos!())? = value;
                 }
 
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
@@ -4446,8 +4796,12 @@ impl<'e> Vm<'e> {
                         or_raise!(program.name(index), malformed(format!("no name {index}")));
                     let op = if tag == code::tag::ASSIGN_NAMED_OP {
                         let index = u32::from(small!(3));
+                        #[cfg(feature = "grain-jit")]
+                        let assign_op = jit::program_assign_op(program, index);
+                        #[cfg(not(feature = "grain-jit"))]
+                        let assign_op = program.assign_op(index);
                         Some(or_raise!(
-                            program.assign_op(index),
+                            assign_op,
                             malformed(format!("no op-assignment {index}"))
                         ))
                     } else {
@@ -4499,10 +4853,16 @@ impl<'e> Vm<'e> {
                         _ => None,
                     };
                     let op = match op {
-                        Some(index) => Some(or_raise!(
-                            program.assign_op(index),
-                            malformed(format!("no op-assignment {index}"))
-                        )),
+                        Some(index) => {
+                            #[cfg(feature = "grain-jit")]
+                            let assign_op = jit::program_assign_op(program, index);
+                            #[cfg(not(feature = "grain-jit"))]
+                            let assign_op = program.assign_op(index);
+                            Some(or_raise!(
+                                assign_op,
+                                malformed(format!("no op-assignment {index}"))
+                            ))
+                        }
                         None => None,
                     };
 
@@ -4519,20 +4879,20 @@ impl<'e> Vm<'e> {
                     let rhs = match from {
                         Some(src) => {
                             let index = base + src as usize;
-                            if index >= scope.len() {
+                            if index >= scope_len!() {
                                 return Err(malformed(format!("local slot {src} is out of scope")));
                             }
-                            scope.get_mut_by_index(index).flatten_clone()
+                            scope_entry!(index).flatten_clone()
                         }
                         None => self.pop()?.flatten(),
                     };
 
                     let index = base + slot as usize;
-                    if index >= scope.len() {
+                    if index >= scope_len!() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
 
-                    if scope.get_mut_by_index(index).is_read_only() {
+                    if scope_entry!(index).is_read_only() {
                         let name = or_raise!(
                             program.name(var_name),
                             malformed(format!("no name {var_name}"))
@@ -4561,12 +4921,15 @@ impl<'e> Vm<'e> {
                     // and started being written through. That is the price of
                     // a shared cell surviving an assignment, and of a chain
                     // over one not taking the host down.
-                    let entry = scope.get_mut_by_index(index);
+                    let entry = scope_entry!(index);
                     if !is_shared!(entry) {
                         let mut rhs = rhs;
-                        if let Some(done) = op.and_then(|op| {
-                            self.store_builtin(op, entry, &mut rhs, move || program.position(pc))
-                        }) {
+                        let done = match op {
+                            Some(op) => self
+                                .store_builtin(op, entry, &mut rhs, move || program.position(pc)),
+                            None => None,
+                        };
+                        if let Some(done) = done {
                             done?;
                             pc += width;
                             continue;
@@ -4614,8 +4977,12 @@ impl<'e> Vm<'e> {
                 code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
                     let op = if tag == code::tag::ASSIGN_THIS_OP {
                         let index = u32::from(small!(1));
+                        #[cfg(feature = "grain-jit")]
+                        let assign_op = jit::program_assign_op(program, index);
+                        #[cfg(not(feature = "grain-jit"))]
+                        let assign_op = program.assign_op(index);
                         Some(or_raise!(
-                            program.assign_op(index),
+                            assign_op,
                             malformed(format!("no op-assignment {index}"))
                         ))
                     } else {
@@ -4712,9 +5079,10 @@ impl<'e> Vm<'e> {
                     let condition = self.pop()?;
                     // Rhai requires a boolean guard and reports the mismatch at
                     // the guard's own position (`eval/stmt.rs:487-490`).
-                    let holds = condition
-                        .as_bool()
-                        .map_err(|actual| self.mismatch::<bool>(actual, pos!()))?;
+                    let holds = match condition.as_bool() {
+                        Ok(holds) => holds,
+                        Err(actual) => return Err(self.mismatch::<bool>(actual, pos!())),
+                    };
                     if holds == (tag == code::tag::JUMP_IF_TRUE) {
                         transfer!(target);
                         continue;
@@ -4747,28 +5115,29 @@ impl<'e> Vm<'e> {
                         code::tag::BIN_OP_FROM_LOCAL | code::tag::BIN_OP_FROM_CONST => {
                             let slot = small!(6);
                             let index = base + slot as usize;
-                            if index >= scope.len() {
+                            if index >= scope_len!() {
                                 return Err(malformed(format!(
                                     "local slot {slot} is out of scope"
                                 )));
                             }
-                            let lhs = scope.get_mut_by_index(index).flatten_clone();
+                            let lhs = scope_entry!(index).flatten_clone();
                             let rhs = if tag == code::tag::BIN_OP_FROM_LOCAL {
                                 let slot = small!(8);
                                 let index = base + slot as usize;
-                                if index >= scope.len() {
+                                if index >= scope_len!() {
                                     return Err(malformed(format!(
                                         "local slot {slot} is out of scope"
                                     )));
                                 }
-                                scope.get_mut_by_index(index).flatten_clone()
+                                scope_entry!(index).flatten_clone()
                             } else {
                                 let index = u32::from(small!(8));
-                                or_raise!(
-                                    program.constant(index),
-                                    malformed(format!("no constant {index}"))
-                                )
-                                .clone()
+                                #[cfg(feature = "grain-jit")]
+                                let constant = jit::program_constant(program, index);
+                                #[cfg(not(feature = "grain-jit"))]
+                                let constant = program.constant(index);
+                                or_raise!(constant, malformed(format!("no constant {index}")))
+                                    .clone()
                             };
                             self.push(lhs);
                             self.push(rhs);
@@ -4790,7 +5159,7 @@ impl<'e> Vm<'e> {
                     // shared cell — falls through into the dispatch below and
                     // is answered by it. See
                     // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
-                    if typed && self.engine.fast_operators() {
+                    if typed && fast_operators!() {
                         let top = self.depth;
                         let under = or_raise!(top.checked_sub(2), {
                             malformed("operator with too few operands".to_string())
@@ -4799,18 +5168,22 @@ impl<'e> Vm<'e> {
                         // dispatch below reads the operator out of the pool
                         // and answers whatever it answers, which is what a
                         // verified program's byte can never make it do.
-                        if let Some(kind) = BinOpKind::from_byte(code[pc + 3]) {
-                            let applied = {
-                                let (lhs, rhs) = self.values().split_at(top - 1);
-                                apply_binary(kind, &lhs[under], &rhs[0])
-                            };
+                        if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
+                            let applied = apply_binary(
+                                kind,
+                                stack_ref(self, under),
+                                stack_ref(self, top - 1),
+                            );
                             if let Some(value) = applied {
                                 // No position stamped on the way out: under
                                 // `fast_operators` Rhai returns a built-in's
                                 // error untouched, which is why `1 / 0` has
                                 // none. See `dispatch_failure`.
-                                let value = value?;
-                                self.truncate_stack(under);
+                                let value = match value {
+                                    Ok(value) => value,
+                                    Err(error) => return Err(error),
+                                };
+                                truncate_stack!(under);
                                 self.push(value);
                                 pc += width;
                                 continue;
@@ -4826,15 +5199,15 @@ impl<'e> Vm<'e> {
                     // One value in and one out, so the operand's slot is where
                     // the result belongs and the stack does not change depth.
                     let unary = tag == code::tag::UN_OP;
-                    if unary && self.engine.fast_operators() {
+                    if unary && fast_operators!() {
                         let under = or_raise!(self.depth.checked_sub(1), {
                             malformed("operator with too few operands".to_string())
                         });
                         // An unknown kind byte is not an error here, as above:
                         // the dispatch below answers whatever it answers.
-                        if let Some(kind) = UnOpKind::from_byte(code[pc + 3]) {
-                            if let Some(value) = apply_unary(kind, &self.stack[under]) {
-                                self.stack[under] = value;
+                        if let Some(kind) = UnOpKind::from_byte(byte!(3)) {
+                            if let Some(value) = apply_unary(kind, stack_ref(self, under)) {
+                                *stack_mut(self, under) = value;
                                 pc += width;
                                 continue;
                             }
@@ -4854,7 +5227,7 @@ impl<'e> Vm<'e> {
                     } else if unary {
                         1
                     } else {
-                        code[pc + 3] as usize
+                        byte!(3) as usize
                     };
                     let op = if typed || tag == code::tag::CALL_OP {
                         let index = u32::from(small!(4));
@@ -4878,7 +5251,7 @@ impl<'e> Vm<'e> {
                     // same answer — including for a user-registered operator
                     // on a primitive, which Rhai's fast path also bypasses
                     // (`func/call.rs:1775-1799`).
-                    if let (Some(token), 2, true) = (op, argc, self.engine.fast_operators()) {
+                    if let (Some(token), 2, true) = (op, argc, fast_operators!()) {
                         let memo = &mut self.operator_memo;
                         let top = self.depth;
                         let (lhs, rhs) = self.stack[..top].split_at_mut(first + 1);
@@ -4894,7 +5267,7 @@ impl<'e> Vm<'e> {
                             let context = need_context
                                 .then(|| (self.engine, name, None, &self.global, pos!()).into());
                             let value = func(context, &mut [lhs, rhs])?;
-                            self.truncate_stack(first);
+                            truncate_stack!(first);
                             self.push(value);
                             pc += width;
                             continue;
@@ -4912,7 +5285,7 @@ impl<'e> Vm<'e> {
                         capture,
                         pos!(),
                     )?;
-                    self.truncate_stack(first);
+                    truncate_stack!(first);
                     self.push(value);
                 }
 
@@ -4927,7 +5300,7 @@ impl<'e> Vm<'e> {
                         program.name(name_index),
                         malformed(format!("no name {name_index}"))
                     );
-                    let argc = code[pc + 3] as usize;
+                    let argc = byte!(3) as usize;
                     // `this` is a register, so this one carries no operand for
                     // the receiver and is two bytes shorter.
                     let receiver = match tag {
@@ -4964,7 +5337,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::ROTATE => {
-                    let under = code[pc + 1] as usize;
+                    let under = byte!(1) as usize;
                     let top = or_raise!(
                         self.depth.checked_sub(1),
                         malformed("rotate on an empty stack".to_string())
@@ -5062,12 +5435,12 @@ impl<'e> Vm<'e> {
                 code::tag::LOAD_SHARED => {
                     let slot = small!(1);
                     let index = base + slot as usize;
-                    if index >= scope.len() {
+                    if index >= scope_len!() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     // Cloned, not flattened: cloning a shared `Dynamic` clones
                     // the `Rc`, which is the capture.
-                    self.push(scope.get_mut_by_index(index).clone());
+                    self.push(scope_entry!(index).clone());
                 }
 
                 // Emitted only for a closure capture, which cannot be parsed
@@ -5077,7 +5450,7 @@ impl<'e> Vm<'e> {
                     let entry = if tag == code::tag::SHARE {
                         let slot = small!(1);
                         let index = base + slot as usize;
-                        if index >= scope.len() {
+                        if index >= scope_len!() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
                         Some(index)
@@ -5100,7 +5473,7 @@ impl<'e> Vm<'e> {
                         // turned back round. Rhai reaches the same entry
                         // through `Scope::search`, which is not public
                         // (`eval/stmt.rs:1009`).
-                        let depth = scope.len();
+                        let depth = scope_len!();
                         let found = scope
                             .iter_raw()
                             .position(|(entry, ..)| entry == name)
@@ -5109,7 +5482,7 @@ impl<'e> Vm<'e> {
                     };
 
                     if let Some(index) = entry {
-                        let value = scope.get_mut_by_index(index);
+                        let value = scope_entry!(index);
                         if !value.is_shared() {
                             *value = value.take().into_shared();
                         }
@@ -5174,19 +5547,19 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::CURRY => {
-                    let argc = code[pc + 1] as usize;
+                    let argc = byte!(1) as usize;
                     let at = or_raise!(
                         self.depth.checked_sub(argc + 1),
                         malformed("curry is missing its target".into())
                     );
                     let mut pointer = or_raise!(
-                        self.stack[at].clone().try_cast::<FnPtr>(),
+                        clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
                         self.mismatch::<FnPtr>(self.stack[at].type_name(), pos!())
                     );
                     for value in self.take_values_from(at + 1) {
                         pointer.add_curry(value);
                     }
-                    self.truncate_stack(at);
+                    truncate_stack!(at);
                     self.push(pointer.into());
                 }
 
@@ -5195,7 +5568,7 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_FN_PTR_ON_LOCAL
                 | code::tag::CALL_FN_PTR_ON_NAMED
                 | code::tag::CALL_FN_PTR_ON_THIS => {
-                    let argc = code[pc + 1] as usize;
+                    let argc = byte!(1) as usize;
                     let method = tag != code::tag::CALL_FN_PTR;
                     let receiver = match tag {
                         code::tag::CALL_FN_PTR_ON_LOCAL => Some(Receiver::Local(small!(2))),
@@ -5270,11 +5643,10 @@ impl<'e> Vm<'e> {
                             break 'fast;
                         };
                         let at = base + small!(3) as usize;
-                        if at >= scope.len() {
+                        if at >= scope_len!() {
                             break 'fast;
                         }
-                        let Union::Array(array, _, AccessMode::ReadWrite) =
-                            &mut scope.get_mut_by_index(at).0
+                        let Union::Array(array, _, AccessMode::ReadWrite) = &mut scope_entry!(at).0
                         else {
                             break 'fast;
                         };
@@ -5302,18 +5674,23 @@ impl<'e> Vm<'e> {
                 code::tag::UNWIND_TO => {
                     let depth = small!(1);
                     let target = base + depth as usize;
-                    if target > scope.len() {
+                    if target > scope_len!() {
                         return Err(malformed(format!(
                             "unwind to {target} past a scope of {}",
-                            scope.len()
+                            scope_len!()
                         )));
                     }
                     scope.rewind(target);
                 }
 
-                code::tag::TICK => self.engine.track_operation(&mut self.global, pos!())?,
+                code::tag::TICK => {
+                    #[cfg(feature = "grain-jit")]
+                    jit::track_operation(self, pos!())?;
+                    #[cfg(not(feature = "grain-jit"))]
+                    self.engine.track_operation(&mut self.global, pos!())?;
+                }
 
-                code::tag::CHECKPOINT => self.unwind_floor = scope.len(),
+                code::tag::CHECKPOINT => self.unwind_floor = scope_len!(),
 
                 code::tag::STATEMENT => {
                     // Nothing to stop for without the interface to stop at, and
@@ -5337,7 +5714,7 @@ impl<'e> Vm<'e> {
                         target,
                         catch_var,
                         operands: self.depth,
-                        scope_len: scope.len(),
+                        scope_len: scope_len!(),
                         iters: self.iterators.len(),
                         caught: None,
                     });
@@ -5397,10 +5774,10 @@ impl<'e> Vm<'e> {
                         // the loop variable is written on every turn.
                         let slot = small!(5);
                         let index = base + slot as usize;
-                        if index >= scope.len() {
+                        if index >= scope_len!() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
-                        store_shared(scope.get_mut_by_index(index), value.flatten(), move || {
+                        store_shared(scope_entry!(index), value.flatten(), move || {
                             program.position(pc)
                         })?;
                         pc += width;
@@ -5416,13 +5793,11 @@ impl<'e> Vm<'e> {
                 code::tag::STORE_SHARED => {
                     let slot = small!(1);
                     let index = base + slot as usize;
-                    if index >= scope.len() {
+                    if index >= scope_len!() {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     let value = self.pop()?;
-                    store_shared(scope.get_mut_by_index(index), value, move || {
-                        program.position(pc)
-                    })?;
+                    store_shared(scope_entry!(index), value, move || program.position(pc))?;
                 }
 
                 code::tag::THROW => {
@@ -5436,7 +5811,7 @@ impl<'e> Vm<'e> {
                     let value = self.pop_or_unit();
                     // Whatever else this frame left behind goes with it, so a
                     // caller's stack is exactly as it was.
-                    self.truncate_stack(stack_base);
+                    truncate_stack!(stack_base);
                     return Ok(value);
                 }
 
@@ -5469,6 +5844,52 @@ mod tests {
     use crate::grain::format::Abi;
     use crate::grain::program::{Function, Parts};
     use crate::{CallFnOptions, Engine, Scope, INT};
+
+    /// The meta-tracer's `getarrayitem_gc_r` works on an array of references,
+    /// just as PyPy's value stack does.  The boxes are allocated only when the
+    /// frame grows; replacing a live operand must keep the slot address stable.
+    #[test]
+    #[cfg(feature = "grain-jit")]
+    fn jit_operand_slots_are_pointer_sized_and_reused() {
+        assert_eq!(
+            core::mem::size_of::<OperandSlot>(),
+            core::mem::size_of::<usize>()
+        );
+
+        let mut slot = operand_slot(Dynamic::from(1 as INT));
+        let address = operand_ref(&slot) as *const Dynamic;
+        set_operand(&mut slot, Dynamic::from(2 as INT));
+
+        assert_eq!(address, operand_ref(&slot) as *const Dynamic);
+        assert_eq!(operand_ref(&slot).as_int(), Ok(2));
+    }
+
+    #[test]
+    #[cfg(feature = "grain-jit")]
+    fn jit_restore_updates_only_the_current_frame_image() {
+        let engine = Engine::new();
+        let vm = Vm::new(&engine);
+        let mut scope = Scope::new();
+        let mut frame = GrainFrame {
+            scope: &mut scope,
+            base: 1,
+            reached: 2,
+            stack_base: 3,
+        };
+        let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
+        let vm_addr = &vm as *const Vm<'_> as usize as i64;
+        let scope_addr = frame.scope as *mut Scope<'_> as usize as i64;
+
+        frame.restore_from_jit(&[frame_addr, vm_addr, scope_addr, 10, 20, 30], &vm);
+        assert_eq!((frame.base, frame.reached, frame.stack_base), (10, 20, 30));
+
+        frame.restore_from_jit(&[frame_addr + 1, vm_addr, scope_addr, 40, 50, 60], &vm);
+        assert_eq!(
+            (frame.base, frame.reached, frame.stack_base),
+            (10, 20, 30),
+            "a resume image for another inlined frame must be ignored",
+        );
+    }
 
     /// A program of phantom functions, named `f` upwards in the order given.
     ///

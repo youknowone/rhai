@@ -119,16 +119,19 @@ pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<Dynami
     if let Some(value) = int_arithmetic(kind, x, y) {
         return Some(value.map(Into::into));
     }
-    int_comparison(kind, x, y).map(|held| Ok(held.into()))
+    match int_comparison(kind, x, y) {
+        Some(held) => Some(Ok(held.into())),
+        None => None,
+    }
 }
 
-/// `x op= y` for two integers, applied in place.
+/// `x op= y` for two integers, returning the value to write back.
 ///
 /// Mirrors the `(Union::Int(..), Union::Int(..), _)` arm of
-/// [`get_builtin_op_assignment_fn`], which writes the result back through
-/// `write_lock` — a plain `downcast_mut` for an unshared value, so the tag and
-/// the access mode of the target survive and only the integer changes. Writing
-/// into the union field is that write.
+/// [`get_builtin_op_assignment_fn`].  The caller owns the `Dynamic` container
+/// and writes this scalar back while preserving its tag and access mode.  This
+/// value-returning boundary also matches the generated JIT's scalar ABI:
+/// RPython has no pointer-to-Signed representation for a Rust `&mut i64`.
 ///
 /// The two arms share `int_arithmetic` because Rhai's two tables do: `+=` and
 /// `+` resolve to the same `add`, and an op-assignment that overflows reports
@@ -141,14 +144,8 @@ pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<Dynami
 ///
 /// [`get_builtin_op_assignment_fn`]: crate::func::get_builtin_op_assignment_fn
 #[inline]
-pub fn int_assign(kind: BinOpKind, target: &mut INT, y: INT) -> Option<RhaiResultOf<()>> {
-    Some(match int_arithmetic(kind, *target, y)? {
-        Ok(value) => {
-            *target = value;
-            Ok(())
-        }
-        Err(err) => Err(err),
-    })
+pub fn int_assign(kind: BinOpKind, x: INT, y: INT) -> Option<RhaiResultOf<INT>> {
+    int_arithmetic(kind, x, y)
 }
 
 /// `x op y` for a pair the float rules cover, or `None` for an operator this
@@ -185,7 +182,7 @@ fn float_arithmetic(kind: BinOpKind, x: FLOAT, y: FLOAT) -> Option<FLOAT> {
     })
 }
 
-/// `x op= y` where the target is a float, applied in place.
+/// `x op= y` where the target is a float, returning the value to write back.
 ///
 /// `impl_float!` in the op-assignment table is `*write_lock::<FLOAT>() op= y`
 /// for the five arithmetic forms and `x.powf(y)` for `**=`, in both builds —
@@ -193,9 +190,8 @@ fn float_arithmetic(kind: BinOpKind, x: FLOAT, y: FLOAT) -> Option<FLOAT> {
 /// tag and access mode survive for the same reason the integer case's do.
 #[cfg(not(feature = "no_float"))]
 #[inline]
-pub fn float_assign(kind: BinOpKind, target: &mut FLOAT, y: FLOAT) -> Option<()> {
-    *target = float_arithmetic(kind, *target, y)?;
-    Some(())
+pub fn float_assign(kind: BinOpKind, x: FLOAT, y: FLOAT) -> Option<FLOAT> {
+    float_arithmetic(kind, x, y)
 }
 
 /// Widen an operand to [`FLOAT`] if the float rules apply to it at all.

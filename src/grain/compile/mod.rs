@@ -18,8 +18,7 @@ use crate::{Dynamic, ImmutableString, Position, AST};
 
 use crate::grain::bytecode::{
     assemble, resolve_switch_targets, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Op, Positions,
-    Receiver,
-    Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind,
+    Receiver, Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind,
 };
 use crate::grain::compile::poolable::is_poolable;
 use crate::grain::compile::slots::Slots;
@@ -2844,9 +2843,7 @@ fn index_set_slot(chain: &Chain) -> Option<u16> {
         return None;
     };
     let [Step::Index {
-        operand: 0,
-        flags,
-        ..
+        operand: 0, flags, ..
     }] = chain.steps[..]
     else {
         return None;

@@ -1239,8 +1239,8 @@ impl Engine {
                             .collect::<FnArgsVec<_>>();
 
                         self.exec_fn_call(
-                            global, caches, None, fn_name, None, hash, args, is_ref_mut, true,
-                            pos, None,
+                            global, caches, None, fn_name, None, hash, args, is_ref_mut, true, pos,
+                            None,
                         )
                     }
                     _ => unreachable!(),

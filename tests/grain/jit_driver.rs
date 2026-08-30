@@ -8,8 +8,8 @@
 //! portal's `BC_JIT_MERGE_POINT` payload, a liveness stream whose opcode
 //! numbering is not the one the bodies were assembled against, live values
 //! whose kinds do not match the declared reds. The last of those is the one
-//! this VM would hit first, because three of its four reds are Ref and the
-//! `JitState` default types every red Int.
+//! this VM would hit first, because both reds are Ref and the `JitState`
+//! default types every red Int.
 
 use majit_metainterp::{JitDriver, JitState};
 use rhai::grain::{jit_state, jitcodes, Compiler, Vm};
@@ -46,12 +46,12 @@ fn the_descriptor_is_the_shape_the_build_recorded() {
 
     let greens: Vec<_> = jd.greens().iter().map(|var| var.tp).collect();
     let reds: Vec<_> = jd.reds().iter().map(|var| var.tp).collect();
-    assert_eq!(greens, [majit_ir::Type::Int, majit_ir::Type::Ref]);
-    assert_eq!(reds, [majit_ir::Type::Ref, majit_ir::Type::Ref, majit_ir::Type::Int, majit_ir::Type::Ref,],);
+    assert_eq!(greens, [majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Ref],);
+    assert_eq!(reds, [majit_ir::Type::Ref, majit_ir::Type::Ref]);
     // `warmspot.py:664` derives one history-kind char per red; the descriptor
     // does the same, so this is the same list twice and disagreeing would mean
     // the descriptor's two accounts of its reds had diverged.
-    assert_eq!(jd.red_args_types, vec!['r', 'r', 'i', 'r']);
+    assert_eq!(jd.red_args_types, vec!['r', 'r']);
 }
 
 /// The gate that declines quietly.
@@ -71,13 +71,27 @@ fn the_live_values_carry_the_kinds_the_descriptor_declares() {
     let state = jit_state::GrainJitState::default();
 
     // One raw word per red, as the merge point would pass them.
-    let env: Vec<i64> = vec![0x1000, 0x2000, 7, 0x3000];
+    let env: Vec<i64> = vec![0x1000, 0x2000];
     let meta = state.build_meta(jitcodes::portal_merge_point_offset().expect("the portal names its merge point"), &env);
 
     assert_eq!(state.extract_live(&meta), env);
     let types: Vec<_> = state.extract_live_values(&meta).iter().map(majit_ir::Value::get_type).collect();
     let declared: Vec<_> = jd.reds().iter().map(|var| var.tp).collect();
     assert_eq!(types, declared, "a live value whose type differs from its red's makes the driver decline silently",);
+}
+
+#[test]
+fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
+    let info = <jit_state::GrainJitState as JitState>::__build_virtualizable_info().expect("the frame red has runtime virtualizable metadata");
+
+    assert_eq!(info.name, "frame");
+    assert!(!info.has_vable_token(), "a stack-resident GrainFrame has no force token");
+    assert_eq!(info.identity_live_index, Some(0));
+    assert_eq!(info.identity_ref_bank_index, Some(0));
+    assert_eq!(
+        info.static_fields.iter().map(|field| (field.name.as_str(), field.field_type)).collect::<Vec<_>>(),
+        [("scope", majit_ir::Type::Ref), ("base", majit_ir::Type::Int), ("reached", majit_ir::Type::Int), ("stack_base", majit_ir::Type::Int),],
+    );
 }
 
 /// The state gate refuses an artifact before majit's backend-entry hook.
@@ -90,7 +104,7 @@ fn the_state_actively_refuses_compiled_entry() {
     jit_state::reset_stats();
     let state = jit_state::GrainJitState::default();
     let header_pc = jitcodes::portal_merge_point_offset().expect("the portal names its merge point");
-    let meta = state.build_meta(header_pc, &[0x1000, 0x2000, 7, 0x3000][..]);
+    let meta = state.build_meta(header_pc, &[0x1000, 0x2000][..]);
 
     assert!(!state.is_compatible(&meta), "unbound residual targets make every compiled artifact incompatible",);
     let stats = jit_state::stats();
@@ -107,7 +121,7 @@ fn the_symbolic_reds_are_input_args_in_declaration_order() {
     }
     let state = jit_state::GrainJitState::default();
     let header_pc = jitcodes::portal_merge_point_offset().expect("the portal names its merge point");
-    let meta = state.build_meta(header_pc, &[0x1000, 0x2000, 7, 0x3000][..]);
+    let meta = state.build_meta(header_pc, &[0x1000, 0x2000][..]);
     let sym = jit_state::GrainJitState::create_sym(&meta, header_pc);
 
     let expected: Vec<_> = jit_state::red_kinds().iter().enumerate().map(|(k, tp)| majit_ir::OpRef::input_arg_typed(k as u32, *tp)).collect();
@@ -172,6 +186,13 @@ fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
     }
 
     jit_state::reset_stats();
+    if std::env::var_os("RHAI_GRAIN_JIT_TRACE").is_some() {
+        for jitcode in jitcodes::all() {
+            if matches!(jitcode.name(), "store_builtin" | "apply_assign" | "int_assign") {
+                eprintln!("[grain-jitcode-dump] {}\n{}", jitcode.name(), jitcode.dump());
+            }
+        }
+    }
     let engine = Engine::new();
     let ast = engine
         .compile(
@@ -197,8 +218,8 @@ fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
     assert_eq!(stats.loops_compiled, 0, "the unbound residual boundary is reached before loop compilation: {stats:?}",);
     assert_eq!(stats.traces_aborted, stats.traces_started, "every trace attempt must end at the observed abort boundary: {stats:?}",);
     assert_eq!(stats.symbolic_residual_aborts, stats.traces_started, "the abort reason must be the actively refused symbolic residual: {stats:?}",);
-    assert_eq!(stats.max_trace_ops, 5, "the current portal records five prefix ops before the residual boundary: {stats:?}",);
-    assert_eq!(stats.ops_recorded, stats.max_trace_ops * stats.traces_started, "each attempt records the same five-op portal prefix: {stats:?}",);
+    assert_eq!(stats.max_trace_ops, 1, "tracing starts at the merge point instead of replaying run_frame's max_stack/reserve_stack prologue: {stats:?}",);
+    assert_eq!(stats.ops_recorded, stats.max_trace_ops * stats.traces_started, "each attempt records the same one-op prefix before Cow.deref: {stats:?}",);
     assert_eq!(stats.compiled_entries, 0, "the immediately-before-backend-entry hook must remain unreachable: {stats:?}",);
     assert_eq!(stats.non_owner_consultations_declined, 0, "the observation run must own its driver: {stats:?}",);
     assert_eq!(stats.reentrant_consultations_declined, 0, "the observation run must not hide nested consultations: {stats:?}",);

@@ -17,7 +17,7 @@
 //! shadow. The trace path stops before that instruction, and the state refuses
 //! the driver's compatibility check before any backend body can run.
 
-use majit_ir::{OpRef, Type};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use super::jitcodes;
@@ -105,7 +105,7 @@ fn driver() -> &'static majit_translate::CompiledJitDriver {
 ///
 /// This is the list [`JitDriver::live_values_match_descriptor`] checks the live
 /// values against. Its default in [`JitState`] types every red `Int`, which for
-/// this VM would misdescribe three of the four and make the driver decline to
+/// this VM would misdescribe both reference reds and make the driver decline to
 /// trace without saying so.
 pub fn red_kinds() -> &'static [Type] {
     &driver().red_args_types
@@ -194,6 +194,12 @@ pub struct GrainJitState {
     pub last_restored: Vec<i64>,
 }
 
+impl GrainJitState {
+    pub(super) fn take_restored(&mut self) -> Vec<i64> {
+        core::mem::take(&mut self.last_restored)
+    }
+}
+
 impl JitState for GrainJitState {
     type Meta = GrainMeta;
     type Sym = GrainSym;
@@ -243,9 +249,73 @@ impl JitState for GrainJitState {
         false
     }
 
+    fn virtualizable_heap_ptr(
+        &self,
+        meta: &Self::Meta,
+        virtualizable: &str,
+        _info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    ) -> Option<*mut u8> {
+        (virtualizable == "frame")
+            .then(|| meta.reds.first().copied())
+            .flatten()
+            .map(|frame| frame as usize as *mut u8)
+    }
+
+    #[allow(non_snake_case)]
+    fn __build_virtualizable_info(
+    ) -> Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
+        use super::GrainFrame;
+        use majit_metainterp::virtualizable::VirtualizableInfo;
+
+        // `GrainFrame` is a stack-resident interpreter frame, so it has no
+        // heap force token.  Its identity is red #0 and ref-bank input #0.
+        let mut info = VirtualizableInfo::without_vable_token();
+        info.name = "frame".to_string();
+        info.identity_live_index = Some(0);
+        info.identity_ref_bank_index = Some(0);
+        info.add_field(
+            "scope",
+            Type::Ref,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, scope),
+        );
+        info.add_field(
+            "base",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, base),
+        );
+        info.add_field(
+            "reached",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, reached),
+        );
+        info.add_field(
+            "stack_base",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, stack_base),
+        );
+        Some(
+            info.finalize_arc(majit_ir::descr::make_size_descr(core::mem::size_of::<
+                GrainFrame<'static, 'static>,
+            >())),
+        )
+    }
+
     fn restore(&mut self, meta: &Self::Meta, values: &[i64]) {
         let _ = meta;
         self.last_restored = values.to_vec();
+    }
+
+    fn restore_values(&mut self, meta: &Self::Meta, values: &[Value]) {
+        let _ = meta;
+        self.last_restored = values
+            .iter()
+            .map(|value| match value {
+                Value::Int(value) => *value,
+                Value::Ref(value) => value.as_usize() as i64,
+                Value::Float(value) => value.to_bits() as i64,
+                Value::Void => 0,
+            })
+            .collect();
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {

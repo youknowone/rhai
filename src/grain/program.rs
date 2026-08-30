@@ -73,6 +73,17 @@ pub struct Function {
 /// artifact format refuses to write a `Program` that has any, so nothing
 /// reaching a device can depend on them.
 pub struct Program<'a> {
+    /// Process-unique identity used by the tracing JIT's green key.
+    ///
+    /// A `Program` is commonly a stack local.  Its address can therefore be
+    /// reused by the next program after it is dropped, while majit's warm
+    /// cells outlive both values.  The address remains a green because the
+    /// lowered portal reads this exact immutable program, but the identity is
+    /// the generation that prevents an old cell from accepting a new value at
+    /// the same address.
+    #[cfg(feature = "grain-jit")]
+    jit_identity: u64,
+
     /// The capabilities required by this program's instructions.
     caps: Caps,
 
@@ -293,6 +304,10 @@ impl<'a> Program<'a> {
         functions: Vec<Function>,
         parts: Parts<'a>,
     ) -> Self {
+        #[cfg(feature = "grain-jit")]
+        static NEXT_JIT_IDENTITY: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
+
         let has_typed_methods = functions.iter().any(|f| f.this_type.is_some());
 
         // Derived here so a program means the same whether it was compiled or
@@ -312,6 +327,8 @@ impl<'a> Program<'a> {
         });
 
         let mut program = Self {
+            #[cfg(feature = "grain-jit")]
+            jit_identity: NEXT_JIT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             caps,
             code,
             main,
@@ -343,6 +360,8 @@ impl<'a> Program<'a> {
     #[must_use]
     pub fn into_owned(self) -> Program<'static> {
         Program {
+            #[cfg(feature = "grain-jit")]
+            jit_identity: self.jit_identity,
             code: Code::Owned(self.code.into_owned()),
             caps: self.caps,
             main: self.main,
@@ -363,6 +382,12 @@ impl<'a> Program<'a> {
             resolver: self.resolver,
             source: self.source,
         }
+    }
+
+    /// The generation paired with this program's address in a JIT green key.
+    #[cfg(feature = "grain-jit")]
+    pub(crate) const fn jit_identity(&self) -> u64 {
+        self.jit_identity
     }
 
     /// Give up the artifact and share the program, so a native can be handed a
@@ -838,6 +863,17 @@ mod tests {
         // The typed one takes an argument, so a no-argument call is the untyped.
         assert_eq!(program.method(0, 0, "i64").unwrap().this_type, None);
         assert_eq!(program.method(0, 1, "i64").unwrap().this_type, Some(1));
+    }
+
+    #[test]
+    #[cfg(feature = "grain-jit")]
+    fn jit_identity_distinguishes_instances_and_survives_ownership_conversion() {
+        let first = program_of(&[]);
+        let second = program_of(&[]);
+
+        assert_ne!(first.jit_identity(), second.jit_identity());
+        let identity = first.jit_identity();
+        assert_eq!(first.into_owned().jit_identity(), identity);
     }
 
     #[test]

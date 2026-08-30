@@ -101,6 +101,17 @@ fn main() {
     let config = majit_translate::AnalyzeConfig {
         pipeline: majit_translate::PipelineConfig {
             transform: majit_translate::GraphTransformConfig {
+                vable_fields: ["scope", "base", "reached", "stack_base"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        majit_translate::VirtualizableFieldDescriptor::new(
+                            name,
+                            Some("GrainFrame".to_string()),
+                            index,
+                        )
+                    })
+                    .collect(),
                 // The VM's merge point is a method on rhai's own driver type
                 // (`grain::vm::jit::GrainJitDriver`), not on pyre's, so the
                 // recogniser is pointed at it. Without this the portal lowers
@@ -124,23 +135,21 @@ fn main() {
                     "Vm",
                     "run_frame",
                 ]),
-                greens: vec!["pc".to_string(), "program".to_string()],
-                reds: vec![
-                    "vm".to_string(),
-                    "scope".to_string(),
-                    "base".to_string(),
-                    "reached".to_string(),
+                greens: vec![
+                    "pc".to_string(),
+                    "program_identity".to_string(),
+                    "program".to_string(),
                 ],
-                green_kinds: vec![majit_ir::Type::Int, majit_ir::Type::Ref],
-                red_kinds: vec![
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Ref,
+                reds: vec!["frame".to_string(), "vm".to_string()],
+                green_kinds: vec![
+                    majit_ir::Type::Int,
                     majit_ir::Type::Int,
                     majit_ir::Type::Ref,
                 ],
+                red_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
                 autoreds: false,
-                virtualizables: Vec::new(),
-                red_types: Vec::new(),
+                virtualizables: vec!["frame".to_string()],
+                red_types: vec!["GrainFrame".to_string(), "Vm".to_string()],
             }],
         },
     };

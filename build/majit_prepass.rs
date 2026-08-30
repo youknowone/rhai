@@ -95,30 +95,28 @@ pub fn main() {
 
 /// The declaration the merge point's signature has to agree with.
 ///
-/// `GrainJitDriver::jit_merge_point(pc, program, vm, scope, base, reached)`
+/// `GrainJitDriver::jit_merge_point(pc, program_identity, program, frame, vm)`
 /// spells the same split positionally and nothing checks the two against each
 /// other at compile time — the lowering does, at `check_jit_marker_operand_kinds`,
 /// and only once both halves are in the same build.
 fn jit_driver() -> majit_translate::JitDriverSpec {
     majit_translate::JitDriverSpec {
         portal: majit_translate::CallPath::from_segments(["grain", "vm", "Vm", "run_frame"]),
-        greens: vec!["pc".to_string(), "program".to_string()],
-        reds: vec![
-            "vm".to_string(),
-            "scope".to_string(),
-            "base".to_string(),
-            "reached".to_string(),
+        greens: vec![
+            "pc".to_string(),
+            "program_identity".to_string(),
+            "program".to_string(),
         ],
-        green_kinds: vec![majit_ir::Type::Int, majit_ir::Type::Ref],
-        red_kinds: vec![
-            majit_ir::Type::Ref,
-            majit_ir::Type::Ref,
+        reds: vec!["frame".to_string(), "vm".to_string()],
+        green_kinds: vec![
+            majit_ir::Type::Int,
             majit_ir::Type::Int,
             majit_ir::Type::Ref,
         ],
+        red_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
         autoreds: false,
-        virtualizables: Vec::new(),
-        red_types: Vec::new(),
+        virtualizables: vec!["frame".to_string()],
+        red_types: vec!["GrainFrame".to_string(), "Vm".to_string()],
     }
 }
 
@@ -127,6 +125,17 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
     let config = majit_translate::AnalyzeConfig {
         pipeline: majit_translate::PipelineConfig {
             transform: majit_translate::GraphTransformConfig {
+                vable_fields: ["scope", "base", "reached", "stack_base"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        majit_translate::VirtualizableFieldDescriptor::new(
+                            name,
+                            Some("GrainFrame".to_string()),
+                            index,
+                        )
+                    })
+                    .collect(),
                 // The merge point is a method on this VM's own driver type, so
                 // the recogniser is pointed at it. Left at its default the
                 // marker is not recognised as a marker, the portal lowers with
