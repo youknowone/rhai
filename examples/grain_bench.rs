@@ -41,25 +41,39 @@ struct Case {
     floor: f64,
 }
 
-/// The fastest sample, and how much slower the middle one was.
+/// One leg's samples, one per script run.
 ///
-/// Noise on a timing is one-sided — nothing makes a run finish sooner than it
-/// can — so the fastest sample is the least contaminated estimate, and the
-/// median is here only to say how contaminated the rest were. A wide spread
-/// means the number below it should not be read closely.
-struct Timing {
-    fastest: Duration,
-    median: Duration,
-}
+/// Held as the whole list rather than a summary because the estimate and the
+/// account of how trustworthy it is are two different reductions of it.
+struct Leg(Vec<Duration>);
 
-impl Timing {
+impl Leg {
+    /// The least contaminated sample, in seconds.
+    ///
+    /// Noise on a duration is one-sided -- nothing makes a run finish sooner
+    /// than it can -- so the fastest sample is the estimate, and a *ratio* of
+    /// two such estimates is a better one than the middle of a list of
+    /// per-pair ratios: those multiply both legs' noise together, and a run on
+    /// 2026-08-30 that graded that way read one unchanged case at 1.90x,
+    /// 3.40x and 2.38x.
     fn secs(&self) -> f64 {
-        self.fastest.as_secs_f64()
+        self.0
+            .iter()
+            .min()
+            .expect("a leg takes at least one sample")
+            .as_secs_f64()
     }
 
-    /// How far the median sits above the fastest, as a fraction.
+    /// How far the middle sample sits above the fastest, as a fraction.
+    ///
+    /// What this says is whether the fastest sample found a quiet slice. Near
+    /// zero, every sample agrees and the estimate is the cost; large, most
+    /// samples were contended and only the reader knows whether one of them
+    /// escaped.
     fn spread(&self) -> f64 {
-        self.median.as_secs_f64() / self.fastest.as_secs_f64() - 1.0
+        let mut sorted = self.0.clone();
+        sorted.sort_unstable();
+        sorted[sorted.len() / 2].as_secs_f64() / self.secs() - 1.0
     }
 }
 
@@ -207,19 +221,44 @@ fn build_line() -> String {
     format!("build: {BUILD}{tables}")
 }
 
-fn time(mut run: impl FnMut()) -> Timing {
-    let mut samples: Vec<Duration> = (0..RUNS)
-        .map(|_| {
-            let start = Instant::now();
-            run();
-            start.elapsed()
-        })
-        .collect();
-    samples.sort_unstable();
-    Timing {
-        fastest: samples[0],
-        median: samples[RUNS / 2],
+fn once(run: &mut impl FnMut()) -> Duration {
+    let start = Instant::now();
+    run();
+    start.elapsed()
+}
+
+fn time(samples: usize, mut run: impl FnMut()) -> Leg {
+    Leg((0..samples).map(|_| once(&mut run)).collect())
+}
+
+/// Sample two legs against each other, alternating one script run at a time.
+///
+/// Measuring one leg to its end and then the other makes the ratio only as
+/// good as the machine holding still in between, and on a busy one it does
+/// not: three runs on 2026-08-30 read `float arithmetic` -- whose lowering
+/// nothing in that diff touched -- at 1.45x, 2.13x and 0.82x, because each
+/// leg met a different minute.
+///
+/// Alternating per *run* rather than per batch is what matters: it gives the
+/// two legs the same load to be unlucky in, and it makes each leg's sample
+/// short, so the fastest of many has somewhere quiet to land. Which leg leads
+/// alternates too, so a burst beginning mid-pair does not always cost the
+/// same one.
+fn time_paired(samples: usize, mut walker: impl FnMut(), mut vm: impl FnMut()) -> (Leg, Leg) {
+    let mut walked = Vec::with_capacity(samples);
+    let mut ran = Vec::with_capacity(samples);
+
+    for sample in 0..samples {
+        if sample % 2 == 0 {
+            walked.push(once(&mut walker));
+            ran.push(once(&mut vm));
+        } else {
+            ran.push(once(&mut vm));
+            walked.push(once(&mut walker));
+        }
     }
+
+    (Leg(walked), Leg(ran))
 }
 
 /// The three-field load average, as the kernel reports it.
@@ -299,19 +338,21 @@ fn main() {
             case.name,
         );
 
-        let walker = time(|| {
-            for _ in 0..case.iterations {
+        // One script run per sample, so the two legs alternate closely and
+        // the fastest of many has somewhere quiet to land. The count is the
+        // same total work the batched form did.
+        let samples = RUNS * case.iterations;
+        let (walker, vm) = time_paired(
+            samples,
+            || {
                 let _ = engine
                     .eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &ast)
                     .unwrap();
-            }
-        });
-
-        let vm = time(|| {
-            for _ in 0..case.iterations {
+            },
+            || {
                 let _ = run_vm().unwrap();
-            }
-        });
+            },
+        );
         #[cfg(feature = "grain-jit")]
         {
             let jit = jit_state::stats();
@@ -342,29 +383,29 @@ fn main() {
         }
 
         let slow_ast = slow_engine.compile(case.source).expect("must compile");
-        let walker_slow = time(|| {
-            for _ in 0..case.iterations {
-                let _ = slow_engine
-                    .eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &slow_ast)
-                    .unwrap();
-            }
+        let walker_slow = time(samples, || {
+            let _ = slow_engine
+                .eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &slow_ast)
+                .unwrap();
         });
 
-        // `speedup` is a ratio, so its contamination is whichever of its two
-        // legs was dirtier -- reporting only the VM's hid a walker leg that
-        // ran under load, and a walker knocked sideways is indistinguishable
-        // from a VM that got slower once the number reaches a `tax` column.
+        // A ratio of two fastest samples rather than the middle of the
+        // per-sample ratios: those multiply both legs' noise together, and the
+        // alternation above is what makes the two fastests comparable.
         let speedup = walker.secs() / vm.secs();
         let spread = walker.spread().max(vm.spread());
+        // The columns still report what `iterations` runs cost, so they stay
+        // the size they were when a sample was a batch of that many.
+        let batch = case.iterations as f64 * 1000.0;
         println!(
             "{:<22} {:>9.1}ms {:>9.1}ms {:>8.2}x {:>6.2}x {:>7.0}% {:>9.1}ms {:>10}",
             case.name,
-            walker.secs() * 1000.0,
-            vm.secs() * 1000.0,
+            walker.secs() * batch,
+            vm.secs() * batch,
             speedup,
             case.floor,
             spread * 100.0,
-            walker_slow.secs() * 1000.0,
+            walker_slow.secs() * batch,
             program.residual_nodes(),
         );
 
