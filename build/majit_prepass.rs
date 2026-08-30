@@ -40,6 +40,32 @@ const RHAI_ERROR_CARRIER: majit_translate::ErrorCarrierSpec<'static> =
         from_exc_object: None,
     };
 
+/// The scalar stores this VM performs through a `&mut Dynamic`.
+///
+/// A `Dynamic` holds its `Union` inline, so an op-assignment writes the live
+/// variant's payload field in place rather than replacing the value. The
+/// lowering has no path into that store on its own — the helper borrows a
+/// `&mut INT` / `&mut FLOAT` into the variant, and a pointer to a primitive
+/// has no repr there — so the boundary is named here, next to the error
+/// carrier and for the same reason.
+///
+/// `dynamic_store_float` does not exist under `no_float`; an entry naming a
+/// function the artefact does not carry matches nothing.
+const RHAI_SCALAR_FIELD_STORES: &[majit_translate::ScalarFieldStore<'static>] = &[
+    majit_translate::ScalarFieldStore {
+        function_path: "rhai::grain::vm::jit::dynamic_store_int",
+        owner_root: "types::dynamic::Union::Int",
+        field: "__pos_0",
+        bank: majit_translate::ScalarBank::Int,
+    },
+    majit_translate::ScalarFieldStore {
+        function_path: "rhai::grain::vm::jit::dynamic_store_float",
+        owner_root: "types::dynamic::Union::Float",
+        field: "__pos_0",
+        bank: majit_translate::ScalarBank::Float,
+    },
+];
+
 /// Where the extracted MIR is read from. Named by `majit-translate`'s front
 /// end, not by this build, so a consumer pointing several artefacts at one
 /// lowering uses the platform path separator as it would for `PATH`.
@@ -102,6 +128,12 @@ pub fn main() {
 fn jit_driver() -> majit_translate::JitDriverSpec {
     majit_translate::JitDriverSpec {
         portal: majit_translate::CallPath::from_segments(["grain", "vm", "Vm", "run_frame"]),
+        // This VM enters its portal directly. There is no synthetic runner to
+        // name, so no call classifies as recursive through one, and the
+        // configured portal path is registered as written rather than against
+        // a copy split before the marker.
+        portal_runner: None,
+        split_portal: false,
         greens: vec![
             "pc".to_string(),
             "program_identity".to_string(),
@@ -170,6 +202,7 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
     };
     let static_addrs = majit_translate::HostStaticAddrs {
         error_carrier: RHAI_ERROR_CARRIER,
+        scalar_field_stores: RHAI_SCALAR_FIELD_STORES,
         ..Default::default()
     };
 
