@@ -241,6 +241,21 @@ pub mod tag {
 
     /// [`Op::IndexGet`](super::Op::IndexGet).
     pub const INDEX_GET: u8 = 0x55;
+    /// [`Op::IndexGet`](super::Op::IndexGet) with the index in a slot.
+    ///
+    /// The same operand layout as [`INDEX_GET`] with that slot after it, so
+    /// the three share a dispatch arm and one fallback — as
+    /// [`BIN_OP_RHS_LOCAL`] and [`BIN_OP_RHS_CONST`] do with [`BIN_OP`].
+    pub const INDEX_GET_FROM_LOCAL: u8 = 0x56;
+    /// [`Op::IndexGet`](super::Op::IndexGet) with a constant index.
+    pub const INDEX_GET_FROM_CONST: u8 = 0x57;
+    /// [`Op::IndexSet`](super::Op::IndexSet) with the index in a slot.
+    ///
+    /// The same operand layout as [`INDEX_SET`] with that slot after it, on
+    /// the pattern [`INDEX_GET_FROM_LOCAL`] follows.
+    pub const INDEX_SET_FROM_LOCAL: u8 = 0x58;
+    /// [`Op::IndexSet`](super::Op::IndexSet) with a constant index.
+    pub const INDEX_SET_FROM_CONST: u8 = 0x59;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -349,6 +364,11 @@ static WIDTHS: [u8; 256] = {
 
     widths[tag::ASSIGN_LOCAL_FROM_OP as usize] = 9;
     widths[tag::ASSIGN_LOCAL_FROM_CONST_OP as usize] = 9;
+
+    widths[tag::INDEX_GET_FROM_LOCAL as usize] = 7;
+    widths[tag::INDEX_GET_FROM_CONST as usize] = 7;
+    widths[tag::INDEX_SET_FROM_LOCAL as usize] = 7;
+    widths[tag::INDEX_SET_FROM_CONST as usize] = 7;
 
     widths[tag::BIN_OP_RHS_LOCAL as usize] = 8;
     widths[tag::BIN_OP_RHS_CONST as usize] = 8;
@@ -702,16 +722,25 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&small(*index as usize, "chains")?.to_le_bytes());
             }
 
-            Op::IndexSet { chain, slot } => {
-                code.push(tag::INDEX_SET);
+            Op::IndexSet { chain, slot, index } | Op::IndexGet { chain, slot, index } => {
+                let reads = matches!(op, Op::IndexGet { .. });
+                code.push(match (index, reads) {
+                    (None, false) => tag::INDEX_SET,
+                    (Some(BinOperand::Local(..)), false) => tag::INDEX_SET_FROM_LOCAL,
+                    (Some(BinOperand::Const(..)), false) => tag::INDEX_SET_FROM_CONST,
+                    (None, true) => tag::INDEX_GET,
+                    (Some(BinOperand::Local(..)), true) => tag::INDEX_GET_FROM_LOCAL,
+                    (Some(BinOperand::Const(..)), true) => tag::INDEX_GET_FROM_CONST,
+                });
                 code.extend_from_slice(&small(*chain as usize, "chains")?.to_le_bytes());
                 code.extend_from_slice(&slot.to_le_bytes());
-            }
-
-            Op::IndexGet { chain, slot } => {
-                code.push(tag::INDEX_GET);
-                code.extend_from_slice(&small(*chain as usize, "chains")?.to_le_bytes());
-                code.extend_from_slice(&slot.to_le_bytes());
+                if let Some(index) = index {
+                    let index = match index {
+                        BinOperand::Local(slot) => *slot,
+                        BinOperand::Const(index) => small(*index as usize, "constants")?,
+                    };
+                    code.extend_from_slice(&index.to_le_bytes());
+                }
             }
 
             Op::MakeArray(len) => {
@@ -985,12 +1014,18 @@ fn encoded_width(op: &Op) -> usize {
         | Op::JumpIfFalse { .. }
         | Op::SkipIfNotUnit { .. }
         | Op::IterNext { .. }
-        | Op::IndexSet { .. }
-        | Op::IndexGet { .. }
+        | Op::IndexSet { index: None, .. }
+        | Op::IndexGet { index: None, .. }
         | Op::PushHandler {
             catch_var: None, ..
         } => 5,
-        Op::PushHandler {
+        Op::IndexSet {
+            index: Some(..), ..
+        }
+        | Op::IndexGet {
+            index: Some(..), ..
+        }
+        | Op::PushHandler {
             catch_var: Some(..),
             ..
         } => 7,
@@ -1163,14 +1198,33 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         tag::ROTATE => Op::Rotate(code[at + 1]),
 
         tag::CHAIN => Op::Chain(u32::from(small(1)?)),
-        tag::INDEX_SET => Op::IndexSet {
-            chain: u32::from(small(1)?),
-            slot: small(3)?,
-        },
-        tag::INDEX_GET => Op::IndexGet {
-            chain: u32::from(small(1)?),
-            slot: small(3)?,
-        },
+        // The six share one operand layout and differ in two things: whether
+        // the instruction reads or writes, and whether it names its index.
+        // The operand word is only read where a tag says it is there.
+        tag::INDEX_SET
+        | tag::INDEX_SET_FROM_LOCAL
+        | tag::INDEX_SET_FROM_CONST
+        | tag::INDEX_GET
+        | tag::INDEX_GET_FROM_LOCAL
+        | tag::INDEX_GET_FROM_CONST => {
+            let chain = u32::from(small(1)?);
+            let slot = small(3)?;
+            let index = match code[at] {
+                tag::INDEX_SET_FROM_LOCAL | tag::INDEX_GET_FROM_LOCAL => {
+                    Some(BinOperand::Local(small(5)?))
+                }
+                tag::INDEX_SET_FROM_CONST | tag::INDEX_GET_FROM_CONST => {
+                    Some(BinOperand::Const(u32::from(small(5)?)))
+                }
+                _ => None,
+            };
+            match code[at] {
+                tag::INDEX_SET | tag::INDEX_SET_FROM_LOCAL | tag::INDEX_SET_FROM_CONST => {
+                    Op::IndexSet { chain, slot, index }
+                }
+                _ => Op::IndexGet { chain, slot, index },
+            }
+        }
         tag::SWITCH => Op::Switch(u32::from(small(1)?)),
         tag::MAKE_ARRAY => Op::MakeArray(small(1)?),
         tag::MAKE_MAP => Op::MakeMap(small(1)?),
@@ -1481,8 +1535,36 @@ mod tests {
             // The chain pool's index and the slot beside it, in both
             // specialised spellings and the general one they fall back to.
             Op::Chain(2),
-            Op::IndexSet { chain: 2, slot: 4 },
-            Op::IndexGet { chain: 2, slot: 4 },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: None,
+            },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Local(5)),
+            },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Const(6)),
+            },
+            Op::IndexGet {
+                chain: 2,
+                slot: 4,
+                index: None,
+            },
+            Op::IndexGet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Local(5)),
+            },
+            Op::IndexGet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Const(6)),
+            },
             // Its exit is an instruction index here and an address after
             // assembly, like every other jump — index 0 is `Const(7)`, which
             // is at 0.

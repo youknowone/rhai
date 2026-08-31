@@ -4759,6 +4759,72 @@ impl<'e> Vm<'e> {
                 }};
             }
 
+            // Where an `INDEX_GET`/`INDEX_SET` instruction's index comes from:
+            // the operand word at `$offset` for the four naming tags, or the
+            // stack entry `$under` for the two plain ones. `None` is the fast
+            // path declining, which the walk below then answers.
+            macro_rules! indexed_int {
+                ($offset:expr, $under:expr) => {{
+                    let mut found = None;
+                    match tag {
+                        code::tag::INDEX_GET_FROM_LOCAL | code::tag::INDEX_SET_FROM_LOCAL => {
+                            let at = base + small!($offset) as usize;
+                            if at < scope_len!() {
+                                if let Union::Int(i, ..) = scope_entry!(at).0 {
+                                    found = Some(i);
+                                }
+                            }
+                        }
+                        code::tag::INDEX_GET_FROM_CONST | code::tag::INDEX_SET_FROM_CONST => {
+                            let index = u32::from(small!($offset));
+                            #[cfg(feature = "grain-jit")]
+                            let constant = jit::program_constant(program, index);
+                            #[cfg(not(feature = "grain-jit"))]
+                            let constant = program.constant(index);
+                            if let Some(Union::Int(i, ..)) = constant.map(|value| &value.0) {
+                                found = Some(*i);
+                            }
+                        }
+                        _ => {
+                            if let Some(under) = $under {
+                                if let Union::Int(i, ..) = stack_ref(self, under).0 {
+                                    found = Some(i);
+                                }
+                            }
+                        }
+                    }
+                    found
+                }};
+            }
+
+            // The same index as a value, for the walk that answers a declined
+            // instruction: it reads its operands off the stack, and a named
+            // index has never been there.
+            macro_rules! indexed_value {
+                ($offset:expr) => {{
+                    match tag {
+                        code::tag::INDEX_GET_FROM_LOCAL | code::tag::INDEX_SET_FROM_LOCAL => {
+                            let slot = small!($offset);
+                            let at = base + slot as usize;
+                            if at >= scope_len!() {
+                                return Err(malformed(format!(
+                                    "local slot {slot} is out of scope"
+                                )));
+                            }
+                            scope_entry!(at).flatten_clone()
+                        }
+                        _ => {
+                            let index = u32::from(small!($offset));
+                            #[cfg(feature = "grain-jit")]
+                            let constant = jit::program_constant(program, index);
+                            #[cfg(not(feature = "grain-jit"))]
+                            let constant = program.constant(index);
+                            or_raise!(constant, malformed(format!("no constant {index}"))).clone()
+                        }
+                    }
+                }};
+            }
+
             // Every transfer of control goes through this, and a backward one
             // is charged an operation.
             //
@@ -5734,7 +5800,9 @@ impl<'e> Vm<'e> {
                     }
                 }
 
-                code::tag::INDEX_SET => {
+                code::tag::INDEX_SET
+                | code::tag::INDEX_SET_FROM_LOCAL
+                | code::tag::INDEX_SET_FROM_CONST => {
                     // The compiler has already decided the shape, so what is
                     // left to test is the types — which it could not know. A
                     // slot holding a writable, unshared `Array` and an index
@@ -5743,20 +5811,19 @@ impl<'e> Vm<'e> {
                     // out-of-range index breaks out and is answered by the
                     // chain below, reporting exactly what it reports.
                     //
-                    // The operands are the chain's own: the index is under the
-                    // value, and an assigning chain leaves nothing behind.
-                    // Only an `Array` reaches the fast path, and `no_index`
-                    // takes the arm it destructures with the rest of indexing —
-                    // so there is nothing left here to be fast about, and the
-                    // compiler emits no `IndexSet` on that build either.
+                    // The operands are the chain's own: the value is on top,
+                    // the index under it or named by the instruction, and an
+                    // assigning chain leaves nothing behind. Only an `Array`
+                    // reaches the fast path, and `no_index` takes the arm it
+                    // destructures with the rest of indexing — so there is
+                    // nothing left here to be fast about, and the compiler
+                    // emits no `IndexSet` on that build either.
+                    let named = tag != code::tag::INDEX_SET;
                     #[cfg_attr(feature = "no_index", allow(unused_mut))]
                     let mut assigned = false;
                     #[cfg(not(feature = "no_index"))]
                     'fast: {
-                        let Some(under) = self.depth.checked_sub(2) else {
-                            break 'fast;
-                        };
-                        let Union::Int(i, ..) = self.stack[under].0 else {
+                        let Some(i) = indexed_int!(5, self.depth.checked_sub(2)) else {
                             break 'fast;
                         };
                         // A negative index counts from the end, which is
@@ -5776,8 +5843,10 @@ impl<'e> Vm<'e> {
                             break 'fast;
                         };
                         *cell = self.pop_or_unit();
-                        // The index operand, done with.
-                        drop(self.pop_or_unit());
+                        if !named {
+                            // The index operand, done with.
+                            drop(self.pop_or_unit());
+                        }
                         assigned = true;
                     }
                     if assigned {
@@ -5785,32 +5854,46 @@ impl<'e> Vm<'e> {
                         continue;
                     }
 
+                    // Declined, so the walk runs — and it reads its operands
+                    // off the stack, where the index belongs under the value.
+                    if named {
+                        let value = self.pop_or_unit();
+                        let index = indexed_value!(5);
+                        self.push(index);
+                        self.push(value);
+                    }
+
                     let index = u32::from(small!(1));
                     let chain =
                         or_raise!(program.chain(index), malformed(format!("no chain {index}")));
-                    // Always an assigning tail — that is what `index_set_slot`
+                    // Always an assigning tail — that is what `indexed_slot`
                     // selects on — so the walk leaves nothing here either.
                     drop(self.run_chain(program, chain, index, scope, base, pos!())?);
                 }
 
-                code::tag::INDEX_GET => {
+                code::tag::INDEX_GET
+                | code::tag::INDEX_GET_FROM_LOCAL
+                | code::tag::INDEX_GET_FROM_CONST => {
                     // `Op::IndexSet`'s speculation, read side: the compiler
                     // decided the shape and what is left to test is the types.
                     // A shared root or a shared element breaks out, because the
                     // walk reaches either through a `Target` that takes a write
                     // lock and this does not.
                     //
-                    // The index is the chain's one operand, and the element
-                    // replaces it — `Target::take_or_clone` clones what it
-                    // referenced, so a clone is what the walk produces too.
+                    // The element takes the index's place —
+                    // `Target::take_or_clone` clones what it referenced, so a
+                    // clone is what the walk produces too. Where the
+                    // instruction names its index that place is one above the
+                    // stack it arrived on, and the two naming tags reach the
+                    // scope entry and the constant themselves rather than
+                    // spending an instruction pushing what the next one takes
+                    // straight off again.
+                    let named = tag != code::tag::INDEX_GET;
                     #[cfg_attr(feature = "no_index", allow(unused_mut))]
                     let mut read = false;
                     #[cfg(not(feature = "no_index"))]
                     'fast: {
-                        let Some(under) = self.depth.checked_sub(1) else {
-                            break 'fast;
-                        };
-                        let Union::Int(i, ..) = stack_ref(self, under).0 else {
+                        let Some(i) = indexed_int!(5, self.depth.checked_sub(1)) else {
                             break 'fast;
                         };
                         // A negative index counts from the end, which is
@@ -5832,12 +5915,24 @@ impl<'e> Vm<'e> {
                             break 'fast;
                         }
                         let value = cell.clone();
-                        *stack_mut(self, under) = value;
+                        if named {
+                            self.push(value);
+                        } else {
+                            *stack_mut(self, self.depth - 1) = value;
+                        }
                         read = true;
                     }
                     if read {
                         pc += width;
                         continue;
+                    }
+
+                    // Declined, so the walk runs — and it reads its one
+                    // operand off the stack, where a named index has never
+                    // been.
+                    if named {
+                        let index = indexed_value!(5);
+                        self.push(index);
                     }
 
                     let index = u32::from(small!(1));

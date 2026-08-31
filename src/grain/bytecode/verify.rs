@@ -554,7 +554,23 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         | Op::IndexSet { chain: index, .. }
         | Op::IndexGet { chain: index, .. } => match pools.chains.get(*index as usize) {
             Some(chain) => {
-                let consumes = chain.consumes();
+                // An index the instruction names is one the stack never
+                // carried, so it is not among the operands consumed here.
+                // Saturating because a corrupt artifact can pair a naming tag
+                // with a chain that declares no operand at all, and reading
+                // that as an underflow would be a panic where every other
+                // malformation is a rejection.
+                let named = usize::from(matches!(
+                    op,
+                    Op::IndexSet {
+                        index: Some(..),
+                        ..
+                    } | Op::IndexGet {
+                        index: Some(..),
+                        ..
+                    }
+                ));
+                let consumes = chain.consumes().saturating_sub(named);
                 let produces = usize::from(matches!(chain.tail, Tail::Read));
                 (consumes, consumes, produces)
             }
@@ -813,8 +829,20 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         tag::EVAL_AST | tag::EVAL_AST_KEEP => bounded(index(1), "fragment", pools.residuals),
         // The slot is checked against the scope when it runs, as every other
         // slot is; the chain behind it is the same record `CHAIN` names.
-        tag::CHAIN | tag::INDEX_SET | tag::INDEX_GET => {
+        tag::CHAIN
+        | tag::INDEX_SET
+        | tag::INDEX_SET_FROM_LOCAL
+        | tag::INDEX_SET_FROM_CONST
+        | tag::INDEX_GET
+        | tag::INDEX_GET_FROM_LOCAL
+        | tag::INDEX_GET_FROM_CONST => {
             bounded(index(1), "chain", pools.chains.len())?;
+            if matches!(
+                code[at],
+                tag::INDEX_SET_FROM_CONST | tag::INDEX_GET_FROM_CONST
+            ) {
+                bounded(index(5), "constant", pools.consts)?;
+            }
             check_chain_indices(at, &pools.chains[index(1) as usize], pools)
         }
         tag::SWITCH => bounded(index(1), "switch", pools.switches.len()),

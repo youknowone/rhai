@@ -968,11 +968,20 @@ pub enum Op {
     /// this a speculation about shape rather than a claim about types.
     ///
     /// Leaves nothing behind, as every assigning [`Op::Chain`] does.
+    ///
+    /// A write whose index is a lone push names it here rather than taking it
+    /// off the stack, on the same trade [`BinOperand`] is for elsewhere — see
+    /// [`Op::IndexGet`], which names its index the same way. A declining write
+    /// pushes the named index under the value, so the walk finds both operands
+    /// where the chain record says they are.
     IndexSet {
         /// Index into the chain pool, for the fallback.
         chain: u32,
         /// The slot the root local lives in.
         slot: u16,
+        /// Where the index comes from, when the instruction names it rather
+        /// than reading it off the stack.
+        index: Option<BinOperand>,
     },
 
     /// Read `local[index]`, with the chain it specialises beside it.
@@ -988,13 +997,25 @@ pub enum Op {
     /// indexer and an out-of-range index are answered by the generic walk and
     /// report exactly what it reports.
     ///
-    /// Leaves the element in the index operand's place, so the stack is one
-    /// deep either way.
+    /// Leaves the element where the index was, so the stack is one deep either
+    /// way — and where `index` names the index instead, one deeper than it
+    /// arrived.
+    ///
+    /// A read whose index is a lone push names it here rather than taking it
+    /// off the stack, on the same trade [`BinOperand`] is for elsewhere: the
+    /// index of an array read in a loop is a counter or a literal almost
+    /// every time, and pushing one to consume it on the next instruction is a
+    /// second trip round the dispatch loop for a value that never outlives it.
+    /// A declining read pushes the named index first, so the walk finds its
+    /// operand where the chain record says it is.
     IndexGet {
         /// Index into the chain pool, for the fallback.
         chain: u32,
         /// The slot the root local lives in.
         slot: u16,
+        /// Where the index comes from, when the instruction names it rather
+        /// than reading it off the stack.
+        index: Option<BinOperand>,
     },
 
     /// Apply a unary operator to the top of the stack, replacing it.

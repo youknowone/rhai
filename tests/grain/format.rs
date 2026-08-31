@@ -127,10 +127,21 @@ fn the_round_trip_covers_something_worth_covering() {
         "string_slice_read",
         #[cfg(not(feature = "no_index"))]
         "string_slice_inclusive", // and the other range tag
+        // The specialised slot-rooted write and its read half, each in all
+        // three spellings: an index the instruction names out of the constant
+        // pool, one it names by slot, and one it takes off the stack.
         #[cfg(not(feature = "no_index"))]
-        "index_assign_array", // IndexSet, the specialised slot-rooted write
+        "index_assign_array",
         #[cfg(not(feature = "no_index"))]
-        "index_read_local_array", // IndexGet, its read half
+        "index_assign_local_index",
+        #[cfg(not(feature = "no_index"))]
+        "index_assign_computed_index",
+        #[cfg(not(feature = "no_index"))]
+        "index_read_local_array",
+        #[cfg(not(feature = "no_index"))]
+        "index_read_local_index",
+        #[cfg(not(feature = "no_index"))]
+        "index_read_computed_index",
         // and one that keeps the general instruction, so the chain encoder's
         // slot-rooted branch stays covered now that the plain write does not
         // reach it — indexed too, and so `no_index` syntax as well

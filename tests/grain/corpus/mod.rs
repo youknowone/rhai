@@ -199,6 +199,8 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "float_int_mixed_op_assign"
             | "int_float_mixed_op_assign"
             | "int_float_comparisons"
+            | "error_index_assign_float_index"
+            | "error_index_read_float_index"
     ) {
         return false;
     }
@@ -240,6 +242,12 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "try_catch_does_not_swallow_return"
                 | "try_does_not_catch_return"
                 | "type_of_a_pointer"
+                | "if_stmt_arm_returns"
+                | "index_assign_is_a_function_bodys_value"
+                | "index_assign_through_a_shared_index"
+                | "index_read_of_a_shared_element"
+                | "index_read_through_a_shared_index"
+                | "index_read_through_a_shared_root"
         )
     {
         return false;
@@ -278,9 +286,15 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_array_bounds"
             | "error_const_root_method_step"
             | "error_host_index_bounds"
+            | "error_index_assign_constant_is_not_an_integer"
+            | "error_index_assign_float_index"
             | "error_index_assign_out_of_bounds"
             | "error_index_into_an_unindexable_step"
             | "error_index_into_an_unindexable_step_deep"
+            | "error_index_read_constant_is_not_an_integer"
+            | "error_index_read_float_index"
+            | "error_index_read_out_of_bounds"
+            | "error_index_read_slot_is_not_an_integer"
             | "error_no_function_for_the_receiver"
             | "error_property_on_a_temporary"
             | "error_temp_root_index_runs_first"
@@ -292,19 +306,39 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "for_with_counter"
             | "host_index_get"
             | "host_index_set"
-            | "index_assign_float_index"
-            | "index_assign_map_root"
-            | "index_assign_negative"
-            | "host_mutation_before_a_failure_survives_in_an_array"
             | "host_index_temp_set"
+            | "host_mutation_before_a_failure_survives_in_an_array"
             | "host_string_index_property_get_fallback"
-            | "host_string_index_property_set_fallback"
             | "host_string_index_property_op_assign_fallback"
+            | "host_string_index_property_set_fallback"
             | "host_temp_index_set"
             | "host_temp_string_index_property_set_fallback"
             | "index_assign_array"
+            | "index_assign_call_index"
+            | "index_assign_computed_index"
+            | "index_assign_float_index"
+            | "index_assign_is_a_function_bodys_value"
+            | "index_assign_is_the_scripts_value"
+            | "index_assign_local_index"
+            | "index_assign_map_root"
+            | "index_assign_negative"
             | "index_assign_nested"
+            | "index_assign_through_a_shared_index"
             | "index_expression_reads_the_root"
+            | "index_read_bitfield_root"
+            | "index_read_blob_root"
+            | "index_read_call_index"
+            | "index_read_computed_index"
+            | "index_read_feeds_a_write_back"
+            | "index_read_local_array"
+            | "index_read_local_array_const"
+            | "index_read_local_index"
+            | "index_read_map_root"
+            | "index_read_negative"
+            | "index_read_of_a_shared_element"
+            | "index_read_string_root"
+            | "index_read_through_a_shared_index"
+            | "index_read_through_a_shared_root"
             | "interpolation_of_containers"
             | "is_shared_after_capture"
             | "map_computed_in_array"
@@ -396,6 +430,8 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "temp_root_array_method"
                 | "try_catch_native_error"
                 | "type_of_method_style"
+                | "index_read_map_root"
+                | "property_assign_is_the_scripts_value"
         )
     {
         return false;
@@ -777,6 +813,28 @@ pub const CASES: &[Case] = &[
     case("index_read_of_a_shared_element", "let a = [1, 2]; let r = 0; { let f = || a; r = a[0]; } [a, r]"),
     case("index_read_through_a_shared_root", "let a = [1, 2]; let r = 0; { let f = || a; r = a[1]; } r"),
     case("index_read_feeds_a_write_back", "let a = [1, 2, 3]; a[0] = a[2]; a"),
+    // An index the instruction names rather than takes off the stack. The two
+    // sources are a slot and a constant, and each has to decline to the same
+    // walk when what it names is not an integer inside the array — including
+    // the slot that has become a shared cell, which is not read the way a
+    // plain one is.
+    case("error_index_read_slot_is_not_an_integer", r#"let a = [1, 2, 3]; let k = "x"; a[k]"#),
+    case("error_index_read_constant_is_not_an_integer", r#"let a = [1, 2, 3]; a["k"]"#),
+    case("index_read_through_a_shared_index", "let a = [1, 2]; let i = 1; let r = 0; { let f = || i; r = a[i]; } r"),
+    case("index_assign_through_a_shared_index", "let a = [1, 2]; let i = 1; { let f = || i; a[i] = 99; } a"),
+    case("error_index_assign_float_index", "let a = [1, 2, 3]; a[1.5] = 9; a"),
+    case("error_index_assign_constant_is_not_an_integer", r#"let a = [1, 2, 3]; a["k"] = 9; a"#),
+    case("index_read_local_index", "let a = [1, 2, 3]; let i = 1; a[i]"),
+    case("index_assign_local_index", "let a = [1, 2, 3]; let i = 1; a[i] = 9; a"),
+    // An index that is more than one push, which the instruction cannot name —
+    // so it arrives on the stack, under the value where there is one.
+    case("index_read_computed_index", "let a = [1, 2, 3]; let i = 0; a[i + 1]"),
+    // The index's own last push is not the index. Reading only the code
+    // emitted for the whole chain would take this one back and hand the
+    // instruction an argument as its index.
+    case("index_read_call_index", "let a = [1, 2, 3]; let i = 0; let j = 1; a[max(i, j)]"),
+    case("index_assign_call_index", "let a = [1, 2, 3]; let i = 0; let j = 1; a[max(i, j)] = 9; a"),
+    case("index_assign_computed_index", "let a = [1, 2, 3]; let i = 0; a[i + 1] = 9; a"),
     // A chain is walked where its root lives rather than in a copy of it, so
     // the access mode of the entry is what refuses a write — not the fact that
     // the walk was handed something detached. All three have to agree with

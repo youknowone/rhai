@@ -563,6 +563,11 @@ impl Lowering {
             }
         }
 
+        // Where the steps' operands end, which for a specialised chain is where
+        // its one index ends — the fold below reads that slice rather than
+        // everything emitted since `rewind_mark`.
+        let operands_end = self.mark();
+
         // Then the root, if it is one that has to be evaluated. After the
         // operands rather than before, which is Rhai's order and not the
         // reading order: `[f()][g()]` calls `g` first.
@@ -593,10 +598,23 @@ impl Lowering {
         // with no slot, a null-conditional index — keeps the general
         // instruction. See [`Op::IndexSet`] and [`Op::IndexGet`].
         let specialised = indexed_slot(&chain);
+        // A specialised chain lowers its index and then, if it assigns, its
+        // value — nothing else — so a lone push is still recognisable here and
+        // the instruction can name it instead of taking it off the stack.
+        let named_index =
+            specialised.and_then(|_| self.fold_index_operand(rewind_mark, operands_end));
         let index = self.push_chain(chain);
         let op = match (specialised, assigns) {
-            (Some(slot), true) => Op::IndexSet { chain: index, slot },
-            (Some(slot), false) => Op::IndexGet { chain: index, slot },
+            (Some(slot), true) => Op::IndexSet {
+                chain: index,
+                slot,
+                index: named_index,
+            },
+            (Some(slot), false) => Op::IndexGet {
+                chain: index,
+                slot,
+                index: named_index,
+            },
             (None, ..) => Op::Chain(index),
         };
         self.emit_at(op, expr.position());
@@ -2637,6 +2655,33 @@ impl Lowering {
         Some(src)
     }
 
+    /// Take back an indexed chain's index push, naming what it read.
+    ///
+    /// The same trade as [`Self::fold_pushed_operand`], for an operand that is
+    /// not always the last thing emitted: a read lowers only its index, but a
+    /// write lowers the index and then the value. `mark..end` is the index's
+    /// own code, which is what decides whether there is a lone push to take —
+    /// a call's last argument is a lone push too, and reading back from the
+    /// end would take that one and hand the instruction an argument as its
+    /// index.
+    ///
+    /// At most one instruction may follow it, so nothing between the index and
+    /// the instruction can be a jump target and removing the push moves no
+    /// address anything names.
+    fn fold_index_operand(&mut self, mark: usize, end: usize) -> Option<BinOperand> {
+        if self.code.len() > end + 1 {
+            return None;
+        }
+        let src = match self.code.get(mark..end)? {
+            [Op::LoadLocal(src)] => BinOperand::Local(*src),
+            [Op::Const(index)] => BinOperand::Const(*index),
+            _ => return None,
+        };
+        self.code.remove(mark);
+        self.positions.remove(mark);
+        Some(src)
+    }
+
     /// Take back the two pushes emitted since `mark` when they are a local
     /// read and a local read or a constant, naming what they read.
     ///
@@ -3148,7 +3193,7 @@ mod tests {
             ),
             (
                 "primes",
-                5,
+                4,
                 r#"
             const SIZE = 1_000_000;
 
