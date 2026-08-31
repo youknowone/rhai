@@ -374,17 +374,18 @@ pub enum Op {
         /// Index into the op-assignment pool; absent for a plain `=`.
         op: Option<u32>,
     },
-    /// Assign local slot `src`'s value to local slot `slot`, optionally
-    /// through an operator.
+    /// Assign `src`'s value to local slot `slot`, optionally through an
+    /// operator.
     ///
-    /// [`Op::AssignLocal`] with the [`Op::LoadLocal`] that fed it folded in.
-    /// `x op= y` where `y` is a plain local read pushes a value and pops it
-    /// again on the very next instruction, and both halves of that pair are
-    /// among the most frequent instructions there are — so the pair is one
-    /// instruction, and the operand stack is not touched at all.
+    /// [`Op::AssignLocal`] with the [`Op::LoadLocal`] or [`Op::Const`] that fed
+    /// it folded in. `x op= y` where `y` is a plain local read or a constant
+    /// pushes a value and pops it again on the very next instruction, and both
+    /// halves of that pair are among the most frequent instructions there are —
+    /// so the pair is one instruction, and the operand stack is not touched at
+    /// all. A loop counter's `i += 1` is the constant case.
     ///
-    /// The source is read exactly as [`Op::LoadLocal`] reads it: cloned out,
-    /// flattening any shared cell.
+    /// The source is read exactly as the instruction it swallowed read it:
+    /// a local cloned out and flattened, a constant cloned from the pool.
     AssignLocalFrom {
         /// The slot being assigned to.
         slot: u16,
@@ -392,8 +393,8 @@ pub enum Op {
         var_name: u32,
         /// Index into the op-assignment pool; absent for a plain `=`.
         op: Option<u32>,
-        /// The slot the value is read from.
-        src: u16,
+        /// Where the value is read from.
+        src: BinOperand,
     },
 
     /// Pop and declare it as a new local, extending the scope by one.

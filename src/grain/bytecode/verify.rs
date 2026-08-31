@@ -751,8 +751,19 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
             Ok(())
         }
         tag::ASSIGN_LOCAL | tag::ASSIGN_LOCAL_FROM => bounded(index(3), "name", pools.names),
+        // The `_CONST` forms hold a constant index where the others hold a
+        // slot, and a slot is checked against the scope when it runs.
+        tag::ASSIGN_LOCAL_FROM_CONST => {
+            bounded(index(3), "name", pools.names)?;
+            bounded(index(5), "constant", pools.consts)
+        }
         tag::ASSIGN_LOCAL_FROM_OP => {
             bounded(index(3), "name", pools.names)?;
+            bounded(index(7), "op-assignment", pools.assign_ops)
+        }
+        tag::ASSIGN_LOCAL_FROM_CONST_OP => {
+            bounded(index(3), "name", pools.names)?;
+            bounded(index(5), "constant", pools.consts)?;
             bounded(index(7), "op-assignment", pools.assign_ops)
         }
         tag::LOAD_NAMED

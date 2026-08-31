@@ -81,6 +81,8 @@ fn main() {
                 autoreds: false,
                 virtualizables: vec!["frame".to_string()],
                 red_types: vec!["GrainFrame".to_string(), "Vm".to_string()],
+                portal_runner: None,
+                split_portal: false,
             }],
         },
     };
@@ -109,7 +111,7 @@ fn main() {
 
     // The census reads the process-global `gc_cache`, which every mint routed
     // through regardless of whether the pipeline finished.
-    let gc = majit_ir::descr::gc_cache().lock().unwrap();
+    let gc = majit_ir::descr::gc_cache().lock();
     let [checked, disagreeing] = gc.positional_invariant_census();
     let [compared, conflicting] = gc.identity_collision_census();
     println!("positional_invariant_census: checked={checked} disagreeing={disagreeing}");

@@ -45,7 +45,8 @@ pub mod jit_state;
 pub mod jitcodes;
 
 use crate::grain::bytecode::{
-    code, AssignOp, BinOpKind, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail, UnOpKind,
+    code, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail,
+    UnOpKind,
 };
 use crate::grain::program::{Program, SharedModule, SharedProgram};
 
@@ -4895,20 +4896,27 @@ impl<'e> Vm<'e> {
                 code::tag::ASSIGN_LOCAL
                 | code::tag::ASSIGN_LOCAL_OP
                 | code::tag::ASSIGN_LOCAL_FROM
-                | code::tag::ASSIGN_LOCAL_FROM_OP => {
+                | code::tag::ASSIGN_LOCAL_FROM_OP
+                | code::tag::ASSIGN_LOCAL_FROM_CONST
+                | code::tag::ASSIGN_LOCAL_FROM_CONST_OP => {
                     let slot = small!(1);
                     let var_name = u32::from(small!(3));
-                    // The fused forms carry the source slot where the plain
+                    // The fused forms carry the source operand where the plain
                     // ones end, so the operator index moves along by it.
                     let from = match tag {
-                        code::tag::ASSIGN_LOCAL_FROM | code::tag::ASSIGN_LOCAL_FROM_OP => {
-                            Some(small!(5))
+                        code::tag::ASSIGN_LOCAL_FROM
+                        | code::tag::ASSIGN_LOCAL_FROM_OP
+                        | code::tag::ASSIGN_LOCAL_FROM_CONST
+                        | code::tag::ASSIGN_LOCAL_FROM_CONST_OP => {
+                            Some(code::assign_source(tag, small!(5)))
                         }
                         _ => None,
                     };
                     let op = match tag {
                         code::tag::ASSIGN_LOCAL_OP => Some(u32::from(small!(5))),
-                        code::tag::ASSIGN_LOCAL_FROM_OP => Some(u32::from(small!(7))),
+                        code::tag::ASSIGN_LOCAL_FROM_OP | code::tag::ASSIGN_LOCAL_FROM_CONST_OP => {
+                            Some(u32::from(small!(7)))
+                        }
                         _ => None,
                     };
                     let op = match op {
@@ -4936,12 +4944,26 @@ impl<'e> Vm<'e> {
                     // those errors describe an artifact the verifier has
                     // already refused, so only their order could differ.
                     let rhs = match from {
-                        Some(src) => {
+                        Some(BinOperand::Local(src)) => {
                             let index = base + src as usize;
                             if index >= scope_len!() {
                                 return Err(malformed(format!("local slot {src} is out of scope")));
                             }
                             scope_entry!(index).flatten_clone()
+                        }
+                        // A constant is read exactly as the `Op::Const` this
+                        // form swallowed read it, then flattened as the pop it
+                        // replaced was. A pool entry is never shared, so the
+                        // flatten is the identity — it is spelled to keep the
+                        // two paths one rule rather than two.
+                        Some(BinOperand::Const(index)) => {
+                            #[cfg(feature = "grain-jit")]
+                            let constant = jit::program_constant(program, index);
+                            #[cfg(not(feature = "grain-jit"))]
+                            let constant = program.constant(index);
+                            let value =
+                                or_raise!(constant, malformed(format!("no constant {index}")));
+                            value.flatten_clone()
                         }
                         None => self.pop()?.flatten(),
                     };

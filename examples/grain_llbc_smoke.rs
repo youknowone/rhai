@@ -150,6 +150,8 @@ fn main() {
                 autoreds: false,
                 virtualizables: vec!["frame".to_string()],
                 red_types: vec!["GrainFrame".to_string(), "Vm".to_string()],
+                portal_runner: None,
+                split_portal: false,
             }],
         },
     };

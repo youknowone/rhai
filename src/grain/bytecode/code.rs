@@ -220,6 +220,17 @@ pub mod tag {
     /// The same operand layout as [`CHAIN`] with the root's slot after it, so
     /// the fallback is the `CHAIN` arm itself rather than a copy of it.
     pub const INDEX_SET: u8 = 0x50;
+    /// [`Op::AssignLocalFrom`](super::Op::AssignLocalFrom) reading a constant,
+    /// with a plain `=`.
+    ///
+    /// The same operand layout as [`ASSIGN_LOCAL_FROM`] with a constant-pool
+    /// index where the source slot would be, so the two share a dispatch arm —
+    /// the pair [`BIN_OP_FROM_LOCAL`] and [`BIN_OP_FROM_CONST`] are to each
+    /// other.
+    pub const ASSIGN_LOCAL_FROM_CONST: u8 = 0x51;
+    /// [`Op::AssignLocalFrom`](super::Op::AssignLocalFrom) reading a constant,
+    /// through an operator.
+    pub const ASSIGN_LOCAL_FROM_CONST_OP: u8 = 0x52;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -323,7 +334,10 @@ static WIDTHS: [u8; 256] = {
     widths[tag::ASSIGN_LOCAL_FROM as usize] = 7;
     widths[tag::ITER_NEXT_STORE as usize] = 7;
 
+    widths[tag::ASSIGN_LOCAL_FROM_CONST as usize] = 7;
+
     widths[tag::ASSIGN_LOCAL_FROM_OP as usize] = 9;
+    widths[tag::ASSIGN_LOCAL_FROM_CONST_OP as usize] = 9;
 
     widths[tag::BIN_OP_FROM_LOCAL as usize] = 10;
     widths[tag::BIN_OP_FROM_CONST as usize] = 10;
@@ -518,12 +532,18 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 op,
                 src,
             } => {
-                code.push(match op {
-                    Some(..) => tag::ASSIGN_LOCAL_FROM_OP,
-                    None => tag::ASSIGN_LOCAL_FROM,
+                code.push(match (src, op) {
+                    (BinOperand::Local(..), Some(..)) => tag::ASSIGN_LOCAL_FROM_OP,
+                    (BinOperand::Local(..), None) => tag::ASSIGN_LOCAL_FROM,
+                    (BinOperand::Const(..), Some(..)) => tag::ASSIGN_LOCAL_FROM_CONST_OP,
+                    (BinOperand::Const(..), None) => tag::ASSIGN_LOCAL_FROM_CONST,
                 });
                 code.extend_from_slice(&slot.to_le_bytes());
                 code.extend_from_slice(&small(*var_name as usize, "names")?.to_le_bytes());
+                let src = match src {
+                    BinOperand::Local(slot) => *slot,
+                    BinOperand::Const(index) => small(*index as usize, "constants")?,
+                };
                 code.extend_from_slice(&src.to_le_bytes());
                 if let Some(assign_op) = op {
                     code.extend_from_slice(
@@ -951,6 +971,19 @@ fn encoded_width(op: &Op) -> usize {
     }
 }
 
+/// Which pool the operand word of an `ASSIGN_LOCAL_FROM*` tag names.
+///
+/// The four tags share one operand layout and differ only in that: the two
+/// `_CONST` ones hold a constant-pool index where the other two hold a slot.
+pub(crate) const fn assign_source(tag: u8, operand: u16) -> BinOperand {
+    match tag {
+        tag::ASSIGN_LOCAL_FROM_CONST | tag::ASSIGN_LOCAL_FROM_CONST_OP => {
+            BinOperand::Const(operand as u32)
+        }
+        _ => BinOperand::Local(operand),
+    }
+}
+
 /// Recover the instruction at `at`, for disassembly and tests.
 ///
 /// Jump targets come back as byte offsets, not the instruction indices the
@@ -987,17 +1020,17 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             op: Some(u32::from(small(5)?)),
         },
 
-        tag::ASSIGN_LOCAL_FROM => Op::AssignLocalFrom {
+        tag::ASSIGN_LOCAL_FROM | tag::ASSIGN_LOCAL_FROM_CONST => Op::AssignLocalFrom {
             slot: small(1)?,
             var_name: u32::from(small(3)?),
             op: None,
-            src: small(5)?,
+            src: assign_source(code[at], small(5)?),
         },
-        tag::ASSIGN_LOCAL_FROM_OP => Op::AssignLocalFrom {
+        tag::ASSIGN_LOCAL_FROM_OP | tag::ASSIGN_LOCAL_FROM_CONST_OP => Op::AssignLocalFrom {
             slot: small(1)?,
             var_name: u32::from(small(3)?),
             op: Some(u32::from(small(7)?)),
-            src: small(5)?,
+            src: assign_source(code[at], small(5)?),
         },
 
         tag::LOAD_NAMED => Op::LoadNamed(u32::from(small(1)?)),
@@ -1252,13 +1285,25 @@ mod tests {
                 slot: 1,
                 var_name: 2,
                 op: None,
-                src: 6,
+                src: BinOperand::Local(6),
             },
             Op::AssignLocalFrom {
                 slot: 1,
                 var_name: 2,
                 op: Some(5),
-                src: 6,
+                src: BinOperand::Local(6),
+            },
+            Op::AssignLocalFrom {
+                slot: 1,
+                var_name: 2,
+                op: None,
+                src: BinOperand::Const(6),
+            },
+            Op::AssignLocalFrom {
+                slot: 1,
+                var_name: 2,
+                op: Some(5),
+                src: BinOperand::Const(6),
             },
             Op::DeclareLocal {
                 name: 8,

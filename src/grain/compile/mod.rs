@@ -1259,7 +1259,7 @@ impl Lowering {
                 self.expression(&binary.rhs);
                 let op = self.op_assignment(op_info);
 
-                let assign = match self.fold_pushed_local(mark) {
+                let assign = match self.fold_pushed_operand(mark) {
                     Some(src) => Op::AssignLocalFrom {
                         slot,
                         var_name,
@@ -2582,18 +2582,24 @@ impl Lowering {
     /// Take back a lone local read emitted since `mark`, naming the slot it
     /// read, so the instruction about to be emitted can do it itself.
     ///
-    /// `x op= y` where `y` is a plain local read pushes a value and pops it
-    /// again on the next instruction. Recognised on the emitted code rather
-    /// than on the tree, so whatever `expression` decided a bare variable is
-    /// decides this too — a shared capture lowers to `Op::LoadShared` and is
-    /// left alone.
+    /// `x op= y` where `y` is a plain local read or a constant pushes a value
+    /// and pops it again on the next instruction. Recognised on the emitted
+    /// code rather than on the tree, so whatever `expression` decided a bare
+    /// variable is decides this too — a shared capture lowers to
+    /// `Op::LoadShared` and is left alone, and a right-hand side that folded to
+    /// a literal is taken whether it was written as one or not.
+    ///
+    /// A loop counter's `i += 1` is the constant case, and it is why the
+    /// operand is not just a slot: that pair sits in the body of nearly every
+    /// counted loop, and in each arm of a `switch` whose arms accumulate.
     ///
     /// Safe to take back because nothing can jump between the two: no label
     /// has been taken since `mark`, so no jump can name the instruction that
     /// followed the read.
-    fn fold_pushed_local(&mut self, mark: usize) -> Option<u16> {
+    fn fold_pushed_operand(&mut self, mark: usize) -> Option<BinOperand> {
         let src = match self.code.get(mark..)? {
-            [Op::LoadLocal(src)] => *src,
+            [Op::LoadLocal(src)] => BinOperand::Local(*src),
+            [Op::Const(index)] => BinOperand::Const(*index),
             _ => return None,
         };
         self.rewind(mark);
@@ -2603,7 +2609,7 @@ impl Lowering {
     /// Take back the two pushes emitted since `mark` when they are a local
     /// read and a local read or a constant, naming what they read.
     ///
-    /// The same trade as [`Self::fold_pushed_local`], for the operand pair in
+    /// The same trade as [`Self::fold_pushed_operand`], for the operand pair in
     /// front of a binary operator.
     fn fold_pushed_operands(&mut self, mark: usize) -> Option<(u16, BinOperand)> {
         let pair = match self.code.get(mark..)? {
@@ -3073,20 +3079,20 @@ mod tests {
         // body to fewer instructions is the point, and only raising one of
         // these numbers should have to be argued for.
         const SOURCES: &[(&str, usize, &str)] = &[
-            ("tight integer loop", 7, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
-            ("float arithmetic", 12, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
+            ("tight integer loop", 6, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
+            ("float arithmetic", 11, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
             ("script fn calls", 6, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
             ("recursive fibonacci", 14, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
                 "switch, 4 arms",
-                16,
+                12,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } \
                  } s",
             ),
             (
                 "switch, 16 arms",
-                52,
+                36,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 16 { \
                  0 => s += 1, 1 => s += 2, 2 => s += 3, 3 => s += 4, \
@@ -3095,7 +3101,7 @@ mod tests {
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
                  } s",
             ),
-            ("branch heavy", 19, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
+            ("branch heavy", 16, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
             ("native function calls", 8, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
             (
                 "native callbacks",

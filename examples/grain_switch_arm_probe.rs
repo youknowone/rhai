@@ -44,6 +44,8 @@ fn main() {
                 autoreds: false,
                 virtualizables: Vec::new(),
                 red_types: Vec::new(),
+                portal_runner: None,
+                split_portal: false,
             }],
         },
     };
