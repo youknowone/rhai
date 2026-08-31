@@ -79,6 +79,13 @@ for n in 0..8 {
     squares.push(n * STRIDE);
 }
 
+// The counted spelling, which pushes the item and the count separately and so
+// is the only thing that reaches `Op::IterNext` rather than its fused form.
+let placed = 0;
+for (square, at) in squares {
+    placed += square * at;
+}
+
 #{
     total: doubled,
     text: `${label} of ${counts.len()}`,
@@ -87,6 +94,7 @@ for n in 0..8 {
     mark: flags.mark,
     supplied: supplied.len(),
     widest: widest,
+    placed: placed,
     caught: caught,
     captured: captured,
     computed: computed,

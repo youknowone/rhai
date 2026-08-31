@@ -579,6 +579,7 @@ impl Lowering {
             (None, None) => (),
         }
 
+        let assigns = matches!(tail, Tail::Assign { .. });
         let chain = Chain {
             root: root_spec,
             steps: lowered,
@@ -599,6 +600,14 @@ impl Lowering {
         };
         self.emit_at(op, expr.position());
         self.unwind_to(unwind_depth);
+        // An assignment evaluates to unit, and as an instruction rather than
+        // as something the chain pushes: written this way the pair is the one
+        // `drop_trailing_unit` already knows how to collapse, so an assignment
+        // in statement position — which is nearly all of them — costs neither
+        // the push nor the `Pop` that took it off again.
+        if assigns {
+            self.emit(Op::Unit);
+        }
         true
     }
 
@@ -3132,7 +3141,7 @@ mod tests {
             ),
             (
                 "primes",
-                6,
+                5,
                 r#"
             const SIZE = 1_000_000;
 

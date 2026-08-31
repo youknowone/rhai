@@ -5722,8 +5722,16 @@ impl<'e> Vm<'e> {
                     let index = u32::from(small!(1));
                     let chain =
                         or_raise!(program.chain(index), malformed(format!("no chain {index}")));
+                    let assigns = matches!(chain.tail, Tail::Assign { .. });
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
-                    self.push(value);
+                    // An assignment is not an expression here: what it
+                    // evaluates to is the `Op::Unit` beside it, emitted only
+                    // where something reads it.
+                    if assigns {
+                        drop(value);
+                    } else {
+                        self.push(value);
+                    }
                 }
 
                 code::tag::INDEX_SET => {
@@ -5736,7 +5744,7 @@ impl<'e> Vm<'e> {
                     // chain below, reporting exactly what it reports.
                     //
                     // The operands are the chain's own: the index is under the
-                    // value, and an assigning chain leaves unit behind.
+                    // value, and an assigning chain leaves nothing behind.
                     // Only an `Array` reaches the fast path, and `no_index`
                     // takes the arm it destructures with the rest of indexing —
                     // so there is nothing left here to be fast about, and the
@@ -5770,7 +5778,6 @@ impl<'e> Vm<'e> {
                         *cell = self.pop_or_unit();
                         // The index operand, done with.
                         drop(self.pop_or_unit());
-                        self.push(Dynamic::UNIT);
                         assigned = true;
                     }
                     if assigned {
@@ -5781,8 +5788,9 @@ impl<'e> Vm<'e> {
                     let index = u32::from(small!(1));
                     let chain =
                         or_raise!(program.chain(index), malformed(format!("no chain {index}")));
-                    let value = self.run_chain(program, chain, index, scope, base, pos!())?;
-                    self.push(value);
+                    // Always an assigning tail — that is what `index_set_slot`
+                    // selects on — so the walk leaves nothing here either.
+                    drop(self.run_chain(program, chain, index, scope, base, pos!())?);
                 }
 
                 code::tag::UNWIND_TO => {

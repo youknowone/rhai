@@ -754,6 +754,13 @@ pub const CASES: &[Case] = &[
     case("error_index_assign_out_of_bounds", "let a = [1, 2, 3]; a[10] = 9; a"),
     case("index_assign_map_root", r#"let m = #{}; m["k"] = 9; m"#),
     case("index_assign_float_index", "let a = [1, 2, 3]; let i = 1; a[i] = 9; a"),
+    // An assignment through a chain in *value* position. It evaluates to unit
+    // like every other assignment, and the instruction that says so is emitted
+    // only here — a statement-position one leaves nothing at all — so the
+    // three places a value is read from are each worth a case.
+    case("index_assign_is_the_scripts_value", "let a = [1, 2, 3]; a[1] = 99"),
+    case("property_assign_is_the_scripts_value", "let m = #{ a: 1 }; m.a = 7"),
+    case("index_assign_is_a_function_bodys_value", "fn place(a) { a[0] = 9 } let a = [1, 2, 3]; [place(a), a]"),
     // A chain is walked where its root lives rather than in a copy of it, so
     // the access mode of the entry is what refuses a write — not the fact that
     // the walk was handed something detached. All three have to agree with

@@ -545,14 +545,17 @@ fn required_caps(op: &Op, pools: &Pools) -> Caps {
 fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
     match op {
         // A chain eats the indices and arguments its steps named, plus a root
-        // that is not a slot, plus the value being assigned, and leaves one
-        // behind. An index with no chain behind it reads as consuming nothing;
-        // `check_indices` is what rejects it.
+        // that is not a slot, plus the value being assigned. A read leaves the
+        // value it arrived at; an assignment leaves nothing, its unit being an
+        // instruction of its own where anything reads it. An index with no
+        // chain behind it reads as consuming nothing; `check_indices` is what
+        // rejects it.
         Op::Chain(index) | Op::IndexSet { chain: index, .. } => {
             match pools.chains.get(*index as usize) {
                 Some(chain) => {
                     let consumes = chain.consumes();
-                    (consumes, consumes, 1)
+                    let produces = usize::from(matches!(chain.tail, Tail::Read));
+                    (consumes, consumes, produces)
                 }
                 None => (0, 0, 1),
             }

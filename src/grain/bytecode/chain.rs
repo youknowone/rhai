@@ -116,7 +116,7 @@ pub enum Tail {
     /// Push the value the chain arrived at.
     Read,
     /// Assign the top of the operand stack to it, optionally through an
-    /// operator, and push unit.
+    /// operator, and leave nothing behind.
     Assign {
         /// Index into the op-assignment pool; absent for a plain `=`.
         op: Option<u32>,

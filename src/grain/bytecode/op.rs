@@ -735,7 +735,10 @@ pub enum Op {
     /// cannot survive a trip round the dispatch loop. Index values and method
     /// arguments were pushed before it, in step order.
     ///
-    /// Pushes the value for a read, or unit for an assignment.
+    /// Pushes the value for a read. An assignment pushes nothing: what it
+    /// evaluates to is an [`Op::Unit`] beside it, emitted only where something
+    /// reads the value — which lets the peephole that already collapses that
+    /// pair for a local assignment collapse this one too.
     Chain(u32),
 
     /// Truncate the scope back to `.0` locals, dropping everything a block
@@ -963,6 +966,8 @@ pub enum Op {
     /// host type with an indexer, or an out-of-range index is answered by the
     /// generic walk and reports exactly what it reports. That is what keeps
     /// this a speculation about shape rather than a claim about types.
+    ///
+    /// Leaves nothing behind, as every assigning [`Op::Chain`] does.
     IndexSet {
         /// Index into the chain pool, for the fallback.
         chain: u32,
