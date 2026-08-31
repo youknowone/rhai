@@ -761,6 +761,22 @@ pub const CASES: &[Case] = &[
     case("index_assign_is_the_scripts_value", "let a = [1, 2, 3]; a[1] = 99"),
     case("property_assign_is_the_scripts_value", "let m = #{ a: 1 }; m.a = 7"),
     case("index_assign_is_a_function_bodys_value", "fn place(a) { a[0] = 9 } let a = [1, 2, 3]; [place(a), a]"),
+    // `Op::IndexGet` speculates on the same shape as `Op::IndexSet` and has
+    // the same set of things to hand back: a root that is not an array, an
+    // index that is not a non-negative integer inside it, and an element that
+    // is shared. Each has to reach the answer the general walk gives.
+    case("index_read_local_array", "let a = [1, 2, 3]; a[1]"),
+    case("index_read_local_array_const", "const A = [1, 2, 3]; A[2]"),
+    case("index_read_negative", "let a = [1, 2, 3]; a[-1]"),
+    case("error_index_read_out_of_bounds", "let a = [1, 2, 3]; a[10]"),
+    case("error_index_read_float_index", "let a = [1, 2, 3]; a[1.5]"),
+    case("index_read_map_root", r#"let m = #{ k: 9 }; m["k"]"#),
+    case("index_read_string_root", r#"let s = "hello"; s[1]"#),
+    case("index_read_bitfield_root", "let x = 5; x[0]"),
+    case("index_read_blob_root", "let b = blob(3, 7); b[1]"),
+    case("index_read_of_a_shared_element", "let a = [1, 2]; let r = 0; { let f = || a; r = a[0]; } [a, r]"),
+    case("index_read_through_a_shared_root", "let a = [1, 2]; let r = 0; { let f = || a; r = a[1]; } r"),
+    case("index_read_feeds_a_write_back", "let a = [1, 2, 3]; a[0] = a[2]; a"),
     // A chain is walked where its root lives rather than in a copy of it, so
     // the access mode of the entry is what refuses a write — not the fact that
     // the walk was handed something detached. All three have to agree with

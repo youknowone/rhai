@@ -586,17 +586,18 @@ impl Lowering {
             tail,
             operands,
         };
-        // `local[i] = v`, which is what a loop writing an array is made of,
-        // gets an instruction that names the slot and skips the walk. Decided
-        // on the lowered chain rather than on the tree, so a shape that lowers
-        // to anything else — a second step, an op-assignment, a root with no
-        // slot, a null-conditional index — keeps the general instruction. See
-        // [`Op::IndexSet`].
-        let specialised = index_set_slot(&chain);
+        // `local[i] = v` and `local[i]`, which is what a loop over an array is
+        // made of, get an instruction that names the slot and skips the walk.
+        // Decided on the lowered chain rather than on the tree, so a shape that
+        // lowers to anything else — a second step, an op-assignment, a root
+        // with no slot, a null-conditional index — keeps the general
+        // instruction. See [`Op::IndexSet`] and [`Op::IndexGet`].
+        let specialised = indexed_slot(&chain);
         let index = self.push_chain(chain);
-        let op = match specialised {
-            Some(slot) => Op::IndexSet { chain: index, slot },
-            None => Op::Chain(index),
+        let op = match (specialised, assigns) {
+            (Some(slot), true) => Op::IndexSet { chain: index, slot },
+            (Some(slot), false) => Op::IndexGet { chain: index, slot },
+            (None, ..) => Op::Chain(index),
         };
         self.emit_at(op, expr.position());
         self.unwind_to(unwind_depth);
@@ -3028,20 +3029,26 @@ fn declaration_order(def: &ScriptFuncDef) -> (&str, usize, Option<&str>) {
     (&def.name, def.params.len(), this_type)
 }
 
-/// The slot [`Op::IndexSet`] would name, for a chain of exactly its shape.
+/// The slot [`Op::IndexSet`] or [`Op::IndexGet`] would name, for a chain of
+/// exactly their shape.
 ///
 /// Every condition is a thing the instruction then does not have to carry or
 /// re-derive: one `[i]` step and nothing after it, an index operand at the
-/// bottom of the chain's operand window, a plain `=` rather than an
-/// op-assignment, no null-conditional short circuit, and a root that is a slot
-/// — the only root a write can land in without a write-back.
-fn index_set_slot(chain: &Chain) -> Option<u16> {
+/// bottom of the chain's operand window, no null-conditional short circuit,
+/// and a root that is a slot — the only root a write can land in without a
+/// write-back, and the only one a read reaches without evaluating anything.
+///
+/// An op-assignment is refused. `a[i] += 1` reads, applies and writes back
+/// through one `Target`, and neither instruction here is built to hold the
+/// element open across the operator.
+fn indexed_slot(chain: &Chain) -> Option<u16> {
     let Root::Local { slot, .. } = chain.root else {
         return None;
     };
-    let Tail::Assign { op: None } = chain.tail else {
-        return None;
-    };
+    match chain.tail {
+        Tail::Read | Tail::Assign { op: None } => {}
+        Tail::Assign { op: Some(..) } => return None,
+    }
     let [Step::Index {
         operand: 0, flags, ..
     }] = chain.steps[..]

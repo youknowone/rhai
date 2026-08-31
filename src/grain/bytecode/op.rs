@@ -975,6 +975,28 @@ pub enum Op {
         slot: u16,
     },
 
+    /// Read `local[index]`, with the chain it specialises beside it.
+    ///
+    /// [`Op::IndexSet`] for the read half of the same shape, decided the same
+    /// way and speculating on the same types: the local has to hold an
+    /// unshared `Array` and the index has to be a non-negative integer inside
+    /// it. A loop that reads an array is what this exists for — the write had
+    /// an instruction and the read went through the walk.
+    ///
+    /// Anything it declines runs `chain`, which is the very chain this
+    /// replaced, so a string, a map, a bitfield, a negative index, a custom
+    /// indexer and an out-of-range index are answered by the generic walk and
+    /// report exactly what it reports.
+    ///
+    /// Leaves the element in the index operand's place, so the stack is one
+    /// deep either way.
+    IndexGet {
+        /// Index into the chain pool, for the fallback.
+        chain: u32,
+        /// The slot the root local lives in.
+        slot: u16,
+    },
+
     /// Apply a unary operator to the top of the stack, replacing it.
     ///
     /// [`Op::BinOp`] for one operand, and speculative in the same way: the

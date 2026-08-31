@@ -238,6 +238,9 @@ pub mod tag {
     pub const BIN_OP_RHS_LOCAL: u8 = 0x53;
     /// [`Op::BinOp`](super::Op::BinOp) with a constant on the right.
     pub const BIN_OP_RHS_CONST: u8 = 0x54;
+
+    /// [`Op::IndexGet`](super::Op::IndexGet).
+    pub const INDEX_GET: u8 = 0x55;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -332,6 +335,7 @@ static WIDTHS: [u8; 256] = {
     widths[tag::BIN_OP as usize] = 6;
     widths[tag::UN_OP as usize] = 4;
     widths[tag::INDEX_SET as usize] = 5;
+    widths[tag::INDEX_GET as usize] = 5;
     widths[tag::CALL_LOCAL_REF as usize] = 6;
     widths[tag::CALL_LOCAL_REF_CAPTURE as usize] = 6;
     widths[tag::CALL_NAMED_REF as usize] = 6;
@@ -704,6 +708,12 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&slot.to_le_bytes());
             }
 
+            Op::IndexGet { chain, slot } => {
+                code.push(tag::INDEX_GET);
+                code.extend_from_slice(&small(*chain as usize, "chains")?.to_le_bytes());
+                code.extend_from_slice(&slot.to_le_bytes());
+            }
+
             Op::MakeArray(len) => {
                 code.push(tag::MAKE_ARRAY);
                 code.extend_from_slice(&len.to_le_bytes());
@@ -976,6 +986,7 @@ fn encoded_width(op: &Op) -> usize {
         | Op::SkipIfNotUnit { .. }
         | Op::IterNext { .. }
         | Op::IndexSet { .. }
+        | Op::IndexGet { .. }
         | Op::PushHandler {
             catch_var: None, ..
         } => 5,
@@ -1153,6 +1164,10 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
 
         tag::CHAIN => Op::Chain(u32::from(small(1)?)),
         tag::INDEX_SET => Op::IndexSet {
+            chain: u32::from(small(1)?),
+            slot: small(3)?,
+        },
+        tag::INDEX_GET => Op::IndexGet {
             chain: u32::from(small(1)?),
             slot: small(3)?,
         },
@@ -1463,6 +1478,11 @@ mod tests {
                 lhs: 4,
                 rhs: BinOperand::Const(6),
             },
+            // The chain pool's index and the slot beside it, in both
+            // specialised spellings and the general one they fall back to.
+            Op::Chain(2),
+            Op::IndexSet { chain: 2, slot: 4 },
+            Op::IndexGet { chain: 2, slot: 4 },
             // Its exit is an instruction index here and an address after
             // assembly, like every other jump — index 0 is `Const(7)`, which
             // is at 0.

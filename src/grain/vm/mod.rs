@@ -5793,6 +5793,60 @@ impl<'e> Vm<'e> {
                     drop(self.run_chain(program, chain, index, scope, base, pos!())?);
                 }
 
+                code::tag::INDEX_GET => {
+                    // `Op::IndexSet`'s speculation, read side: the compiler
+                    // decided the shape and what is left to test is the types.
+                    // A shared root or a shared element breaks out, because the
+                    // walk reaches either through a `Target` that takes a write
+                    // lock and this does not.
+                    //
+                    // The index is the chain's one operand, and the element
+                    // replaces it — `Target::take_or_clone` clones what it
+                    // referenced, so a clone is what the walk produces too.
+                    #[cfg_attr(feature = "no_index", allow(unused_mut))]
+                    let mut read = false;
+                    #[cfg(not(feature = "no_index"))]
+                    'fast: {
+                        let Some(under) = self.depth.checked_sub(1) else {
+                            break 'fast;
+                        };
+                        let Union::Int(i, ..) = stack_ref(self, under).0 else {
+                            break 'fast;
+                        };
+                        // A negative index counts from the end, which is
+                        // `get_indexed_mut`'s rule and not worth restating.
+                        let Ok(i) = usize::try_from(i) else {
+                            break 'fast;
+                        };
+                        let at = base + small!(3) as usize;
+                        if at >= scope_len!() {
+                            break 'fast;
+                        }
+                        let Union::Array(array, ..) = &scope_entry!(at).0 else {
+                            break 'fast;
+                        };
+                        let Some(cell) = array.get(i) else {
+                            break 'fast;
+                        };
+                        if is_shared!(*cell) {
+                            break 'fast;
+                        }
+                        let value = cell.clone();
+                        *stack_mut(self, under) = value;
+                        read = true;
+                    }
+                    if read {
+                        pc += width;
+                        continue;
+                    }
+
+                    let index = u32::from(small!(1));
+                    let chain =
+                        or_raise!(program.chain(index), malformed(format!("no chain {index}")));
+                    let value = self.run_chain(program, chain, index, scope, base, pos!())?;
+                    self.push(value);
+                }
+
                 code::tag::UNWIND_TO => {
                     let depth = small!(1);
                     let target = base + depth as usize;

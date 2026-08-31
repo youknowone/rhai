@@ -129,6 +129,8 @@ fn the_round_trip_covers_something_worth_covering() {
         "string_slice_inclusive", // and the other range tag
         #[cfg(not(feature = "no_index"))]
         "index_assign_array", // IndexSet, the specialised slot-rooted write
+        #[cfg(not(feature = "no_index"))]
+        "index_read_local_array", // IndexGet, its read half
         // and one that keeps the general instruction, so the chain encoder's
         // slot-rooted branch stays covered now that the plain write does not
         // reach it — indexed too, and so `no_index` syntax as well
