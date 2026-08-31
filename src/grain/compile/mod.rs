@@ -1479,13 +1479,11 @@ impl Lowering {
                         flow.expr.position(),
                     ),
                 }
-                self.emit_at(Op::Tick, flow.body.position());
-
                 self.begin_for(top, outside);
                 if !self.block_discarding(flow.body.statements()) {
                     return false;
                 }
-                self.emit(Op::Jump(top));
+                self.emit_at(Op::Jump(top), flow.body.position());
                 let breaks = self.end_loop();
 
                 // Exhausted: `IterNext` dropped the iterator on the way here.
@@ -1518,7 +1516,6 @@ impl Lowering {
                 let unconditional = matches!(expr, Expr::Unit(..) | Expr::BoolConstant(true, ..));
 
                 let top = self.here();
-                self.emit_at(Op::Tick, body.position());
 
                 let exit = if unconditional {
                     None
@@ -1531,7 +1528,13 @@ impl Lowering {
                 if !self.block_discarding(body.statements()) {
                     return false;
                 }
-                self.emit(Op::Jump(top));
+                // The back edge is where the turn is charged an operation —
+                // the dispatch loop meters every backward transfer, so an
+                // instruction at the header metering it a second time is one
+                // dispatch and one position lookup per iteration for a count
+                // nothing reads. It carries the body's position because that
+                // is the place the charge is reported against.
+                self.emit_at(Op::Jump(top), body.position());
 
                 let breaks = self.end_loop();
                 if let Some(exit) = exit {
@@ -1553,7 +1556,6 @@ impl Lowering {
                 let until = flags.contains(ASTFlags::NEGATED);
 
                 let top = self.here();
-                self.emit_at(Op::Tick, body.position());
 
                 self.begin_loop(top);
                 if !self.block_discarding(body.statements()) {
@@ -1568,7 +1570,7 @@ impl Lowering {
                     self.emit_at(Op::JumpIfFalse { target: top }, expr.position());
                 } else {
                     let exit = self.emit_jump_if_false(expr.position());
-                    self.emit(Op::Jump(top));
+                    self.emit_at(Op::Jump(top), body.position());
                     self.patch_here(exit);
                 }
 
@@ -1581,7 +1583,7 @@ impl Lowering {
                 true
             }
 
-            Stmt::BreakLoop(value, flags, ..) => {
+            Stmt::BreakLoop(value, flags, pos) => {
                 let Some(active) = self.loops.last() else {
                     // Outside any loop this is a parse error in Rhai, so it
                     // should be unreachable; bail rather than emit a jump to
@@ -1619,7 +1621,9 @@ impl Lowering {
                     self.pop_handlers(loop_handlers);
                     self.drop_iterators(loop_iters);
                     self.emit(Op::UnwindTo(continue_depth));
-                    self.emit(Op::Jump(continue_target));
+                    // A back edge of its own, and charged as one, so it names
+                    // the place the charge is reported against.
+                    self.emit_at(Op::Jump(continue_target), *pos);
                 }
 
                 // Unreachable, but every statement must leave a value for the
@@ -3096,20 +3100,20 @@ mod tests {
         // body to fewer instructions is the point, and only raising one of
         // these numbers should have to be argued for.
         const SOURCES: &[(&str, usize, &str)] = &[
-            ("tight integer loop", 6, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
-            ("float arithmetic", 9, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
-            ("script fn calls", 6, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
+            ("tight integer loop", 5, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
+            ("float arithmetic", 8, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
+            ("script fn calls", 5, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
             ("recursive fibonacci", 14, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
                 "switch, 4 arms",
-                12,
+                11,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } \
                  } s",
             ),
             (
                 "switch, 16 arms",
-                36,
+                35,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 16 { \
                  0 => s += 1, 1 => s += 2, 2 => s += 3, 3 => s += 4, \
@@ -3118,17 +3122,17 @@ mod tests {
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
                  } s",
             ),
-            ("branch heavy", 14, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
-            ("native function calls", 8, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
+            ("branch heavy", 13, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
+            ("native function calls", 7, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
             (
                 "native callbacks",
-                6,
+                5,
                 "let a = []; for i in 0..500 { a.push(i); } \
                  let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
             ),
             (
                 "primes",
-                7,
+                6,
                 r#"
             const SIZE = 1_000_000;
 

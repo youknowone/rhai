@@ -4763,13 +4763,15 @@ impl<'e> Vm<'e> {
             // is charged an operation.
             //
             // A cycle in a chunk always contains a backward edge, so this is
-            // what makes `max_operations` and the `on_progress` interrupt cover
-            // a chunk *this compiler did not write*. `Op::Tick` covers the
-            // loops it does write, positioned where Rhai would report them; a
-            // corrupt artifact has no ticks at all and would otherwise spin
-            // forever inside a loader that had already accepted it. Found by
-            // `mutated_artifacts_load_or_fail_but_never_misbehave`, whose whole
-            // claim is that this cannot happen.
+            // the whole of `max_operations` and the `on_progress` interrupt —
+            // for the loops this compiler writes and for a chunk it did not.
+            // A corrupt artifact carries no metering instruction and would
+            // otherwise spin forever inside a loader that had already accepted
+            // it. Found by `mutated_artifacts_load_or_fail_but_never_misbehave`,
+            // whose whole claim is that this cannot happen.
+            //
+            // The back edge a loop is lowered with names the body's position,
+            // so what a stopped loop reports is the place Rhai reports.
             //
             // A macro rather than four open-coded checks because the failure
             // mode of missing one is silent, and because it costs nothing on

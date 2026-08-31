@@ -745,12 +745,16 @@ pub enum Op {
     /// Count one operation against `max_operations`, and give `on_progress` a
     /// chance to terminate.
     ///
-    /// Emitted on loop back-edges. Rhai ticks per AST node, so counts differ;
-    /// what this preserves is that a limit is enforced and an interrupt is
-    /// honoured, which is what allows `loop {}` to be killed.
+    /// This compiler emits none. A cycle always contains a backward transfer of
+    /// control and the dispatch loop charges an operation there, so that a chunk
+    /// it did not write is stoppable too; a loop that also carried one of these
+    /// at its header paid for the same turn twice. Rhai ticks per AST node, so
+    /// no count matches it either way, and what a charge preserves is that a
+    /// limit is enforced and an interrupt is honoured — which is what allows
+    /// `loop {}` to be killed.
     ///
-    /// Its table entry is read on every iteration rather than only on failure,
-    /// which is why the in-memory position table is dense.
+    /// Still decodable, because the charge is part of the artifact format and a
+    /// producer other than this compiler may spell it.
     Tick,
 
     /// Record the current scope length as the depth an error escaping this

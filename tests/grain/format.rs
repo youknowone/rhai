@@ -112,7 +112,7 @@ fn the_round_trip_covers_something_worth_covering() {
         #[cfg(not(feature = "no_float"))]
         "float_arithmetic",
         "shadowing_nested", // DeclareLocal and UnwindTo
-        "while_loop",       // jumps, Tick, AssignLocal with an op
+        "while_loop",       // jumps, AssignLocal with an op
         "loop_break_value", // backpatched jumps
         // A position that has to survive. `unchecked` turns the failure it
         // rests on into a panic in Rhai, so the case is not run at all there.
@@ -661,8 +661,8 @@ fn trailing_bytes_are_refused() {
 /// **Verification is not termination.** A flipped jump target that still lands
 /// inside the chunk is a structurally valid infinite loop, and this test hung
 /// until it ran under a budget. That is not a gap to close — no loader can
-/// decide halting — it is the reason `Op::Tick` sits on every back edge and the
-/// reason the patch exposes `track_operation`. A host running untrusted
+/// decide halting — it is the reason the VM charges an operation for every
+/// backward transfer and the reason the patch exposes `track_operation`. A host running untrusted
 /// bytecode must set `max_operations`, exactly as it must for untrusted source.
 #[test]
 // A corrupted chunk can loop, and `max_operations` is what stops it. Without

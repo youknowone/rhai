@@ -157,8 +157,9 @@ pub enum VerifyError {
 /// that passes cannot underflow the operand stack, jump outside itself, or
 /// decode an operand as an instruction. What it does *not* prove is
 /// termination — a jump target inside the chunk is well-formed whether or not
-/// it closes a loop — which is why [`Op::Tick`] sits on every back edge and why
-/// a host running untrusted bytecode still needs `max_operations`.
+/// it closes a loop — which is why the dispatch loop charges an operation for
+/// every backward transfer and why a host running untrusted bytecode still
+/// needs `max_operations`.
 ///
 /// Returns the measured stack high water, which is what the chunk should
 /// declare.

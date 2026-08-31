@@ -7,9 +7,10 @@
 //! performance one, which is why `track_operation` is in the patch.
 //!
 //! These live outside the differential corpus on purpose. The walker ticks per
-//! node and the VM ticks per loop back-edge, so the operation *counts* differ
-//! and always will. What must hold is that the limit fires and the interrupt is
-//! honoured, so that is what is asserted — not parity of counts or positions.
+//! node and the VM charges one operation per backward transfer, so the
+//! operation *counts* differ and always will. What must hold is that the limit
+//! fires and the interrupt is honoured, so that is what is asserted — not
+//! parity of counts or positions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -28,9 +29,10 @@ fn run_vm(engine: &Engine, source: &str) -> Result<Dynamic, Box<EvalAltResult>> 
 
     assert_eq!(program.residual_count(), 0, "{source:?} must be fully lowered, or this tests Rhai rather than the VM",);
 
-    // Without a tick on the back-edge nothing in a compiled loop ever reaches
-    // `track_operation`, and the tests below would hang rather than fail.
-    assert!(program.main().ops(program.code()).any(|(_, op)| op == Op::Tick), "{source:?} lowered to a loop with no operation tick",);
+    // Nothing in the code meters: the charge is on the backward transfer, and
+    // without one in the chunk the tests below would hang rather than fail.
+    assert!(!program.main().ops(program.code()).any(|(_, op)| op == Op::Tick), "{source:?} lowered with a metering instruction, which this compiler does not emit",);
+    assert!(program.main().ops(program.code()).any(|(at, op)| matches!(op, Op::Jump(target) if target as usize <= at)), "{source:?} lowered to a loop with no backward jump to charge",);
 
     Vm::new(engine).eval_with_scope(&mut Scope::new(), &program)
 }
@@ -63,45 +65,65 @@ fn compiled_loop_honours_the_progress_interrupt() {
     assert!(ticks.load(Ordering::SeqCst) >= 500, "on_progress should have been called on every back-edge",);
 }
 
-/// A chunk that loops with no tick in it must still be stopped.
+/// A chunk that loops with no metering instruction in it must still be stopped.
 ///
-/// Every loop this compiler emits carries an `Op::Tick` on its back-edge, so
-/// nothing it produces can spin. An artifact is not required to have come from
-/// it. Turning this program's tick into a no-op leaves a chunk that still
-/// verifies — the jump is in range, the stack balances, every path reaches a
-/// `Return` — and runs forever, which makes the engine's budget the only thing
-/// between a host and a hostile file.
+/// An artifact is not required to have come from this compiler. A cycle whose
+/// instructions all do ordinary work still verifies — the jump is in range, the
+/// stack balances, every path reaches a `Return` — and runs forever, which
+/// would make a hostile file unanswerable.
 ///
-/// So the budget cannot depend on the compiler having been generous: the VM
+/// So the budget cannot depend on the producer having been generous: the VM
 /// charges an operation for every *backward* transfer, and a cycle always has
-/// one. Found by `mutated_artifacts_load_or_fail_but_never_misbehave`, which
-/// hung on a mutation rather than failing.
+/// one. Written against a hand-built chunk rather than a compiled one because
+/// what is under test is the artifact a loader accepts, not the lowering.
+/// Found by `mutated_artifacts_load_or_fail_but_never_misbehave`, which hung on
+/// a mutation rather than failing.
 #[test]
-fn a_loop_with_its_tick_removed_still_hits_the_limit() {
+fn a_loop_with_no_metering_instruction_still_hits_the_limit() {
     let mut engine = Engine::new();
     engine.set_max_operations(10_000);
 
     let ast = engine.compile(SPIN).expect("must compile");
     let program = Compiler::new().compile(&ast);
 
-    // Where the tick sits inside the code, and what the code looks like, so the
-    // same bytes can be found again inside the finished artifact.
-    let code = program.code().to_vec();
-    let (tick_at, _) = program.main().ops(program.code()).find(|(_, op)| *op == Op::Tick).expect("the compiler ticks a loop");
+    // Through the artifact rather than straight from the compiler, so what runs
+    // is what a loader would have accepted off disk.
+    let bytes = program.write().expect("a lowered program must write");
+    let loaded = Program::read(&bytes).expect("a valid artifact");
+    assert!(!loaded.main().ops(loaded.code()).any(|(_, op)| op == Op::Tick), "nothing in the chunk may meter, or this tests the instruction rather than the transfer",);
 
-    let mut bytes = program.write().expect("a lowered program must write");
-    let start = bytes.windows(code.len()).position(|window| window == code).expect("the artifact embeds the code verbatim");
-
-    // `Checkpoint` is the other one-byte instruction that does nothing to the
-    // stack, so this swap leaves every offset, jump target and position entry
-    // exactly where it was. Only the metering goes.
-    bytes[start + tick_at] = rhai::grain::bytecode::code::tag::CHECKPOINT;
-
-    let tick_less = Program::read(&bytes).expect("still a valid artifact");
-    assert!(!tick_less.main().ops(tick_less.code()).any(|(_, op)| op == Op::Tick), "the tick should be gone, or this tests nothing",);
-
-    let err = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &tick_less).expect_err("a tick_less loop must still be stopped");
+    let err = Vm::new(&engine)
+        .eval_with_scope(&mut Scope::new(), &loaded)
+        .expect_err("a loop with nothing metering it must still be stopped");
     assert!(matches!(*err, EvalAltResult::ErrorTooManyOperations(..)), "expected ErrorTooManyOperations, got {err:?}",);
+}
+
+/// A turn of a loop is charged exactly one operation.
+///
+/// Two instructions used to meter the same turn: one the lowering put at the
+/// loop header and the backward transfer that closes it. A budget a host sets
+/// is then spent at twice the rate the loop runs, which stops a script the
+/// setting was chosen to allow — so the rate is pinned here rather than left to
+/// follow the shape of the lowering.
+#[test]
+fn a_turn_of_a_loop_is_charged_once() {
+    let counted = Arc::new(AtomicU64::new(0));
+    let seen = counted.clone();
+
+    let mut engine = Engine::new();
+    engine.on_progress(move |count| {
+        seen.store(count, Ordering::SeqCst);
+        None
+    });
+
+    let source = "let s = 0; let i = 0; while i < 100 { s += i; i += 1; } s";
+    let ast = engine.compile(source).expect("must compile");
+    let program = Compiler::new().compile(&ast);
+    assert_eq!(program.residual_count(), 0, "must be lowered, not walked");
+
+    Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("a bounded loop must finish");
+
+    assert_eq!(counted.load(Ordering::SeqCst), 100, "one hundred turns, one charge each",);
 }
 
 /// The walker and the VM must agree that the script *fails*, even though they
