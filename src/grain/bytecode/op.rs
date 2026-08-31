@@ -906,7 +906,14 @@ pub enum Op {
     /// (`eval/stmt.rs:877`).
     Throw,
 
-    /// Pop two operands and apply a binary operator to them, pushing the result.
+    /// Apply a binary operator to two operands, pushing the result.
+    ///
+    /// The left operand is always popped. The right is popped too unless the
+    /// instruction names it: `<expression> op <local>` and `<expression> op
+    /// <constant>` push a value and take it off again on the very next
+    /// instruction, exactly as [`Op::BinOpFrom`]'s pair does — the difference
+    /// is only that here the left operand is not a lone read, so there is
+    /// nothing to fold on that side. `i % 3 == 0` and `x * 1.5` are the shape.
     ///
     /// The specialised form of [`Op::Call`] with `argc: 2` and an operator
     /// token, and it carries the same `name` and `op` so that it can *be* that
@@ -934,6 +941,8 @@ pub enum Op {
         op: u32,
         /// Which operator this is.
         kind: BinOpKind,
+        /// Where the right operand comes from; popped when absent.
+        rhs: Option<BinOperand>,
     },
 
     /// Assign into `local[index]`, with the chain it specialises beside it.

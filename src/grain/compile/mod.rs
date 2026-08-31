@@ -2120,7 +2120,12 @@ impl Lowering {
         }
 
         let mark = self.mark();
+        // Where the LAST argument's code starts, which for a binary operator
+        // is its right-hand side. The pair fold below wants the whole range;
+        // the right-hand fold wants only this much of it.
+        let mut rhs_mark = mark;
         for arg in call.args.iter() {
+            rhs_mark = self.mark();
             self.expression(arg);
         }
         let name = self.push_name(call.name.clone());
@@ -2169,7 +2174,19 @@ impl Lowering {
                 );
                 return;
             }
-            self.emit_at(Op::BinOp { name, op, kind }, pos);
+            // Failing that, the right-hand side alone: `i % 3 == 0` computes
+            // its left operand and cannot fold it, but the `0` is still a push
+            // this instruction takes straight off again.
+            let rhs = self.fold_pushed_operand(rhs_mark);
+            self.emit_at(
+                Op::BinOp {
+                    name,
+                    op,
+                    kind,
+                    rhs,
+                },
+                pos,
+            );
             return;
         }
 
@@ -3080,7 +3097,7 @@ mod tests {
         // these numbers should have to be argued for.
         const SOURCES: &[(&str, usize, &str)] = &[
             ("tight integer loop", 6, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
-            ("float arithmetic", 11, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
+            ("float arithmetic", 9, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
             ("script fn calls", 6, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
             ("recursive fibonacci", 14, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
@@ -3101,7 +3118,7 @@ mod tests {
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
                  } s",
             ),
-            ("branch heavy", 16, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
+            ("branch heavy", 14, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
             ("native function calls", 8, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
             (
                 "native callbacks",

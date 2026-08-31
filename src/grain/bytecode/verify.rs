@@ -606,7 +606,10 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
 
         // The same, with the count fixed: an operator takes two operands
         // whichever way the instruction ends up running.
-        Op::BinOp { .. } => (2, 2, 1),
+        // The named-right form takes only its left operand off the stack; the
+        // other it reads for itself, as `BinOpFrom` reads both.
+        Op::BinOp { rhs: Some(..), .. } => (1, 1, 1),
+        Op::BinOp { rhs: None, .. } => (2, 2, 1),
 
         // The same for one operand.
         Op::UnOp { .. } => (1, 1, 1),
@@ -734,6 +737,22 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         }
         // The operands are a slot, which is checked against the scope when it
         // runs, and either a second slot or a constant index.
+        tag::BIN_OP_RHS_LOCAL | tag::BIN_OP_RHS_CONST => {
+            bounded(index(1), "name", pools.names)?;
+            let kind = u32::from(code[at + 3]);
+            if BinOpKind::from_byte(code[at + 3]).is_none() {
+                return Err(VerifyError::BadIndex {
+                    at,
+                    what: "operator kind",
+                    index: kind,
+                });
+            }
+            bounded(index(4), "operator", pools.tokens)?;
+            if code[at] == tag::BIN_OP_RHS_CONST {
+                bounded(index(6), "constant", pools.consts)?;
+            }
+            Ok(())
+        }
         tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_CONST => {
             bounded(index(1), "name", pools.names)?;
             let kind = u32::from(code[at + 3]);

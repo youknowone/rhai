@@ -231,6 +231,13 @@ pub mod tag {
     /// [`Op::AssignLocalFrom`](super::Op::AssignLocalFrom) reading a constant,
     /// through an operator.
     pub const ASSIGN_LOCAL_FROM_CONST_OP: u8 = 0x52;
+    /// [`Op::BinOp`](super::Op::BinOp) with the right operand in a slot.
+    ///
+    /// The same operand layout as [`BIN_OP`] with that slot after it, so the
+    /// four share a dispatch arm and one fallback with [`BIN_OP_FROM_LOCAL`].
+    pub const BIN_OP_RHS_LOCAL: u8 = 0x53;
+    /// [`Op::BinOp`](super::Op::BinOp) with a constant on the right.
+    pub const BIN_OP_RHS_CONST: u8 = 0x54;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -338,6 +345,9 @@ static WIDTHS: [u8; 256] = {
 
     widths[tag::ASSIGN_LOCAL_FROM_OP as usize] = 9;
     widths[tag::ASSIGN_LOCAL_FROM_CONST_OP as usize] = 9;
+
+    widths[tag::BIN_OP_RHS_LOCAL as usize] = 8;
+    widths[tag::BIN_OP_RHS_CONST as usize] = 8;
 
     widths[tag::BIN_OP_FROM_LOCAL as usize] = 10;
     widths[tag::BIN_OP_FROM_CONST as usize] = 10;
@@ -607,11 +617,27 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.extend_from_slice(&small(*token as usize, "operators")?.to_le_bytes());
             }
 
-            Op::BinOp { name, op, kind } => {
-                code.push(tag::BIN_OP);
+            Op::BinOp {
+                name,
+                op,
+                kind,
+                rhs,
+            } => {
+                code.push(match rhs {
+                    None => tag::BIN_OP,
+                    Some(BinOperand::Local(..)) => tag::BIN_OP_RHS_LOCAL,
+                    Some(BinOperand::Const(..)) => tag::BIN_OP_RHS_CONST,
+                });
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*kind as u8);
                 code.extend_from_slice(&small(*op as usize, "operators")?.to_le_bytes());
+                if let Some(rhs) = rhs {
+                    let rhs = match rhs {
+                        BinOperand::Local(slot) => *slot,
+                        BinOperand::Const(index) => small(*index as usize, "constants")?,
+                    };
+                    code.extend_from_slice(&rhs.to_le_bytes());
+                }
             }
 
             Op::UnOp { name, kind } => {
@@ -958,11 +984,12 @@ fn encoded_width(op: &Op) -> usize {
             ..
         } => 7,
         Op::Call { op: Some(..), .. }
-        | Op::BinOp { .. }
+        | Op::BinOp { rhs: None, .. }
         | Op::CallRef {
             receiver: Receiver::Local(..) | Receiver::Named(..),
             ..
         } => 6,
+        Op::BinOp { rhs: Some(..), .. } => 8,
         Op::AssignLocal { op: Some(..), .. }
         | Op::AssignLocalFrom { op: None, .. }
         | Op::IterNextStore { .. } => 7,
@@ -1088,10 +1115,15 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         // A kind byte naming nothing is not an instruction, which is what
         // keeps a corrupt artifact from reaching the VM's operator table with
         // an index it cannot answer.
-        tag::BIN_OP => Op::BinOp {
+        tag::BIN_OP | tag::BIN_OP_RHS_LOCAL | tag::BIN_OP_RHS_CONST => Op::BinOp {
             name: u32::from(small(1)?),
             op: u32::from(small(4)?),
             kind: BinOpKind::from_byte(code[at + 3])?,
+            rhs: match code[at] {
+                tag::BIN_OP_RHS_LOCAL => Some(BinOperand::Local(small(6)?)),
+                tag::BIN_OP_RHS_CONST => Some(BinOperand::Const(u32::from(small(6)?))),
+                _ => None,
+            },
         },
 
         tag::UN_OP => Op::UnOp {
@@ -1399,6 +1431,24 @@ mod tests {
             Op::AssignThis { op: None },
             Op::AssignThis { op: Some(6) },
             Op::Rotate(3),
+            Op::BinOp {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Add,
+                rhs: None,
+            },
+            Op::BinOp {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Add,
+                rhs: Some(BinOperand::Local(5)),
+            },
+            Op::BinOp {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                rhs: Some(BinOperand::Const(6)),
+            },
             Op::BinOpFrom {
                 name: 1,
                 op: 3,

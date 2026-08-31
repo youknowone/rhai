@@ -5190,6 +5190,8 @@ impl<'e> Vm<'e> {
                 | code::tag::BIN_OP
                 | code::tag::BIN_OP_FROM_LOCAL
                 | code::tag::BIN_OP_FROM_CONST
+                | code::tag::BIN_OP_RHS_LOCAL
+                | code::tag::BIN_OP_RHS_CONST
                 | code::tag::UN_OP => {
                     // A fused operator names its operands instead of taking
                     // them off the stack; pushed here so that everything below
@@ -5226,6 +5228,31 @@ impl<'e> Vm<'e> {
                                     .clone()
                             };
                             self.push(lhs);
+                            self.push(rhs);
+                            true
+                        }
+                        // Only the right operand is named here; the left is
+                        // already on the stack, where the expression that
+                        // computed it left it.
+                        code::tag::BIN_OP_RHS_LOCAL | code::tag::BIN_OP_RHS_CONST => {
+                            let rhs = if tag == code::tag::BIN_OP_RHS_LOCAL {
+                                let slot = small!(6);
+                                let index = base + slot as usize;
+                                if index >= scope_len!() {
+                                    return Err(malformed(format!(
+                                        "local slot {slot} is out of scope"
+                                    )));
+                                }
+                                scope_entry!(index).flatten_clone()
+                            } else {
+                                let index = u32::from(small!(6));
+                                #[cfg(feature = "grain-jit")]
+                                let constant = jit::program_constant(program, index);
+                                #[cfg(not(feature = "grain-jit"))]
+                                let constant = program.constant(index);
+                                or_raise!(constant, malformed(format!("no constant {index}")))
+                                    .clone()
+                            };
                             self.push(rhs);
                             true
                         }
