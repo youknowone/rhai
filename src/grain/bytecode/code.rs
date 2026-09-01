@@ -430,6 +430,76 @@ static WIDTHS: [u8; 256] = {
     widths
 };
 
+/// What the dispatch loop's operator-and-call arm needs to know about a tag.
+///
+/// Every operator and every call a program runs is dispatched through that one
+/// arm, and each of them asks what the instruction names, what its result is
+/// for, and where its operator comes from. Asked by comparison, those are
+/// three walks of a tag list that lengthens every time the compiler learns a
+/// new fused spelling — paid by every instruction sharing the arm, whether or
+/// not the spelling that lengthened it is the one running. Packed into a byte
+/// they are one load and a mask apiece.
+pub mod form {
+    /// The instruction is also the branch that reads its own result.
+    pub const BRANCHES: u8 = 0x01;
+    /// A binary operator: once this arm has pushed whatever the instruction
+    /// names, its two operands are on top of the stack and the typed fast
+    /// path can run.
+    pub const TYPED: u8 = 0x02;
+    /// A unary operator, whose one operand is already on the stack.
+    pub const UNARY: u8 = 0x04;
+    /// Names both operands — the left at offset 6 and the right at offset 8.
+    pub const NAMES_FROM: u8 = 0x08;
+    /// Names the right operand only, at offset 6.
+    pub const NAMES_RHS: u8 = 0x10;
+    /// What a named operand is: a slot rather than a constant. The left
+    /// operand of a [`NAMES_FROM`] instruction is a slot either way.
+    pub const NAMED_IS_LOCAL: u8 = 0x20;
+    /// The operator token comes out of the pool.
+    pub const POOLED_OP: u8 = 0x40;
+    /// The call sees the scope it was called from.
+    pub const CAPTURES: u8 = 0x80;
+}
+
+/// [`form`], one entry per tag. Zero for `CALL` and for every tag the
+/// operator-and-call arm never sees, which ask nothing of this.
+static FORMS: [u8; 256] = {
+    let mut forms = [0u8; 256];
+
+    forms[tag::CALL_CAPTURE as usize] = form::CAPTURES;
+    forms[tag::CALL_OP as usize] = form::POOLED_OP;
+
+    forms[tag::UN_OP as usize] = form::UNARY;
+    forms[tag::UN_OP_JF as usize] = form::UNARY | form::BRANCHES;
+
+    let binop = form::TYPED | form::POOLED_OP;
+    forms[tag::BIN_OP as usize] = binop;
+    forms[tag::BIN_OP_JF as usize] = binop | form::BRANCHES;
+
+    let rhs = binop | form::NAMES_RHS;
+    forms[tag::BIN_OP_RHS_CONST as usize] = rhs;
+    forms[tag::BIN_OP_RHS_LOCAL as usize] = rhs | form::NAMED_IS_LOCAL;
+    forms[tag::BIN_OP_RHS_CONST_JF as usize] = rhs | form::BRANCHES;
+    forms[tag::BIN_OP_RHS_LOCAL_JF as usize] = rhs | form::NAMED_IS_LOCAL | form::BRANCHES;
+
+    let from = binop | form::NAMES_FROM;
+    forms[tag::BIN_OP_FROM_CONST as usize] = from;
+    forms[tag::BIN_OP_FROM_LOCAL as usize] = from | form::NAMED_IS_LOCAL;
+    forms[tag::BIN_OP_FROM_CONST_JF as usize] = from | form::BRANCHES;
+    forms[tag::BIN_OP_FROM_LOCAL_JF as usize] = from | form::NAMED_IS_LOCAL | form::BRANCHES;
+
+    forms
+};
+
+/// What the operator-and-call arm does with the instruction tagged `tag`.
+///
+/// See [`form`](self::form) for the fields.
+#[must_use]
+#[inline]
+pub fn form(tag: u8) -> u8 {
+    FORMS[tag as usize]
+}
+
 /// How many bytes the instruction at `at` occupies, or `None` if the tag is
 /// unknown or the operands run past the end.
 #[must_use]
@@ -1906,6 +1976,57 @@ mod tests {
                 entries: 70_000,
             }),
         );
+    }
+
+    /// The dispatch loop reads [`form`] rather than asking the tag list what
+    /// an instruction is, so a wrong entry is not something it can notice: it
+    /// would read the operands of a shape the instruction is not, and answer
+    /// with them. The list is spelled out here because the arm does not
+    /// spell it out anywhere.
+    #[test]
+    fn every_tag_the_operator_arm_dispatches_names_its_own_shape() {
+        use form::{
+            BRANCHES, CAPTURES, NAMED_IS_LOCAL, NAMES_FROM, NAMES_RHS, POOLED_OP, TYPED, UNARY,
+        };
+
+        const BIN: u8 = TYPED | POOLED_OP;
+        const EXPECTED: &[(u8, u8)] = &[
+            (tag::CALL, 0),
+            (tag::CALL_CAPTURE, CAPTURES),
+            (tag::CALL_OP, POOLED_OP),
+            (tag::UN_OP, UNARY),
+            (tag::UN_OP_JF, UNARY | BRANCHES),
+            (tag::BIN_OP, BIN),
+            (tag::BIN_OP_JF, BIN | BRANCHES),
+            (tag::BIN_OP_RHS_CONST, BIN | NAMES_RHS),
+            (tag::BIN_OP_RHS_LOCAL, BIN | NAMES_RHS | NAMED_IS_LOCAL),
+            (tag::BIN_OP_RHS_CONST_JF, BIN | NAMES_RHS | BRANCHES),
+            (
+                tag::BIN_OP_RHS_LOCAL_JF,
+                BIN | NAMES_RHS | NAMED_IS_LOCAL | BRANCHES,
+            ),
+            (tag::BIN_OP_FROM_CONST, BIN | NAMES_FROM),
+            (tag::BIN_OP_FROM_LOCAL, BIN | NAMES_FROM | NAMED_IS_LOCAL),
+            (tag::BIN_OP_FROM_CONST_JF, BIN | NAMES_FROM | BRANCHES),
+            (
+                tag::BIN_OP_FROM_LOCAL_JF,
+                BIN | NAMES_FROM | NAMED_IS_LOCAL | BRANCHES,
+            ),
+        ];
+
+        for (tag, expected) in EXPECTED {
+            assert_eq!(form(*tag), *expected, "tag {tag:#04x}");
+        }
+        for tag in 0..=u8::MAX {
+            if EXPECTED.iter().any(|(named, ..)| *named == tag) {
+                continue;
+            }
+            assert_eq!(
+                form(tag),
+                0,
+                "tag {tag:#04x} is not dispatched by the operator arm",
+            );
+        }
     }
 
     #[test]

@@ -5355,91 +5355,42 @@ impl<'e> Vm<'e> {
                     // finds them where it always did. The two instructions this
                     // replaces did exactly this and cost two more trips round
                     // the dispatch loop for it.
-                    let typed = match tag {
-                        code::tag::BIN_OP_FROM_LOCAL
-                        | code::tag::BIN_OP_FROM_CONST
-                        | code::tag::BIN_OP_FROM_LOCAL_JF
-                        | code::tag::BIN_OP_FROM_CONST_JF => {
-                            let slot = small!(6);
-                            let index = base + slot as usize;
-                            if index >= scope_len!() {
-                                return Err(malformed(format!(
-                                    "local slot {slot} is out of scope"
-                                )));
-                            }
-                            let lhs = scope_entry!(index).flatten_clone();
-                            let rhs = if matches!(
-                                tag,
-                                code::tag::BIN_OP_FROM_LOCAL | code::tag::BIN_OP_FROM_LOCAL_JF
-                            ) {
-                                let slot = small!(8);
-                                let index = base + slot as usize;
-                                if index >= scope_len!() {
-                                    return Err(malformed(format!(
-                                        "local slot {slot} is out of scope"
-                                    )));
-                                }
-                                scope_entry!(index).flatten_clone()
-                            } else {
-                                let index = u32::from(small!(8));
-                                #[cfg(feature = "grain-jit")]
-                                let constant = jit::program_constant(program, index);
-                                #[cfg(not(feature = "grain-jit"))]
-                                let constant = program.constant(index);
-                                or_raise!(constant, malformed(format!("no constant {index}")))
-                                    .clone()
-                            };
-                            self.push(lhs);
-                            self.push(rhs);
-                            true
-                        }
+                    // What this instruction names, what its result is for
+                    // and where its operator comes from, in one table read.
+                    // Every operator and every call a program runs arrives
+                    // here and asks all three, so asking by comparison walks
+                    // a tag list that lengthens with each fused spelling the
+                    // compiler learns to emit.
+                    let form = code::form(tag);
+                    let named_is_local = form & code::form::NAMED_IS_LOCAL != 0;
+                    if form & code::form::NAMES_FROM != 0 {
+                        // A fused operator names its operands instead of
+                        // taking them off the stack; pushed here so that
+                        // everything below — the typed arms and the dispatch
+                        // they fall through to — finds them where it always
+                        // did. The two instructions this replaces did exactly
+                        // this and cost two more trips round the dispatch loop
+                        // for it. The left operand is a slot in both
+                        // spellings of this shape; only the right one is
+                        // spelled either way.
+                        let lhs = operand_value!(6, true);
+                        let rhs = operand_value!(8, named_is_local);
+                        self.push(lhs);
+                        self.push(rhs);
+                    } else if form & code::form::NAMES_RHS != 0 {
                         // Only the right operand is named here; the left is
                         // already on the stack, where the expression that
                         // computed it left it.
-                        code::tag::BIN_OP_RHS_LOCAL
-                        | code::tag::BIN_OP_RHS_CONST
-                        | code::tag::BIN_OP_RHS_LOCAL_JF
-                        | code::tag::BIN_OP_RHS_CONST_JF => {
-                            let rhs = if matches!(
-                                tag,
-                                code::tag::BIN_OP_RHS_LOCAL | code::tag::BIN_OP_RHS_LOCAL_JF
-                            ) {
-                                let slot = small!(6);
-                                let index = base + slot as usize;
-                                if index >= scope_len!() {
-                                    return Err(malformed(format!(
-                                        "local slot {slot} is out of scope"
-                                    )));
-                                }
-                                scope_entry!(index).flatten_clone()
-                            } else {
-                                let index = u32::from(small!(6));
-                                #[cfg(feature = "grain-jit")]
-                                let constant = jit::program_constant(program, index);
-                                #[cfg(not(feature = "grain-jit"))]
-                                let constant = program.constant(index);
-                                or_raise!(constant, malformed(format!("no constant {index}")))
-                                    .clone()
-                            };
-                            self.push(rhs);
-                            true
-                        }
-                        _ => matches!(tag, code::tag::BIN_OP | code::tag::BIN_OP_JF),
-                    };
+                        let rhs = operand_value!(6, named_is_local);
+                        self.push(rhs);
+                    }
+                    let typed = form & code::form::TYPED != 0;
 
                     // Whether this instruction is also the branch that reads
                     // its result. A fused form carries the target as its last
                     // operand, so it sits four bytes from the end and needs no
                     // offset of its own.
-                    let branching = matches!(
-                        tag,
-                        code::tag::UN_OP_JF
-                            | code::tag::BIN_OP_JF
-                            | code::tag::BIN_OP_RHS_LOCAL_JF
-                            | code::tag::BIN_OP_RHS_CONST_JF
-                            | code::tag::BIN_OP_FROM_LOCAL_JF
-                            | code::tag::BIN_OP_FROM_CONST_JF
-                    );
+                    let branching = form & code::form::BRANCHES != 0;
                     // What the operator's result is for: pushed, or read by
                     // the branch the instruction swallowed and not pushed at
                     // all. Every way out of this arm goes through here, so an
@@ -5515,7 +5466,7 @@ impl<'e> Vm<'e> {
                     // the result belongs and the stack does not change depth --
                     // unless the instruction is the branch that reads it, which
                     // leaves nothing behind at all.
-                    let unary = matches!(tag, code::tag::UN_OP | code::tag::UN_OP_JF);
+                    let unary = form & code::form::UNARY != 0;
                     if unary && fast_operators!() {
                         let under = or_raise!(self.depth.checked_sub(1), {
                             malformed("operator with too few operands".to_string())
@@ -5540,7 +5491,7 @@ impl<'e> Vm<'e> {
                         program.name(name_index),
                         malformed(format!("no name {name_index}"))
                     );
-                    let capture = tag == code::tag::CALL_CAPTURE;
+                    let capture = form & code::form::CAPTURES != 0;
                     // The kind byte sits where an argument count would, because
                     // an operator's count is always two — or, for `UN_OP`, one.
                     let argc = if typed {
@@ -5550,7 +5501,7 @@ impl<'e> Vm<'e> {
                     } else {
                         byte!(3) as usize
                     };
-                    let op = if typed || tag == code::tag::CALL_OP {
+                    let op = if form & code::form::POOLED_OP != 0 {
                         let index = u32::from(small!(4));
                         Some(or_raise!(
                             program.token(index),
