@@ -281,6 +281,12 @@ pub mod tag {
     /// becomes of the value it arrives at differs — so the two share a dispatch
     /// arm.
     pub const CHAIN_DISCARD: u8 = 0x5f;
+
+    /// [`Op::UnOp`](super::Op::UnOp) that is also the branch reading it.
+    ///
+    /// The same operand layout as [`UN_OP`] with the branch target after it,
+    /// on the pattern [`BIN_OP_JF`] follows.
+    pub const UN_OP_JF: u8 = 0x60;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -403,6 +409,7 @@ static WIDTHS: [u8; 256] = {
     widths[tag::BIN_OP_FROM_CONST as usize] = 10;
 
     // Each one its unbranched spelling plus the target.
+    widths[tag::UN_OP_JF as usize] = 8;
     widths[tag::BIN_OP_JF as usize] = 10;
     widths[tag::BIN_OP_RHS_LOCAL_JF as usize] = 12;
     widths[tag::BIN_OP_RHS_CONST_JF as usize] = 12;
@@ -704,10 +711,17 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 }
             }
 
-            Op::UnOp { name, kind } => {
-                code.push(tag::UN_OP);
+            Op::UnOp { name, kind, branch } => {
+                code.push(if branch.is_some() {
+                    tag::UN_OP_JF
+                } else {
+                    tag::UN_OP
+                });
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*kind as u8);
+                if let Some(branch) = branch {
+                    code.extend_from_slice(&target(*branch)?.to_le_bytes());
+                }
             }
 
             Op::CallRef {
@@ -1052,7 +1066,7 @@ fn encoded_width(op: &Op) -> usize {
         | Op::AssignThis { op: Some(..) }
         | Op::CheckSize { .. } => 3,
         Op::Call { op: None, .. }
-        | Op::UnOp { .. }
+        | Op::UnOp { branch: None, .. }
         | Op::CallRef {
             receiver: Receiver::This,
             ..
@@ -1099,6 +1113,9 @@ fn encoded_width(op: &Op) -> usize {
         | Op::IterNextStore { .. } => 7,
         Op::AssignLocalFrom { op: Some(..), .. } => 9,
         // Each fused form is its unbranched spelling plus the target.
+        Op::UnOp {
+            branch: Some(..), ..
+        } => 8,
         Op::BinOp {
             rhs: None,
             branch: Some(..),
@@ -1260,9 +1277,13 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             },
         },
 
-        tag::UN_OP => Op::UnOp {
+        tag::UN_OP | tag::UN_OP_JF => Op::UnOp {
             name: u32::from(small(1)?),
             kind: UnOpKind::from_byte(code[at + 3])?,
+            branch: match code[at] {
+                tag::UN_OP_JF => Some(u32_at(code, at + 4)?),
+                _ => None,
+            },
         },
 
         tag @ (tag::CALL_LOCAL_REF | tag::CALL_LOCAL_REF_CAPTURE) => Op::CallRef {
@@ -1637,7 +1658,7 @@ mod tests {
                 rhs: BinOperand::Const(6),
                 branch: None,
             },
-            // The same five carrying the branch that reads their result.
+            // The same six carrying the branch that reads their result.
             Op::BinOp {
                 name: 1,
                 op: 3,
@@ -1673,6 +1694,16 @@ mod tests {
                 kind: BinOpKind::Less,
                 lhs: 4,
                 rhs: BinOperand::Const(6),
+                branch: Some(0),
+            },
+            Op::UnOp {
+                name: 1,
+                kind: UnOpKind::Not,
+                branch: None,
+            },
+            Op::UnOp {
+                name: 1,
+                kind: UnOpKind::Not,
                 branch: Some(0),
             },
             // The chain pool's index and the slot beside it, in both

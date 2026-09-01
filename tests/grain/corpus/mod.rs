@@ -368,6 +368,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "this_survives_a_failed_chain"
             | "try_catch_native_error"
             | "type_of_a_container"
+            | "unary_not_guard_on_an_indexed_read"
     ) {
         return false;
     }
@@ -584,6 +585,12 @@ pub const CASES: &[Case] = &[
     // goes, and it has to arrive at a test rather than past one.
     case("coalesce_guard_ends_in_a_comparison", "let a = (); let b = 1; if a ?? (b < 2) { 1 } else { 2 }"),
     case("coalesce_guard_skips_to_the_branch", "let a = true; let b = 1; if a ?? (b < 2) { 1 } else { 2 }"),
+    // A guard that is a unary operator, which carries its branch the same way.
+    // `!` is the one the walker short-circuits, so the guard reaches the typed
+    // arm for a `bool` and the dispatch for anything else.
+    case("unary_not_guard_on_an_indexed_read", "let a = [true, false]; let i = 1; if !a[i] { 1 } else { 2 }"),
+    case("unary_not_while_guard", "let b = true; let n = 0; while !b { n += 1; } n"),
+    case("error_unary_not_guard_int", "let i = 1; if !i { 1 } else { 2 }"),
     // A chain in statement position, which is what a loop writing a container
     // is made of. The walk runs for the method's effect and nothing reads what
     // it arrived at, so the instruction drops the value rather than pushing it

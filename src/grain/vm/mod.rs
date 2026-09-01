@@ -4265,6 +4265,18 @@ impl<'e> Vm<'e> {
         ))
     }
 
+    /// Whether a guard holds, for an operator that is also the branch reading
+    /// its result.
+    ///
+    /// Rhai requires a boolean guard and reports the mismatch at the guard's
+    /// own position (`eval/stmt.rs:487-490`), which is the fused instruction's
+    /// -- the operator that computed the guard *is* the guard expression.
+    fn guard_holds(&self, value: Dynamic, pos: Position) -> Result<bool, Box<EvalAltResult>> {
+        value
+            .as_bool()
+            .map_err(|actual| self.mismatch::<bool>(actual, pos))
+    }
+
     /// What reading a key a map does not have produces.
     ///
     /// Unit, unless the host asked for the strict reading — which is a whole
@@ -5265,7 +5277,8 @@ impl<'e> Vm<'e> {
                 | code::tag::BIN_OP_FROM_CONST_JF
                 | code::tag::BIN_OP_RHS_LOCAL_JF
                 | code::tag::BIN_OP_RHS_CONST_JF
-                | code::tag::UN_OP => {
+                | code::tag::UN_OP
+                | code::tag::UN_OP_JF => {
                     // A fused operator names its operands instead of taking
                     // them off the stack; pushed here so that everything below
                     // — the typed arms and the dispatch they fall through to —
@@ -5344,43 +5357,38 @@ impl<'e> Vm<'e> {
                         _ => matches!(tag, code::tag::BIN_OP | code::tag::BIN_OP_JF),
                     };
 
-                    // Where the target of the branch this instruction also is
-                    // sits, when it is one. Behind whatever operand the tag
-                    // names, which is the only thing that moves it.
-                    let branch = match tag {
-                        code::tag::BIN_OP_JF => Some(6),
-                        code::tag::BIN_OP_RHS_LOCAL_JF | code::tag::BIN_OP_RHS_CONST_JF => Some(8),
-                        code::tag::BIN_OP_FROM_LOCAL_JF | code::tag::BIN_OP_FROM_CONST_JF => {
-                            Some(10)
-                        }
-                        _ => None,
-                    };
+                    // Whether this instruction is also the branch that reads
+                    // its result. A fused form carries the target as its last
+                    // operand, so it sits four bytes from the end and needs no
+                    // offset of its own.
+                    let branching = matches!(
+                        tag,
+                        code::tag::UN_OP_JF
+                            | code::tag::BIN_OP_JF
+                            | code::tag::BIN_OP_RHS_LOCAL_JF
+                            | code::tag::BIN_OP_RHS_CONST_JF
+                            | code::tag::BIN_OP_FROM_LOCAL_JF
+                            | code::tag::BIN_OP_FROM_CONST_JF
+                    );
                     // What the operator's result is for: pushed, or read by
                     // the branch the instruction swallowed and not pushed at
                     // all. Every way out of this arm goes through here, so an
-                    // operand pair the typed arms decline reaches the same
-                    // branch by the same rule the pair of instructions reached
-                    // it by. Rhai requires a boolean guard and reports the
-                    // mismatch at the guard's own position, which is this
-                    // instruction's (`eval/stmt.rs:487-490`).
+                    // operand the typed arms decline reaches the same branch by
+                    // the same rule the pair of instructions reached it by.
+                    //
+                    // The reading itself is a call rather than more of this
+                    // macro, because the macro stands at three exits and the
+                    // arm every instruction sharing it dispatches through is
+                    // the arm this lives in.
                     macro_rules! deliver {
                         ($floor:expr, $value:expr) => {{
                             let value = $value;
                             truncate_stack!($floor);
-                            match branch {
-                                None => self.push(value),
-                                Some(offset) => {
-                                    let holds = match value.as_bool() {
-                                        Ok(holds) => holds,
-                                        Err(actual) => {
-                                            return Err(self.mismatch::<bool>(actual, pos!()))
-                                        }
-                                    };
-                                    if !holds {
-                                        transfer!(wide!(offset) as usize);
-                                        continue;
-                                    }
-                                }
+                            if !branching {
+                                self.push(value);
+                            } else if !self.guard_holds(value, pos!())? {
+                                transfer!(wide!(width - 4) as usize);
+                                continue;
                             }
                         }};
                     }
@@ -5434,8 +5442,10 @@ impl<'e> Vm<'e> {
                     // without (`func/call.rs` `eval_fn_call_expr`).
                     //
                     // One value in and one out, so the operand's slot is where
-                    // the result belongs and the stack does not change depth.
-                    let unary = tag == code::tag::UN_OP;
+                    // the result belongs and the stack does not change depth --
+                    // unless the instruction is the branch that reads it, which
+                    // leaves nothing behind at all.
+                    let unary = matches!(tag, code::tag::UN_OP | code::tag::UN_OP_JF);
                     if unary && fast_operators!() {
                         let under = or_raise!(self.depth.checked_sub(1), {
                             malformed("operator with too few operands".to_string())
@@ -5444,7 +5454,11 @@ impl<'e> Vm<'e> {
                         // the dispatch below answers whatever it answers.
                         if let Some(kind) = UnOpKind::from_byte(byte!(3)) {
                             if let Some(value) = apply_unary(kind, stack_ref(self, under)) {
-                                *stack_mut(self, under) = value;
+                                if branching {
+                                    deliver!(under, value);
+                                } else {
+                                    *stack_mut(self, under) = value;
+                                }
                                 pc += width;
                                 continue;
                             }

@@ -105,8 +105,9 @@ fn the_round_trip_covers_something_worth_covering() {
     // One per construct the encoder has a branch for, so a branch that stops
     // working names itself.
     for required in [
-        "int_arithmetic", // BinOp, and the operator pool it falls back through
-        "unary_not_bool", // UnOp, which carries no operator index at all
+        "int_arithmetic",  // BinOp, and the operator pool it falls back through
+        "unary_not_bool",  // UnOp, which carries no operator index at all
+        "unary_not_guard", // and the same operator carrying its branch
         // A float constant, whose width the ABI pins — and which `no_float`
         // removes from the language, so there is no branch left to cover.
         #[cfg(not(feature = "no_float"))]

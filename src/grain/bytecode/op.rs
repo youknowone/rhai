@@ -1062,11 +1062,18 @@ pub enum Op {
     ///
     /// Gated at run time on `Engine::fast_operators()`, matching the walker's
     /// own unary short-circuit in `eval_fn_call_expr`.
+    ///
+    /// It takes a branch on the same terms [`Op::BinOp`] does. `if !flag` and
+    /// `if !mask[i]` are the shape: the operator runs, and the only thing that
+    /// ever reads what it produced is the jump behind it.
     UnOp {
         /// The operator's name, for the dispatch fallback and error messages.
         name: u32,
         /// Which operator this is.
         kind: UnOpKind,
+        /// Where to go when the result is false, for an operator that is also
+        /// the test of a branch; the result is consumed rather than pushed.
+        branch: Option<u32>,
     },
 
     /// Apply a binary operator to a local and a second operand named by the

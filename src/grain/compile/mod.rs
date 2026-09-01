@@ -2174,7 +2174,14 @@ impl Lowering {
         // because it wants nothing from it. See [`Op::UnOp`].
         if argc == 1 {
             if let Some(kind) = call.op_token.as_ref().and_then(UnOpKind::of) {
-                self.emit_at(Op::UnOp { name, kind }, pos);
+                self.emit_at(
+                    Op::UnOp {
+                        name,
+                        kind,
+                        branch: None,
+                    },
+                    pos,
+                );
                 return;
             }
         }
@@ -2832,12 +2839,12 @@ impl Lowering {
 
     /// Give the operator that computed a condition the branch that reads it.
     ///
-    /// `while i < n`, `if i % 3 == 0` and every guard written that way push a
-    /// `bool` that the very next instruction takes straight off again — the
-    /// same trade [`BinOperand`] is for elsewhere, made on an operator's
-    /// result rather than on its operands. The operator instruction carries
-    /// the dispatching form it falls back to, so a pair the typed arms decline
-    /// still answers what the two instructions answered.
+    /// `while i < n`, `if i % 3 == 0`, `if !mask[i]` and every guard written
+    /// that way push a `bool` that the very next instruction takes straight
+    /// off again — the same trade [`BinOperand`] is for elsewhere, made on an
+    /// operator's result rather than on its operands. The operator instruction
+    /// carries the dispatching form it falls back to, so an operand the typed
+    /// arms decline still answers what the two instructions answered.
     ///
     /// Refused unless the operator is the last instruction emitted and its
     /// position is the branch's own, so that the one position-table entry
@@ -2859,6 +2866,10 @@ impl Lowering {
                 ..
             }
             | Op::BinOpFrom {
+                branch: branch @ None,
+                ..
+            }
+            | Op::UnOp {
                 branch: branch @ None,
                 ..
             } => *branch = Some(target),
@@ -3078,6 +3089,10 @@ fn jump_target_mut(op: &mut Op) -> Option<&mut u32> {
             ..
         }
         | Op::BinOpFrom {
+            branch: Some(target),
+            ..
+        }
+        | Op::UnOp {
             branch: Some(target),
             ..
         } => Some(target),
