@@ -287,6 +287,23 @@ pub enum Receiver {
     This,
 }
 
+/// A branch folded into the operator that computes its condition.
+///
+/// The operator consumes its own result instead of pushing it for the jump
+/// that would have read it back — the same trade [`BinOperand`] makes on an
+/// operator's operands, made on its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Branch {
+    /// Where it goes.
+    pub target: u32,
+    /// The result that takes it.
+    ///
+    /// False for a guard, which skips what it guards. True for the test of a
+    /// loop that sits below its own body: the body is reached by taking the
+    /// branch, and the loop is left by falling past it.
+    pub taken_when: bool,
+}
+
 /// One VM instruction, as the compiler emits it and a disassembly shows it.
 ///
 /// **Not the executed form.** A program's code is a byte slice, assembled from
@@ -1122,9 +1139,9 @@ pub enum Op {
         lhs: u16,
         /// Where the right operand comes from.
         rhs: BinOperand,
-        /// Where to go when the result is false, for an operator that is also
-        /// the test of a branch; the result is consumed rather than pushed.
-        branch: Option<u32>,
+        /// The branch this operator is also the test of; the result is
+        /// consumed rather than pushed.
+        branch: Option<Branch>,
     },
 
     /// End the chunk, yielding the top of the operand stack, or unit if empty.

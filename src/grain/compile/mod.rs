@@ -17,13 +17,19 @@ use crate::types::Span;
 use crate::{Dynamic, ImmutableString, Position, AST};
 
 use crate::grain::bytecode::{
-    assemble, resolve_switch_targets, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Op, Positions,
-    Receiver, Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind,
+    assemble, resolve_switch_targets, AssignOp, BinOpKind, BinOperand, Branch, Chain, Chunk, Op,
+    Positions, Receiver, Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind,
 };
 use crate::grain::compile::poolable::is_poolable;
 use crate::grain::compile::slots::Slots;
 use crate::grain::format::Caps;
 use crate::grain::program::{Function, Parts, Program};
+
+/// Whether a conditional `while` is lowered with its test below the body.
+///
+/// A measurement switch, not a tuning knob: the two lowerings differ by one
+/// dispatch per turn, and two builds differ by their code layout as well. One
+/// binary that can emit either compares the bytecode and nothing else.
 
 /// Whether a variable reference is module-qualified, as in `foo::bar`.
 ///
@@ -66,9 +72,15 @@ macro_rules! call_has_namespace {
 /// Anything not yet lowered is kept as an AST fragment and handed back to
 /// Rhai's walker at runtime, so the output always means the same as its input.
 /// Progress is [`Program::residual_count`] falling.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Compiler {
-    _private: (),
+    rotate_while: bool,
+}
+
+impl Default for Compiler {
+    fn default() -> Self {
+        Self { rotate_while: true }
+    }
 }
 
 impl Compiler {
@@ -76,6 +88,18 @@ impl Compiler {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Whether a conditional `while` is lowered with its test below the body.
+    ///
+    /// A measurement option, not a tuning knob. The two shapes differ by one
+    /// dispatch per turn, and two builds differ by their code layout as well —
+    /// enough, on this workload, to swamp the difference being asked about. A
+    /// caller that can emit either compares the bytecode and nothing else.
+    #[must_use]
+    pub fn rotate_while(mut self, rotated: bool) -> Self {
+        self.rotate_while = rotated;
+        self
     }
 
     /// Lower an `AST` into a [`Program`].
@@ -99,6 +123,7 @@ impl Compiler {
         let fresh = |caps| Lowering {
             script_fns: script_fns.clone(),
             caps,
+            rotate_while: self.rotate_while,
             ..Lowering::default()
         };
 
@@ -299,6 +324,8 @@ struct LoweredFn {
 
 #[derive(Default)]
 struct Lowering {
+    /// See [`Compiler::rotate_while`].
+    rotate_while: bool,
     /// Capabilities required by the instructions emitted so far.
     /// The compiler does not know what the caller will do with the output,
     /// so it has to assume the worst and report everything it uses.
@@ -1543,7 +1570,7 @@ impl Lowering {
                         flow.expr.position(),
                     ),
                 }
-                let (breaks, continues) = self.end_for();
+                let (breaks, continues) = self.end_loop();
                 // `continue` advances the iterator, so it arrives at the
                 // header rather than at the body.
                 for site in continues {
@@ -1578,28 +1605,51 @@ impl Lowering {
                 let FlowControl { expr, body, .. } = &**payload;
                 let unconditional = matches!(expr, Expr::Unit(..) | Expr::BoolConstant(true, ..));
 
+                // Unconditional: nothing to test, so there is nothing to
+                // rotate the body around and the back edge stays a jump.
+                // Otherwise the test is emitted below the body and branches
+                // back into it, which is one dispatch off every turn: the
+                // body reaches the test by falling into it, and the jump that
+                // used to carry it there is gone.
+                //
+                // Either way the back edge is where the turn is charged an
+                // operation — the dispatch loop meters every backward
+                // transfer, so a second instruction metering it would be one
+                // dispatch and one position lookup per iteration for a count
+                // nothing reads.
+                let rotated = !unconditional && self.rotate_while;
+                let entry = rotated.then(|| self.emit_jump());
                 let top = self.here();
-
-                let exit = if unconditional {
-                    None
-                } else {
+                // The unrotated shape, for the measurement switch only: the
+                // test sits above the body and the back edge is a jump.
+                let exit = (!rotated && !unconditional).then(|| {
                     self.expression(expr);
-                    Some(self.emit_jump_if_false(expr.position()))
-                };
+                    self.emit_jump_if_false(expr.position())
+                });
 
-                self.begin_loop(top);
+                self.begin_loop((!rotated).then_some(top));
                 if !self.block_discarding(body.statements()) {
                     return false;
                 }
-                // The back edge is where the turn is charged an operation —
-                // the dispatch loop meters every backward transfer, so an
-                // instruction at the header metering it a second time is one
-                // dispatch and one position lookup per iteration for a count
-                // nothing reads. It carries the body's position because that
-                // is the place the charge is reported against.
-                self.emit_at(Op::Jump(top), body.position());
-
-                let breaks = self.end_loop();
+                let breaks = match entry {
+                    None => {
+                        self.emit_at(Op::Jump(top), body.position());
+                        self.end_loop().0
+                    }
+                    Some(entry) => {
+                        let test = self.here();
+                        self.patch_to(entry, test);
+                        self.expression(expr);
+                        self.emit_branch_if_true(top, expr.position());
+                        let (breaks, continues) = self.end_loop();
+                        // `continue` re-tests, so it arrives at the test
+                        // rather than at the body.
+                        for site in continues {
+                            self.patch_to(site, test);
+                        }
+                        breaks
+                    }
+                };
                 if let Some(exit) = exit {
                     self.patch_here(exit);
                 }
@@ -1620,11 +1670,11 @@ impl Lowering {
 
                 let top = self.here();
 
-                self.begin_loop(top);
+                self.begin_loop(Some(top));
                 if !self.block_discarding(body.statements()) {
                     return false;
                 }
-                let breaks = self.end_loop();
+                let (breaks, ..) = self.end_loop();
 
                 self.expression(expr);
                 if until {
@@ -2905,11 +2955,26 @@ impl Lowering {
     /// one — see [`Self::fold_branch`] — so the site returned may be an
     /// instruction that was already there.
     fn emit_branch_if_false(&mut self, target: u32, pos: Position) -> usize {
-        if let Some(site) = self.fold_branch(target, pos) {
+        if let Some(site) = self.fold_branch(target, pos, false) {
             return site;
         }
         let site = self.code.len();
         self.emit_at(Op::JumpIfFalse { target }, pos);
+        site
+    }
+
+    /// Branch to `target` when the condition on top of the stack holds.
+    ///
+    /// The shape a rotated loop needs: its test sits below the body and jumps
+    /// back into it, so the edge taken every turn is the one the condition
+    /// makes true.
+    fn emit_branch_if_true(&mut self, target: u32, pos: Position) -> usize {
+        if let Some(site) = self.fold_branch(target, pos, true) {
+            return site;
+        }
+        let site = self.code.len();
+        self.emit_at(Op::JumpIfTrue { target }, pos);
+        self.note_target(target);
         site
     }
 
@@ -2931,24 +2996,28 @@ impl Lowering {
     /// branch would go. That edge exists — an `&&` operand's short circuit
     /// leaves one behind — and it has to arrive at a test rather than past
     /// one.
-    fn fold_branch(&mut self, target: u32, pos: Position) -> Option<usize> {
+    fn fold_branch(&mut self, target: u32, pos: Position, taken_when: bool) -> Option<usize> {
         let last = self.code.len().checked_sub(1)?;
         if self.patched_max as usize > last || self.positions[last] != pos {
             return None;
         }
         match &mut self.code[last] {
-            Op::BinOp {
+            Op::BinOpFrom {
                 branch: branch @ None,
                 ..
-            }
-            | Op::BinOpFrom {
+            } => *branch = Some(Branch { target, taken_when }),
+            // Only `BinOpFrom` is spelled both ways round, so these two
+            // answer a guard and decline a rotated loop's test. Declining
+            // costs the jump back, which is what the test would have been
+            // folded into — never more than the shape it replaces.
+            Op::BinOp {
                 branch: branch @ None,
                 ..
             }
             | Op::UnOp {
                 branch: branch @ None,
                 ..
-            } => *branch = Some(target),
+            } if !taken_when => *branch = Some(target),
             _ => return None,
         }
         self.note_target(target);
@@ -3002,10 +3071,10 @@ impl Lowering {
 
     /// Open a loop whose `break` and `continue` unwind to the same place —
     /// `while`, `loop` and `do`, which declare nothing of their own.
-    fn begin_loop(&mut self, continue_target: u32) {
+    fn begin_loop(&mut self, continue_target: Option<u32>) {
         let depth = u16::try_from(self.slots.depth()).expect("slot count is bounded");
         self.loops.push(Loop {
-            continue_target: Some(continue_target),
+            continue_target,
             break_depth: depth,
             continue_depth: depth,
             iters: self.iters,
@@ -3032,18 +3101,12 @@ impl Lowering {
         });
     }
 
-    fn end_loop(&mut self) -> Vec<usize> {
-        let done = self.loops.pop().expect("loop stack is balanced");
-        debug_assert!(
-            done.continues.is_empty(),
-            "a loop that named its continue target leaves no sites to patch"
-        );
-        done.breaks
-    }
-
-    /// Close a `for`, which leaves both lists: its `continue` sites name the
-    /// header, and the header is emitted after the body they sit in.
-    fn end_for(&mut self) -> (Vec<usize>, Vec<usize>) {
+    /// Close a loop, handing back its `break` sites and its `continue` sites.
+    ///
+    /// The second list is empty for a loop that named its continue target
+    /// when it opened, and holds every `continue` in one whose test sits
+    /// below the body that reaches it.
+    fn end_loop(&mut self) -> (Vec<usize>, Vec<usize>) {
         let done = self.loops.pop().expect("loop stack is balanced");
         (done.breaks, done.continues)
     }
@@ -3179,7 +3242,7 @@ fn jump_target_mut(op: &mut Op) -> Option<&mut u32> {
             ..
         }
         | Op::BinOpFrom {
-            branch: Some(target),
+            branch: Some(Branch { target, .. }),
             ..
         }
         | Op::UnOp {
@@ -3430,8 +3493,8 @@ mod tests {
         // body to fewer instructions is the point, and only raising one of
         // these numbers should have to be argued for.
         const SOURCES: &[(&str, usize, &str)] = &[
-            ("tight integer loop", 4, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
-            ("float arithmetic", 7, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
+            ("tight integer loop", 3, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
+            ("float arithmetic", 6, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
             ("script fn calls", 4, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
             ("recursive fibonacci", 13, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
@@ -3504,15 +3567,31 @@ mod tests {
             // there to the last back edge naming it. A loop has several: a
             // `continue` is one, and `Lowering::thread_jumps` turns each arm's
             // jump into another, so taking the first cuts the body off at the
-            // first arm. A `for` loop's own back edge belongs to the
-            // instruction that advances the iterator, not to a `Jump`.
+            // first arm. A rotated loop's own back edge belongs to whatever
+            // sits at the bottom testing it — the instruction that advances
+            // the iterator, or the operator that swallowed the test — so this
+            // asks every op that names a target, not only `Jump`.
             let edges: Vec<(usize, usize)> = decoded
                 .iter()
                 .filter_map(|(at, op)| {
                     let target = match op {
                         Op::Jump(target)
+                        | Op::JumpIfFalse { target }
+                        | Op::JumpIfTrue { target }
                         | Op::IterNext { body: target, .. }
-                        | Op::IterNextStore { body: target, .. } => *target as usize,
+                        | Op::IterNextStore { body: target, .. }
+                        | Op::BinOp {
+                            branch: Some(target),
+                            ..
+                        }
+                        | Op::UnOp {
+                            branch: Some(target),
+                            ..
+                        } => *target as usize,
+                        Op::BinOpFrom {
+                            branch: Some(Branch { target, .. }),
+                            ..
+                        } => *target as usize,
                         _ => return None,
                     };
                     (target <= *at).then_some((target, *at))
@@ -3572,6 +3651,59 @@ mod tests {
             assert!(
                 total <= *ceiling,
                 "{name} lowers its body to {total} instructions, up from {ceiling}"
+            );
+        }
+    }
+
+    /// Both `while` shapes are reachable, so both have to be right.
+    ///
+    /// [`Compiler::rotate_while`] leaves a lowering in the compiler that a
+    /// default build never emits, and nothing else here would run it. The two
+    /// differ in where the test sits and which way round its branch is read,
+    /// which is exactly the kind of difference that shows up as a loop running
+    /// one turn too few rather than as anything that fails to verify.
+    #[test]
+    fn a_while_is_the_same_loop_whichever_way_its_test_faces() {
+        const SOURCES: &[&str] = &[
+            "let s = 0; let i = 0; while i < 5 { s += i; i += 1; } s",
+            // Zero turns: the entry hop has to arrive at the test rather than
+            // at the body.
+            "let s = 9; let i = 0; while i < 0 { s += 1; i += 1; } s",
+            // `continue` re-tests, and `break` leaves with a value.
+            "let s = 0; let i = 0; while i < 9 { i += 1; if i % 2 == 0 { continue; } if i > 6 { break; } s += i; } s",
+            // A test the operator cannot swallow, so the branch stays an
+            // instruction of its own.
+            "let s = 0; let i = 0; while `${i}` != `20` { s += i; i += 1; } s",
+            // Nested, so an inner loop's rotation has to leave the outer
+            // loop's `break` and `continue` sites alone.
+            "let t = 0; let i = 0; while i < 4 { let j = 0; while j < 4 { t += 1; j += 1; } i += 1; } t",
+        ];
+
+        let engine = crate::Engine::new();
+        for source in SOURCES {
+            let ast = engine.compile(source).expect("must compile");
+            let answers: Vec<String> = [false, true]
+                .into_iter()
+                .map(|rotated| {
+                    let program = Compiler::new().rotate_while(rotated).compile(&ast);
+                    program.verify().unwrap_or_else(|err| {
+                        panic!("rotated={rotated} does not verify: {err:?} for {source}")
+                    });
+                    let value = crate::grain::Vm::new(&engine)
+                        .eval_with_scope(&mut crate::Scope::new(), &program)
+                        .unwrap_or_else(|err| panic!("rotated={rotated} failed: {err} for {source}"));
+                    format!("{value:?}")
+                })
+                .collect();
+            assert_eq!(answers[0], answers[1], "the two lowerings disagree on {source}");
+
+            let expected = engine
+                .eval_ast_with_scope::<Dynamic>(&mut crate::Scope::new(), &ast)
+                .expect("the walker must succeed");
+            assert_eq!(
+                format!("{expected:?}"),
+                answers[1],
+                "neither lowering agrees with the walker on {source}",
             );
         }
     }
@@ -3708,13 +3840,45 @@ mod tests {
         let decoded = lower(
             "fn h(x) { let i = 0; while i < x { if i == 3 { i += 1; } else { i += 2; } } i }",
         );
+        // The test sits below the body it tests, so it holds the loop's only
+        // back edge, and both arms converge on it: one by the jump that used
+        // to carry it to the header, the other by falling into it.
+        let test = decoded
+            .iter()
+            .find_map(|(at, op)| {
+                matches!(
+                    op,
+                    Op::BinOpFrom {
+                        branch: Some(Branch {
+                            taken_when: true,
+                            ..
+                        }),
+                        ..
+                    }
+                )
+                .then_some(*at)
+            })
+            .expect("the loop's test must carry a branch back into its body");
         let back_edges = decoded
             .iter()
-            .filter(|(at, op)| matches!(op, Op::Jump(target) if (*target as usize) <= *at))
+            .filter(|(at, op)| match op {
+                Op::Jump(target) => (*target as usize) <= *at,
+                Op::BinOpFrom {
+                    branch: Some(Branch { target, .. }),
+                    ..
+                } => (*target as usize) <= *at,
+                _ => false,
+            })
+            .count();
+        assert_eq!(back_edges, 1, "the loop's one back edge is its test");
+        let arrivals = decoded
+            .iter()
+            .filter(|(.., op)| matches!(op, Op::Jump(target) if *target as usize == test))
             .count();
         assert_eq!(
-            back_edges, 2,
-            "both arms of the loop body must still arrive at the header",
+            arrivals, 2,
+            "the hop that enters the loop and the arm that does not fall into \
+             the test both jump to it",
         );
     }
 

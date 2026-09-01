@@ -173,6 +173,14 @@ required-features = ["serde"]
 name = "definitions"
 required-features = ["metadata", "internals"]
 
+# Two lowerings, or two spellings of one dispatch arm, alternating inside one
+# process. Two separately built binaries measured the same loop body at 38.4
+# and 61.1 ns/iter, so a change to either cannot be graded by building it
+# twice.
+[[example]]
+name = "grain_ab"
+required-features = ["grain"]
+
 # VM-versus-walker timings. Run with `--release`; `-- --check` exits non-zero
 # on a case that has fallen below the floor recorded beside it.
 [[example]]

@@ -622,6 +622,7 @@ pub const CASES: &[Case] = &[
     // after all rather than never pushed.
     case("chain_in_statement_position_at_a_jump_target", "let a = [1]; let n = 1; if n > 0 { a.push(2); } else { a.clear(); } a"),
     case("while_loop", "let i = 0; let s = 0; while i < 5 { s += i; i += 1; } s"),
+    case("while_loop_local_bound", "let n = 5; let i = 0; let s = 0; while i < n { s += i; i += 1; } s"),
     case("do_while", "let i = 0; do { i += 1; } while i < 3; i"),
     case("do_until", "let i = 0; do { i += 1; } until i >= 3; i"),
     case("loop_break_value", "let i = 0; loop { i += 1; if i > 4 { break i * 10; } }"),

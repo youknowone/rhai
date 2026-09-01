@@ -113,7 +113,12 @@ fn the_round_trip_covers_something_worth_covering() {
         #[cfg(not(feature = "no_float"))]
         "float_arithmetic",
         "shadowing_nested", // DeclareLocal and UnwindTo
-        "while_loop",       // jumps, AssignLocal with an op
+        // Jumps, and AssignLocal with an op. A rotated loop's test also
+        // branches back into the body it sits below, so its operator is
+        // spelled the other way round from a guard's — once here against a
+        // constant, and once below against a slot.
+        "while_loop",
+        "while_loop_local_bound",
         "loop_break_value", // backpatched jumps
         // A position that has to survive. `unchecked` turns the failure it
         // rests on into a panic in Rhai, so the case is not run at all there.

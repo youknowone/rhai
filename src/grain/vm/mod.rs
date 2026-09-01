@@ -5345,6 +5345,8 @@ impl<'e> Vm<'e> {
                 | code::tag::BIN_OP_JF
                 | code::tag::BIN_OP_FROM_LOCAL_JF
                 | code::tag::BIN_OP_FROM_CONST_JF
+                | code::tag::BIN_OP_FROM_LOCAL_JT
+                | code::tag::BIN_OP_FROM_CONST_JT
                 | code::tag::BIN_OP_RHS_LOCAL_JF
                 | code::tag::BIN_OP_RHS_CONST_JF
                 | code::tag::UN_OP
@@ -5387,10 +5389,11 @@ impl<'e> Vm<'e> {
                     let typed = form & code::form::TYPED != 0;
 
                     // Whether this instruction is also the branch that reads
-                    // its result. A fused form carries the target as its last
-                    // operand, so it sits four bytes from the end and needs no
-                    // offset of its own.
+                    // its result, and which result takes it. A fused form
+                    // carries the target as its last operand, so it sits four
+                    // bytes from the end and needs no offset of its own.
                     let branching = form & code::form::BRANCHES != 0;
+                    let taken_when = form & code::form::TAKEN_WHEN != 0;
                     // What the operator's result is for: pushed, or read by
                     // the branch the instruction swallowed and not pushed at
                     // all. Every way out of this arm goes through here, so an
@@ -5407,7 +5410,7 @@ impl<'e> Vm<'e> {
                             truncate_stack!($floor);
                             if !branching {
                                 self.push(value);
-                            } else if !self.guard_holds(value, pos!())? {
+                            } else if self.guard_holds(value, pos!())? == taken_when {
                                 transfer!(wide!(width - 4) as usize);
                                 continue;
                             }

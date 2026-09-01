@@ -25,7 +25,7 @@
 
 use alloc::borrow::Cow;
 
-use crate::grain::bytecode::{BinOpKind, BinOperand, Op, Receiver, UnOpKind};
+use crate::grain::bytecode::{BinOpKind, BinOperand, Branch, Op, Receiver, UnOpKind};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -264,6 +264,16 @@ pub mod tag {
     pub const INDEX_SET_FROM_LOCAL_VALUE_CONST: u8 = 0x61;
     /// [`INDEX_SET_FROM_CONST`] with a constant value.
     pub const INDEX_SET_FROM_CONST_VALUE_CONST: u8 = 0x62;
+    /// [`Op::BinOpFrom`](super::Op::BinOpFrom) whose branch is taken when the
+    /// result is *true*, with the right operand in a slot.
+    ///
+    /// The shape a rotated loop's test takes: its body sits above it, so the
+    /// turn is the branch and leaving is the fall-through. The same operand
+    /// layout as [`BIN_OP_FROM_LOCAL_JF`], which is the same branch read the
+    /// other way round.
+    pub const BIN_OP_FROM_LOCAL_JT: u8 = 0x63;
+    /// [`BIN_OP_FROM_LOCAL_JT`] with the right operand in the constant pool.
+    pub const BIN_OP_FROM_CONST_JT: u8 = 0x64;
 
     /// [`Op::BinOp`](super::Op::BinOp) that is also the branch reading it.
     ///
@@ -426,6 +436,8 @@ static WIDTHS: [u8; 256] = {
     widths[tag::BIN_OP_RHS_CONST_JF as usize] = 12;
     widths[tag::BIN_OP_FROM_LOCAL_JF as usize] = 14;
     widths[tag::BIN_OP_FROM_CONST_JF as usize] = 14;
+    widths[tag::BIN_OP_FROM_LOCAL_JT as usize] = 14;
+    widths[tag::BIN_OP_FROM_CONST_JT as usize] = 14;
 
     widths
 };
@@ -441,30 +453,35 @@ static WIDTHS: [u8; 256] = {
 /// they are one load and a mask apiece.
 pub mod form {
     /// The instruction is also the branch that reads its own result.
-    pub const BRANCHES: u8 = 0x01;
+    pub const BRANCHES: u16 = 0x001;
     /// A binary operator: once this arm has pushed whatever the instruction
     /// names, its two operands are on top of the stack and the typed fast
     /// path can run.
-    pub const TYPED: u8 = 0x02;
+    pub const TYPED: u16 = 0x002;
     /// A unary operator, whose one operand is already on the stack.
-    pub const UNARY: u8 = 0x04;
+    pub const UNARY: u16 = 0x004;
     /// Names both operands — the left at offset 6 and the right at offset 8.
-    pub const NAMES_FROM: u8 = 0x08;
+    pub const NAMES_FROM: u16 = 0x008;
     /// Names the right operand only, at offset 6.
-    pub const NAMES_RHS: u8 = 0x10;
+    pub const NAMES_RHS: u16 = 0x010;
     /// What a named operand is: a slot rather than a constant. The left
     /// operand of a [`NAMES_FROM`] instruction is a slot either way.
-    pub const NAMED_IS_LOCAL: u8 = 0x20;
+    pub const NAMED_IS_LOCAL: u16 = 0x020;
     /// The operator token comes out of the pool.
-    pub const POOLED_OP: u8 = 0x40;
+    pub const POOLED_OP: u16 = 0x040;
     /// The call sees the scope it was called from.
-    pub const CAPTURES: u8 = 0x80;
+    pub const CAPTURES: u16 = 0x080;
+    /// Which result takes the branch this instruction carries: its own, not
+    /// the other one. Only a rotated loop's test is spelled this way — its
+    /// body sits above it, so the turn is the branch and leaving the loop is
+    /// the fall-through.
+    pub const TAKEN_WHEN: u16 = 0x100;
 }
 
 /// [`form`], one entry per tag. Zero for `CALL` and for every tag the
 /// operator-and-call arm never sees, which ask nothing of this.
-static FORMS: [u8; 256] = {
-    let mut forms = [0u8; 256];
+static FORMS: [u16; 256] = {
+    let mut forms = [0u16; 256];
 
     forms[tag::CALL_CAPTURE as usize] = form::CAPTURES;
     forms[tag::CALL_OP as usize] = form::POOLED_OP;
@@ -488,6 +505,10 @@ static FORMS: [u8; 256] = {
     forms[tag::BIN_OP_FROM_CONST_JF as usize] = from | form::BRANCHES;
     forms[tag::BIN_OP_FROM_LOCAL_JF as usize] = from | form::NAMED_IS_LOCAL | form::BRANCHES;
 
+    let jt = from | form::BRANCHES | form::TAKEN_WHEN;
+    forms[tag::BIN_OP_FROM_CONST_JT as usize] = jt;
+    forms[tag::BIN_OP_FROM_LOCAL_JT as usize] = jt | form::NAMED_IS_LOCAL;
+
     forms
 };
 
@@ -496,7 +517,7 @@ static FORMS: [u8; 256] = {
 /// See [`form`](self::form) for the fields.
 #[must_use]
 #[inline]
-pub fn form(tag: u8) -> u8 {
+pub fn form(tag: u8) -> u16 {
     FORMS[tag as usize]
 }
 
@@ -1049,8 +1070,30 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.push(match (rhs, branch) {
                     (BinOperand::Local(..), None) => tag::BIN_OP_FROM_LOCAL,
                     (BinOperand::Const(..), None) => tag::BIN_OP_FROM_CONST,
-                    (BinOperand::Local(..), Some(..)) => tag::BIN_OP_FROM_LOCAL_JF,
-                    (BinOperand::Const(..), Some(..)) => tag::BIN_OP_FROM_CONST_JF,
+                    (
+                        BinOperand::Local(..),
+                        Some(Branch {
+                            taken_when: false, ..
+                        }),
+                    ) => tag::BIN_OP_FROM_LOCAL_JF,
+                    (
+                        BinOperand::Const(..),
+                        Some(Branch {
+                            taken_when: false, ..
+                        }),
+                    ) => tag::BIN_OP_FROM_CONST_JF,
+                    (
+                        BinOperand::Local(..),
+                        Some(Branch {
+                            taken_when: true, ..
+                        }),
+                    ) => tag::BIN_OP_FROM_LOCAL_JT,
+                    (
+                        BinOperand::Const(..),
+                        Some(Branch {
+                            taken_when: true, ..
+                        }),
+                    ) => tag::BIN_OP_FROM_CONST_JT,
                 });
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*kind as u8);
@@ -1062,7 +1105,7 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 };
                 code.extend_from_slice(&rhs.to_le_bytes());
                 if let Some(branch) = branch {
-                    code.extend_from_slice(&target(*branch)?.to_le_bytes());
+                    code.extend_from_slice(&target(branch.target)?.to_le_bytes());
                 }
             }
 
@@ -1548,20 +1591,30 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         tag::BIN_OP_FROM_LOCAL
         | tag::BIN_OP_FROM_CONST
         | tag::BIN_OP_FROM_LOCAL_JF
-        | tag::BIN_OP_FROM_CONST_JF => Op::BinOpFrom {
+        | tag::BIN_OP_FROM_CONST_JF
+        | tag::BIN_OP_FROM_LOCAL_JT
+        | tag::BIN_OP_FROM_CONST_JT => Op::BinOpFrom {
             name: u32::from(small(1)?),
             kind: BinOpKind::from_byte(code[at + 3])?,
             op: u32::from(small(4)?),
             lhs: small(6)?,
-            rhs: if matches!(code[at], tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_LOCAL_JF) {
+            rhs: if matches!(
+                code[at],
+                tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_LOCAL_JF | tag::BIN_OP_FROM_LOCAL_JT
+            ) {
                 BinOperand::Local(small(8)?)
             } else {
                 BinOperand::Const(u32::from(small(8)?))
             },
             branch: match code[at] {
-                tag::BIN_OP_FROM_LOCAL_JF | tag::BIN_OP_FROM_CONST_JF => {
-                    Some(u32_at(code, at + 10)?)
-                }
+                tag::BIN_OP_FROM_LOCAL_JF | tag::BIN_OP_FROM_CONST_JF => Some(Branch {
+                    target: u32_at(code, at + 10)?,
+                    taken_when: false,
+                }),
+                tag::BIN_OP_FROM_LOCAL_JT | tag::BIN_OP_FROM_CONST_JT => Some(Branch {
+                    target: u32_at(code, at + 10)?,
+                    taken_when: true,
+                }),
                 _ => None,
             },
         },
@@ -1832,7 +1885,10 @@ mod tests {
                 kind: BinOpKind::Less,
                 lhs: 4,
                 rhs: BinOperand::Local(5),
-                branch: Some(0),
+                branch: Some(Branch {
+                    target: 0,
+                    taken_when: false,
+                }),
             },
             Op::BinOpFrom {
                 name: 1,
@@ -1840,7 +1896,34 @@ mod tests {
                 kind: BinOpKind::Less,
                 lhs: 4,
                 rhs: BinOperand::Const(6),
-                branch: Some(0),
+                branch: Some(Branch {
+                    target: 0,
+                    taken_when: false,
+                }),
+            },
+            // And the two of those six that are also spelled the other way
+            // round, for a test whose body sits above it.
+            Op::BinOpFrom {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                lhs: 4,
+                rhs: BinOperand::Local(5),
+                branch: Some(Branch {
+                    target: 0,
+                    taken_when: true,
+                }),
+            },
+            Op::BinOpFrom {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                lhs: 4,
+                rhs: BinOperand::Const(6),
+                branch: Some(Branch {
+                    target: 0,
+                    taken_when: true,
+                }),
             },
             Op::UnOp {
                 name: 1,
@@ -1986,11 +2069,12 @@ mod tests {
     #[test]
     fn every_tag_the_operator_arm_dispatches_names_its_own_shape() {
         use form::{
-            BRANCHES, CAPTURES, NAMED_IS_LOCAL, NAMES_FROM, NAMES_RHS, POOLED_OP, TYPED, UNARY,
+            BRANCHES, CAPTURES, NAMED_IS_LOCAL, NAMES_FROM, NAMES_RHS, POOLED_OP, TAKEN_WHEN,
+            TYPED, UNARY,
         };
 
-        const BIN: u8 = TYPED | POOLED_OP;
-        const EXPECTED: &[(u8, u8)] = &[
+        const BIN: u16 = TYPED | POOLED_OP;
+        const EXPECTED: &[(u8, u16)] = &[
             (tag::CALL, 0),
             (tag::CALL_CAPTURE, CAPTURES),
             (tag::CALL_OP, POOLED_OP),
@@ -2011,6 +2095,14 @@ mod tests {
             (
                 tag::BIN_OP_FROM_LOCAL_JF,
                 BIN | NAMES_FROM | NAMED_IS_LOCAL | BRANCHES,
+            ),
+            (
+                tag::BIN_OP_FROM_CONST_JT,
+                BIN | NAMES_FROM | BRANCHES | TAKEN_WHEN,
+            ),
+            (
+                tag::BIN_OP_FROM_LOCAL_JT,
+                BIN | NAMES_FROM | NAMED_IS_LOCAL | BRANCHES | TAKEN_WHEN,
             ),
         ];
 

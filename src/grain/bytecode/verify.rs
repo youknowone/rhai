@@ -1,6 +1,6 @@
 use crate::grain::bytecode::code::{self, tag};
 use crate::grain::bytecode::{
-    BinOpKind, Chain, Chunk, Op, Receiver, Root, Step, Switch, Tail, UnOpKind,
+    BinOpKind, Branch, Chain, Chunk, Op, Receiver, Root, Step, Switch, Tail, UnOpKind,
 };
 use crate::grain::format::Caps;
 use crate::grain::program::Function;
@@ -387,7 +387,7 @@ fn verify_chunk(
                 ..
             }
             | Op::BinOpFrom {
-                branch: Some(target),
+                branch: Some(Branch { target, .. }),
                 ..
             }
             | Op::UnOp {
@@ -821,7 +821,9 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         tag::BIN_OP_FROM_LOCAL
         | tag::BIN_OP_FROM_CONST
         | tag::BIN_OP_FROM_LOCAL_JF
-        | tag::BIN_OP_FROM_CONST_JF => {
+        | tag::BIN_OP_FROM_CONST_JF
+        | tag::BIN_OP_FROM_LOCAL_JT
+        | tag::BIN_OP_FROM_CONST_JT => {
             bounded(index(1), "name", pools.names)?;
             let kind = u32::from(code[at + 3]);
             if BinOpKind::from_byte(code[at + 3]).is_none() {
@@ -832,7 +834,10 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
                 });
             }
             bounded(index(4), "operator", pools.tokens)?;
-            if matches!(code[at], tag::BIN_OP_FROM_CONST | tag::BIN_OP_FROM_CONST_JF) {
+            if matches!(
+                code[at],
+                tag::BIN_OP_FROM_CONST | tag::BIN_OP_FROM_CONST_JF | tag::BIN_OP_FROM_CONST_JT
+            ) {
                 bounded(index(8), "constant", pools.consts)?;
             }
             Ok(())
