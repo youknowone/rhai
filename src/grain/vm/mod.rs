@@ -1454,8 +1454,37 @@ impl<'e> Vm<'e> {
         pos: Position,
     ) -> VmResult {
         let scope = &mut Scope::new();
-        self.call_function_with_this(program, name, args, level, scope, true, pos, None)
+        self.call_function_with_this(program, name, None, args, level, scope, true, pos, None)
             .0
+    }
+
+    /// The same, reaching the callee by its name-pool index.
+    ///
+    /// A crossing already knows which function it is carrying, and a name is
+    /// how a caller that does not asks. The name stays for what it is still
+    /// needed for, which is naming the callee if the arity does not match.
+    pub(super) fn call_function_at(
+        &mut self,
+        program: &Program,
+        index: u32,
+        name: &str,
+        args: FnArgsVec<Dynamic>,
+        level: usize,
+        pos: Position,
+    ) -> VmResult {
+        let scope = &mut Scope::new();
+        self.call_function_with_this(
+            program,
+            name,
+            Some(index),
+            args,
+            level,
+            scope,
+            true,
+            pos,
+            None,
+        )
+        .0
     }
 
     /// The same, against a receiver the callee owns for the duration.
@@ -1466,6 +1495,7 @@ impl<'e> Vm<'e> {
         &mut self,
         program: &Program,
         name: &str,
+        index: Option<u32>,
         args: FnArgsVec<Dynamic>,
         level: usize,
         scope: &mut Scope,
@@ -1479,7 +1509,14 @@ impl<'e> Vm<'e> {
         #[cfg(feature = "debugging")]
         self.pending_steps.clear();
 
-        let Some(function) = program.function_named(name, args.len()) else {
+        // By index where the caller has one: the name pool gives equal names
+        // equal indices, so this is the same question asked with an integer
+        // comparison instead of a string one.
+        let found = match index {
+            Some(index) => program.function(index, args.len()),
+            None => program.function_named(name, args.len()),
+        };
+        let Some(function) = found else {
             return (
                 Err(Box::new(EvalAltResult::ErrorFunctionNotFound(
                     format!("{name} ({} args)", args.len()),
@@ -1492,7 +1529,13 @@ impl<'e> Vm<'e> {
 
         // `call_compiled` takes its arguments off the operand stack, where a
         // compiled call site would already have put them.
+        //
+        // Reserved for the arguments and the body at once. A crossing arrives
+        // on an empty stack, and taking both in one step is one growth rather
+        // than the two that pushing and then entering the frame would each ask
+        // for.
         let first = self.depth;
+        self.reserve_stack(args.len() + program.max_stack() as usize);
         self.push_all(args.into_iter());
 
         let restore = mem::replace(&mut self.global.level, level);
@@ -1603,6 +1646,7 @@ impl<'e> Vm<'e> {
                 vm.call_function_with_this(
                     program,
                     name,
+                    None,
                     arg_values,
                     0,
                     scope,

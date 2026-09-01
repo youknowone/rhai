@@ -90,6 +90,7 @@ pub(super) fn wrappers(program: &SharedProgram) -> Module {
         };
 
         let owner = program.clone();
+        let name_index = function.name;
         let called: SmartString = name.into();
 
         // One closure for every arity, rather than the fixed-arity shapes
@@ -105,7 +106,7 @@ pub(super) fn wrappers(program: &SharedProgram) -> Module {
             // registration copied the first itself, because it reached it as a
             // call by reference (`func/call.rs:439`).
             let values = args.iter_mut().map(|arg| mem::take(*arg)).collect();
-            invoke(&owner, &called, &context, values)
+            invoke(&owner, name_index, &called, &context, values)
         };
 
         FuncRegistration::new(name)
@@ -160,6 +161,7 @@ pub(super) fn pointer(program: &SharedProgram, index: u32, name: &str) -> Option
     // lookup. No arity bound here: a bound exists there because Rhai has to
     // *find* the registration, and nothing is being found.
     let owner = program.clone();
+    let name_index = index;
     let called: SmartString = name.into();
     Some(FnPtrType::Native(Shared::new(
         move |context: NativeCallContext, args: &mut FnCallArgs| {
@@ -182,7 +184,7 @@ pub(super) fn pointer(program: &SharedProgram, index: u32, name: &str) -> Option
                     _ => mem::take(*arg),
                 })
                 .collect();
-            invoke(&owner, &called, &context, values)
+            invoke(&owner, name_index, &called, &context, values)
         },
     )))
 }
@@ -193,6 +195,7 @@ pub(super) fn pointer(program: &SharedProgram, index: u32, name: &str) -> Option
 /// depends on how it was reached: see [`wrappers`] and [`pointer`].
 fn invoke(
     program: &SharedProgram,
+    index: u32,
     name: &str,
     context: &NativeCallContext,
     values: FnArgsVec<Dynamic>,
@@ -201,8 +204,9 @@ fn invoke(
     // The share this crossing came out of, so a pointer the chunk creates
     // carries its body too. See [`pointer`].
     vm.callbacks = Some(program.clone());
-    vm.call_function(
+    vm.call_function_at(
         program,
+        index,
         name,
         values,
         context.call_level(),
