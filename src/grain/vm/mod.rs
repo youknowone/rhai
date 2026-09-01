@@ -6177,15 +6177,18 @@ impl<'e> Vm<'e> {
                 code::tag::ITER_NEXT
                 | code::tag::ITER_NEXT_INDEXED
                 | code::tag::ITER_NEXT_STORE => {
-                    let exit = wide!(1) as usize;
+                    let body = wide!(1) as usize;
                     let iteration = or_raise!(
                         self.iterators.last_mut(),
                         malformed("no iterator to advance".to_string())
                     );
 
                     let Some(item) = iteration.items.next() else {
+                        // Out of the loop by falling through: this edge is
+                        // taken once, and the one back into the body is taken
+                        // every turn.
                         self.iterators.pop();
-                        transfer!(exit);
+                        pc += width;
                         continue;
                     };
 
@@ -6221,14 +6224,17 @@ impl<'e> Vm<'e> {
                         store_shared(scope_entry!(index), value.flatten(), move || {
                             program.position(pc)
                         })?;
-                        pc += width;
-                        continue;
+                    } else {
+                        if tag == code::tag::ITER_NEXT_INDEXED {
+                            self.push(Dynamic::from(count));
+                        }
+                        self.push(value.flatten());
                     }
 
-                    if tag == code::tag::ITER_NEXT_INDEXED {
-                        self.push(Dynamic::from(count));
-                    }
-                    self.push(value.flatten());
+                    // The back edge, so the turn is metered and the JIT driver
+                    // is consulted here rather than at a jump of the body's.
+                    transfer!(body);
+                    continue;
                 }
 
                 code::tag::STORE_SHARED => {

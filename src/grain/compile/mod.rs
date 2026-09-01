@@ -243,8 +243,12 @@ impl Compiler {
 /// emitted and pointed at the instruction after the loop once that address is
 /// known.
 struct Loop {
-    /// Where `continue` goes — the condition test, or the top of the body.
-    continue_target: u32,
+    /// Where `continue` goes — the condition test, which sits above the body.
+    ///
+    /// `None` in a `for`, whose header is emitted *after* the body so that the
+    /// body needs no jump to come back to it. The address is not known while
+    /// the body is being emitted, so the sites are collected like `breaks`.
+    continue_target: Option<u32>,
     /// Slot depth a `break` unwinds to. For a `for` loop this is *before* the
     /// loop variable, which leaving must drop.
     break_depth: u16,
@@ -256,6 +260,9 @@ struct Loop {
     /// can drop whatever was made since. A `break` inside a `try` inside a
     /// `for` skips the straight-line path that would have cleaned up.
     iters: usize,
+    /// `continue` sites waiting for the header's address — see
+    /// [`Loop::continue_target`].
+    continues: Vec<usize>,
     /// Whether the loop owns an iterator of its own. `break` drops it and
     /// `continue` must not, which is the other thing one field cannot be.
     owns_iterator: bool,
@@ -1494,44 +1501,56 @@ impl Lowering {
                 self.slots.declare(var.name.clone());
                 let var_slot = self.slots.depth() as u16 - 1;
 
-                let top = self.here();
-                let exit = self.code.len();
+                // The loop is rotated: the header advances the iterator and
+                // branches *back* into the body, so the body's last
+                // instruction falls into the header instead of jumping to it.
+                // That is one dispatch off every turn of every `for` loop.
+                // Entering costs the one hop this emits, once.
+                let entry = self.emit_jump();
+                let body = self.here();
+                // `for (x, i) in seq` pushes a count as well, so the item and
+                // the count come off the operand stack in the order the two
+                // locals were declared. They are popped at the top of the
+                // body, which is where the header's branch arrives.
+                if let Some(slot) = counter_slot {
+                    self.emit(Op::StoreShared(var_slot));
+                    self.emit(Op::StoreShared(slot));
+                }
+                self.begin_for(outside);
+                if !self.block_discarding(flow.body.statements()) {
+                    return false;
+                }
+
+                let header = self.here();
+                self.patch_to(entry, header);
                 match counter_slot {
-                    // `for (x, i) in seq` pushes a count as well, so the item
-                    // and the count come off the operand stack in the order
-                    // the two locals were declared.
-                    Some(slot) => {
-                        self.emit_at(
-                            Op::IterNext {
-                                exit: u32::MAX,
-                                indexed: true,
-                            },
-                            flow.expr.position(),
-                        );
-                        self.emit(Op::StoreShared(var_slot));
-                        self.emit(Op::StoreShared(slot));
-                    }
-                    // One variable, so the item goes onto the operand stack
-                    // and straight off it again on the next instruction —
-                    // every turn of every ordinary `for` loop. Fused, it never
-                    // goes there at all.
+                    Some(..) => self.emit_at(
+                        Op::IterNext {
+                            body,
+                            indexed: true,
+                        },
+                        flow.expr.position(),
+                    ),
+                    // One variable, so the item would go onto the operand
+                    // stack and straight off it again on the next instruction
+                    // — every turn of every ordinary `for` loop. Fused, it
+                    // never goes there at all.
                     None => self.emit_at(
                         Op::IterNextStore {
-                            exit: u32::MAX,
+                            body,
                             slot: var_slot,
                         },
                         flow.expr.position(),
                     ),
                 }
-                self.begin_for(top, outside);
-                if !self.block_discarding(flow.body.statements()) {
-                    return false;
+                let (breaks, continues) = self.end_for();
+                // `continue` advances the iterator, so it arrives at the
+                // header rather than at the body.
+                for site in continues {
+                    self.patch_to(site, header);
                 }
-                self.emit_at(Op::Jump(top), flow.body.position());
-                let breaks = self.end_loop();
 
-                // Exhausted: `IterNext` dropped the iterator on the way here.
-                self.patch_to(exit, self.here());
+                // Exhausted: the header dropped the iterator and fell through.
                 self.iters -= 1;
                 self.emit(Op::UnwindTo(outside));
                 self.slots.unwind_to(outside as usize);
@@ -1665,9 +1684,19 @@ impl Lowering {
                     self.pop_handlers(loop_handlers);
                     self.drop_iterators(loop_iters);
                     self.emit(Op::UnwindTo(continue_depth));
-                    // A back edge of its own, and charged as one, so it names
-                    // the place the charge is reported against.
-                    self.emit_at(Op::Jump(continue_target), *pos);
+                    match continue_target {
+                        // Above the body, so this is a back edge of its own
+                        // and charged as one: it names the place the charge is
+                        // reported against.
+                        Some(target) => self.emit_at(Op::Jump(target), *pos),
+                        // Below the body, so this arrives at the header and
+                        // the header's own back edge is what the turn is
+                        // charged for.
+                        None => {
+                            let site = self.emit_jump_at(*pos);
+                            self.loops.last_mut().expect("checked").continues.push(site);
+                        }
+                    }
                 }
 
                 // Unreachable, but every statement must leave a value for the
@@ -2859,6 +2888,13 @@ impl Lowering {
         site
     }
 
+    /// [`Self::emit_jump`], blaming a position of its own.
+    fn emit_jump_at(&mut self, pos: Position) -> usize {
+        let site = self.code.len();
+        self.emit_at(Op::Jump(u32::MAX), pos);
+        site
+    }
+
     fn emit_jump_if_false(&mut self, pos: Position) -> usize {
         self.emit_branch_if_false(u32::MAX, pos)
     }
@@ -2969,10 +3005,11 @@ impl Lowering {
     fn begin_loop(&mut self, continue_target: u32) {
         let depth = u16::try_from(self.slots.depth()).expect("slot count is bounded");
         self.loops.push(Loop {
-            continue_target,
+            continue_target: Some(continue_target),
             break_depth: depth,
             continue_depth: depth,
             iters: self.iters,
+            continues: Vec::new(),
             handlers: self.handlers,
             owns_iterator: false,
             breaks: Vec::new(),
@@ -2982,12 +3019,13 @@ impl Lowering {
     /// Open a `for`, which does declare: the loop variable and any counter
     /// live between the two depths, so leaving drops them and going round
     /// again does not.
-    fn begin_for(&mut self, continue_target: u32, break_depth: u16) {
+    fn begin_for(&mut self, break_depth: u16) {
         self.loops.push(Loop {
-            continue_target,
+            continue_target: None,
             break_depth,
             continue_depth: u16::try_from(self.slots.depth()).expect("slot count is bounded"),
             iters: self.iters,
+            continues: Vec::new(),
             handlers: self.handlers,
             owns_iterator: true,
             breaks: Vec::new(),
@@ -2995,7 +3033,19 @@ impl Lowering {
     }
 
     fn end_loop(&mut self) -> Vec<usize> {
-        self.loops.pop().expect("loop stack is balanced").breaks
+        let done = self.loops.pop().expect("loop stack is balanced");
+        debug_assert!(
+            done.continues.is_empty(),
+            "a loop that named its continue target leaves no sites to patch"
+        );
+        done.breaks
+    }
+
+    /// Close a `for`, which leaves both lists: its `continue` sites name the
+    /// header, and the header is emitted after the body they sit in.
+    fn end_for(&mut self) -> (Vec<usize>, Vec<usize>) {
+        let done = self.loops.pop().expect("loop stack is balanced");
+        (done.breaks, done.continues)
     }
 
     fn residual_expr(&mut self, expr: &Expr) {
@@ -3119,8 +3169,8 @@ fn jump_target_mut(op: &mut Op) -> Option<&mut u32> {
         | Op::JumpIfFalse { target, .. }
         | Op::JumpIfTrue { target, .. }
         | Op::SkipIfNotUnit { target, .. }
-        | Op::IterNext { exit: target, .. }
-        | Op::IterNextStore { exit: target, .. }
+        | Op::IterNext { body: target, .. }
+        | Op::IterNextStore { body: target, .. }
         | Op::PushHandler { target, .. }
         // An operator that is also the branch reading it is patched and
         // threaded as the branch it swallowed would have been.
@@ -3382,18 +3432,18 @@ mod tests {
         const SOURCES: &[(&str, usize, &str)] = &[
             ("tight integer loop", 4, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
             ("float arithmetic", 7, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
-            ("script fn calls", 5, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
+            ("script fn calls", 4, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
             ("recursive fibonacci", 13, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
                 "switch, 4 arms",
-                11,
+                10,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } \
                  } s",
             ),
             (
                 "switch, 16 arms",
-                35,
+                34,
                 "let s = 0; for i in 0..20000 { \
                  switch i % 16 { \
                  0 => s += 1, 1 => s += 2, 2 => s += 3, 3 => s += 4, \
@@ -3402,17 +3452,17 @@ mod tests {
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
                  } s",
             ),
-            ("branch heavy", 11, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
-            ("native function calls", 7, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
+            ("branch heavy", 10, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
+            ("native function calls", 6, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
             (
                 "native callbacks",
-                4,
+                3,
                 "let a = []; for i in 0..500 { a.push(i); } \
                  let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
             ),
             (
                 "primes",
-                3,
+                2,
                 r#"
             const SIZE = 1_000_000;
 
@@ -3448,18 +3498,24 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name} does not verify: {err:?}"));
             let decoded: Vec<_> =
                 crate::grain::bytecode::code::disassemble(program.code()).collect();
-            // A back edge is a `Jump` to an address at or below its own. The
-            // highest address any of them names is the innermost loop's
+            // A back edge is a transfer to an address at or below its own.
+            // The highest address any of them names is the innermost loop's
             // header, and the body that runs every iteration reaches from
             // there to the last back edge naming it. A loop has several: a
             // `continue` is one, and `Lowering::thread_jumps` turns each arm's
             // jump into another, so taking the first cuts the body off at the
-            // first arm.
+            // first arm. A `for` loop's own back edge belongs to the
+            // instruction that advances the iterator, not to a `Jump`.
             let edges: Vec<(usize, usize)> = decoded
                 .iter()
-                .filter_map(|(at, op)| match op {
-                    Op::Jump(target) if (*target as usize) <= *at => Some((*target as usize, *at)),
-                    _ => None,
+                .filter_map(|(at, op)| {
+                    let target = match op {
+                        Op::Jump(target)
+                        | Op::IterNext { body: target, .. }
+                        | Op::IterNextStore { body: target, .. } => *target as usize,
+                        _ => return None,
+                    };
+                    (target <= *at).then_some((target, *at))
                 })
                 .collect();
             let body = edges

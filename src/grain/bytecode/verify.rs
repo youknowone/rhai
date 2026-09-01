@@ -399,14 +399,14 @@ fn verify_chunk(
             }
 
             // The one instruction whose edges differ in more than where they
-            // go: falling through carries the item it pushed and still holds
-            // the iterator, while the exit edge has neither.
-            // Fused with the store that took its item, so the fall-through
-            // edge carries nothing extra — only the iterator count differs
-            // between the two edges.
-            Op::IterNextStore { exit, .. } => {
-                go(
-                    exit,
+            // go: the edge back into the body still holds the iterator, and
+            // the one that falls out of the loop has dropped it.
+            // Fused with the store that took its item, so neither edge carries
+            // anything extra — only the iterator count differs.
+            Op::IterNextStore { body, .. } => {
+                go(body, next_state)?;
+                work_list.push((
+                    next,
                     State {
                         operands: depth,
                         iters: state
@@ -415,28 +415,27 @@ fn verify_chunk(
                             .ok_or(VerifyError::IteratorUnderflow { at })?,
                         handlers: state.handlers,
                     },
-                )?;
-                work_list.push((next, next_state));
+                ));
             }
 
-            Op::IterNext { exit, indexed } => {
+            Op::IterNext { body, indexed } => {
                 go(
-                    exit,
+                    body,
                     State {
-                        operands: depth,
-                        iters: state
-                            .iters
-                            .checked_sub(1)
-                            .ok_or(VerifyError::IteratorUnderflow { at })?,
+                        // The item, and the count under it when there is one.
+                        operands: depth + 1 + usize::from(indexed),
+                        iters: state.iters,
                         handlers: state.handlers,
                     },
                 )?;
                 work_list.push((
                     next,
                     State {
-                        // The item, and the count under it when there is one.
-                        operands: depth + 1 + usize::from(indexed),
-                        iters: state.iters,
+                        operands: depth,
+                        iters: state
+                            .iters
+                            .checked_sub(1)
+                            .ok_or(VerifyError::IteratorUnderflow { at })?,
                         handlers: state.handlers,
                     },
                 ));

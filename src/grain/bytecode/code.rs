@@ -959,13 +959,13 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 }
             }
 
-            Op::IterNext { exit, indexed } => {
+            Op::IterNext { body, indexed } => {
                 code.push(if *indexed {
                     tag::ITER_NEXT_INDEXED
                 } else {
                     tag::ITER_NEXT
                 });
-                code.extend_from_slice(&target(*exit)?.to_le_bytes());
+                code.extend_from_slice(&target(*body)?.to_le_bytes());
             }
 
             Op::BinOpFrom {
@@ -996,9 +996,9 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 }
             }
 
-            Op::IterNextStore { exit, slot } => {
+            Op::IterNextStore { body, slot } => {
                 code.push(tag::ITER_NEXT_STORE);
-                code.extend_from_slice(&target(*exit)?.to_le_bytes());
+                code.extend_from_slice(&target(*body)?.to_le_bytes());
                 code.extend_from_slice(&slot.to_le_bytes());
             }
 
@@ -1468,11 +1468,11 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         tag::ITER_INIT => Op::IterInit,
         tag::ITER_DROP => Op::IterDrop,
         tag::ITER_NEXT => Op::IterNext {
-            exit: u32_at(code, at + 1)?,
+            body: u32_at(code, at + 1)?,
             indexed: false,
         },
         tag::ITER_NEXT_INDEXED => Op::IterNext {
-            exit: u32_at(code, at + 1)?,
+            body: u32_at(code, at + 1)?,
             indexed: true,
         },
         tag::BIN_OP_FROM_LOCAL
@@ -1497,7 +1497,7 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         },
 
         tag::ITER_NEXT_STORE => Op::IterNextStore {
-            exit: u32_at(code, at + 1)?,
+            body: u32_at(code, at + 1)?,
             slot: small(5)?,
         },
         tag::STORE_SHARED => Op::StoreShared(small(1)?),
@@ -1838,10 +1838,10 @@ mod tests {
                 slot: 4,
                 index: Some(BinOperand::Const(6)),
             },
-            // Its exit is an instruction index here and an address after
+            // Its body is an instruction index here and an address after
             // assembly, like every other jump — index 0 is `Const(7)`, which
             // is at 0.
-            Op::IterNextStore { exit: 0, slot: 4 },
+            Op::IterNextStore { body: 0, slot: 4 },
             Op::UnwindTo(6),
             Op::Tick,
             Op::Statement { depth: 2 },

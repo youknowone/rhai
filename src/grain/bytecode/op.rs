@@ -865,27 +865,33 @@ pub enum Op {
     /// position from the one [`Op::IterNext`] uses.
     IterInit,
 
-    /// Advance the current iterator: push the next item and fall through, or
-    /// drop the iterator and jump to `exit`.
+    /// Advance the current iterator: push the next item and jump back to
+    /// `body`, or drop the iterator and fall through.
     ///
     /// The only instruction whose two edges leave different amounts on the
     /// operand stack, which is why the verifier gives it explicit successors.
+    ///
+    /// The loop is laid out with this at the bottom and the body above it, so
+    /// the edge taken every turn is the backward one and the body needs no
+    /// jump of its own to come back here. That makes this the back edge the
+    /// dispatch loop meters and the JIT driver counts, and the exhausted edge
+    /// -- taken once -- the one that costs nothing to lay out.
     ///
     /// Its table entry is the iterable's position — `position`, not
     /// `start_position` — because that is what a fallible iterator's error is
     /// filled in with (`eval/stmt.rs:749`).
     IterNext {
-        /// Where to jump to once the iterator is exhausted.
-        exit: u32,
+        /// Where the body begins, which is above this instruction.
+        body: u32,
         /// `for (x, i) in seq`: the count is pushed under the item, so the two
-        /// `StoreShared`s that follow pop them in declaration order.
+        /// `StoreShared`s that begin the body pop them in declaration order.
         indexed: bool,
     },
 
-    /// Advance the current iterator straight into local slot `slot`, or drop
-    /// the iterator and jump to `exit`.
+    /// Advance the current iterator straight into local slot `slot` and jump
+    /// back to `body`, or drop the iterator and fall through.
     ///
-    /// [`Op::IterNext`] with the [`Op::StoreShared`] that always follows it
+    /// [`Op::IterNext`] with the [`Op::StoreShared`] that always followed it
     /// folded in. Every `for` loop over a single variable runs both on every
     /// turn, and the item they hand between them goes onto the operand stack
     /// and straight off it again.
@@ -896,8 +902,8 @@ pub enum Op {
     /// Its table entry is [`Op::IterNext`]'s — the iterable's position, which
     /// is what a fallible iterator's error is filled in with.
     IterNextStore {
-        /// Where to jump to once the iterator is exhausted.
-        exit: u32,
+        /// Where the body begins, which is above this instruction.
+        body: u32,
         /// The slot the item is written into.
         slot: u16,
     },
