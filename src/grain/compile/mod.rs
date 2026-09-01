@@ -2606,12 +2606,20 @@ impl Lowering {
         }
     }
 
-    /// Point every jump past the jumps it lands on.
+    /// Point every jump past the jumps it lands on, and let one that arrives
+    /// at a `Return` be that `Return`.
     ///
     /// An `if` or `switch` arm ends by jumping to where the arms converge, and
     /// when the statement is the last thing in a loop body that convergence
     /// point *is* the back edge -- so the arm dispatches `Jump` twice in a row
     /// to reach the loop header. One of the two does nothing but arrive.
+    ///
+    /// When the convergence point is the body's `Return` instead, the arm pays
+    /// a whole trip round the dispatch loop to arrive at an instruction it
+    /// could have been -- so it becomes that instruction. The two rules are
+    /// ordered: threading names where the chain really ends, and the `Return`
+    /// rule is asked about that address rather than about the hop in front of
+    /// it, which is what makes `Jump -> Jump -> Return` a `Return` here.
     ///
     /// Run after everything is emitted, so it sees whole chains and does not
     /// have to keep [`Lowering::patched_max`] honest.
@@ -2620,23 +2628,59 @@ impl Lowering {
             // Not a handler: its target is where a throw lands, so what was
             // dispatched before it is whatever raised, and the reasoning in
             // [`Lowering::threaded_target`] has no predecessor to stand on.
+            // Both rules below are behind this: the second only ever rewrites
+            // an `Op::Jump`, so a handler could not reach it anyway.
             if matches!(self.code[site], Op::PushHandler { .. }) {
                 continue;
             }
             let Some(target) = jump_target_mut(&mut self.code[site]).map(|target| *target) else {
                 continue;
             };
-            let Some(threaded) = self.threaded_target(site, target) else {
+            let Some(arrival) = self.threaded_target(site, target) else {
                 continue;
             };
-            if let Some(slot) = jump_target_mut(&mut self.code[site]) {
-                *slot = threaded;
+            if arrival != target {
+                if let Some(slot) = jump_target_mut(&mut self.code[site]) {
+                    *slot = arrival;
+                }
+            }
+            if self.returns_on_arrival(site, arrival) {
+                // In place, so every address the rest of the list was patched
+                // with still names the instruction it was patched to name.
+                // The position table keeps the jump's entry, which costs
+                // nothing: `Return` never asks for a position.
+                self.code[site] = Op::Return;
             }
         }
     }
 
+    /// Whether the unconditional jump at `site` could be the [`Op::Return`] it
+    /// arrives at.
+    ///
+    /// Arriving there and running `Return` here are the same thing: the jump
+    /// dispatches nothing on the way, so the operand stack, the locals, the
+    /// iterators and the armed handlers are what this site left them, and the
+    /// verifier has already established that every path into that `Return`
+    /// agrees on all four. What the `Return` then does with them -- take the
+    /// value on top and truncate the frame -- does not depend on where it was
+    /// reached from.
+    ///
+    /// Forward only, for the reason [`Lowering::threaded_target`] gives: an
+    /// arrival at or below the site is a back edge the JIT driver counts and
+    /// the operation budget charges, and an instruction that is no longer a
+    /// jump has no arrival to offer. A forward one has none to lose.
+    fn returns_on_arrival(&self, site: usize, arrival: u32) -> bool {
+        matches!(self.code[site], Op::Jump(..))
+            && arrival > site as u32
+            && matches!(self.code.get(arrival as usize), Some(Op::Return))
+    }
+
     /// Where a jump at `site` to `target` really arrives, or `None` when
     /// sending it straight there would change what the JIT driver sees.
+    ///
+    /// `target` itself when there is no chain to follow, which is an answer
+    /// [`Lowering::thread_jumps`] still has a use for -- it is the address the
+    /// `Return` rule is asked about -- so the caller compares before storing.
     ///
     /// The grain driver has no `can_enter_jit`. It recognises a back edge
     /// instead, by the program counter failing to advance from the last
@@ -2669,7 +2713,7 @@ impl Lowering {
         }
 
         let direct = u32::from(at <= site as u32);
-        (at != target && arrivals == direct).then_some(at)
+        (arrivals == direct).then_some(at)
     }
 
     /// Where the instruction list currently ends, for [`Lowering::rewind`].
@@ -3479,6 +3523,88 @@ mod tests {
         let ops = lowered("let a = (); let b = 1; if a ?? (b < 2) { 1 } else { 2 }");
         assert_eq!(branched(&ops), 0, "a `??` operand's operator must not fold");
         assert_eq!(tests(&ops), 1, "the branch it feeds must survive");
+    }
+
+    /// An arm that converges on a `Return` is that `Return`.
+    ///
+    /// The `then` arm of a tail `if` ends by jumping to where the arms meet,
+    /// and when that is the body's own `Return` the jump buys nothing: the
+    /// instructions in between are skipped either way, so arriving there and
+    /// returning here leave the same value on the same stack.
+    ///
+    /// The nested `if` is the chained shape — the inner arms converge on the
+    /// outer arm's jump, which is itself only a way of reaching that same
+    /// `Return` — and it is what fixes the order of the two rules in
+    /// [`Lowering::thread_jumps`]: threading first, so the second rule is
+    /// asked about the address the chain ends at.
+    ///
+    /// The `while` is the shape that must not move. Its arms converge on the
+    /// loop header, and that arrival is what the JIT driver reads as a back
+    /// edge and what the operation budget charges — see
+    /// [`Lowering::threaded_target`] — so those jumps stay jumps.
+    #[test]
+    fn an_arm_that_converges_on_a_return_is_a_return() {
+        let engine = crate::Engine::new();
+        let lower = |source: &str| {
+            let ast = engine.compile(source).expect("must compile");
+            let program = Compiler::new().compile(&ast);
+            program.verify().expect("must verify");
+            crate::grain::bytecode::code::disassemble(program.code()).collect::<Vec<_>>()
+        };
+
+        let ops: Vec<_> = lower("fn f(x) { if x { 1 } else { 2 } }")
+            .into_iter()
+            .map(|(.., op)| op)
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                // The script body, which calls nothing.
+                Op::Unit,
+                Op::Return,
+                // `f`, whose `then` arm returns where it used to jump.
+                Op::LoadLocal(0),
+                Op::JumpIfFalse { target: 14 },
+                Op::Const(0),
+                Op::Return,
+                Op::Const(1),
+                Op::Return,
+            ],
+        );
+
+        let ops: Vec<_> = lower("fn g(x, y) { if x { if y { 1 } else { 2 } } else { 3 } }")
+            .into_iter()
+            .map(|(.., op)| op)
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                Op::Unit,
+                Op::Return,
+                Op::LoadLocal(0),
+                Op::JumpIfFalse { target: 26 },
+                Op::LoadLocal(1),
+                Op::JumpIfFalse { target: 22 },
+                Op::Const(0),
+                Op::Return,
+                Op::Const(1),
+                Op::Return,
+                Op::Const(2),
+                Op::Return,
+            ],
+        );
+
+        let decoded = lower(
+            "fn h(x) { let i = 0; while i < x { if i == 3 { i += 1; } else { i += 2; } } i }",
+        );
+        let back_edges = decoded
+            .iter()
+            .filter(|(at, op)| matches!(op, Op::Jump(target) if (*target as usize) <= *at))
+            .count();
+        assert_eq!(
+            back_edges, 2,
+            "both arms of the loop body must still arrive at the header",
+        );
     }
 
     #[test]
