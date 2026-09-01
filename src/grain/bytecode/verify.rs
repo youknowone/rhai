@@ -467,7 +467,7 @@ fn verify_chunk(
 /// Capabilities an instruction requires.
 fn required_caps(op: &Op, pools: &Pools) -> Caps {
     match op {
-        Op::Chain(index)
+        Op::Chain { chain: index, .. }
         | Op::IndexSet { chain: index, .. }
         | Op::IndexGet { chain: index, .. } => match pools.chains.get(*index as usize) {
             Some(chain) => {
@@ -556,11 +556,11 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
     match op {
         // A chain eats the indices and arguments its steps named, plus a root
         // that is not a slot, plus the value being assigned. A read leaves the
-        // value it arrived at; an assignment leaves nothing, its unit being an
-        // instruction of its own where anything reads it. An index with no
-        // chain behind it reads as consuming nothing; `check_indices` is what
-        // rejects it.
-        Op::Chain(index)
+        // value it arrived at, unless the instruction is the spelling that
+        // drops it; an assignment leaves nothing, its unit being an instruction
+        // of its own where anything reads it. An index with no chain behind it
+        // reads as consuming nothing; `check_indices` is what rejects it.
+        Op::Chain { chain: index, .. }
         | Op::IndexSet { chain: index, .. }
         | Op::IndexGet { chain: index, .. } => match pools.chains.get(*index as usize) {
             Some(chain) => {
@@ -581,7 +581,14 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
                     }
                 ));
                 let consumes = chain.consumes().saturating_sub(named);
-                let produces = usize::from(matches!(chain.tail, Tail::Read));
+                // A discarding tag over an assigning tail names a value that
+                // was never pushed, which is a corrupt artifact rather than a
+                // second way of leaving nothing — and it reads as leaving
+                // nothing either way, so nothing here has to tell them apart.
+                let produces = usize::from(
+                    matches!(chain.tail, Tail::Read)
+                        && !matches!(op, Op::Chain { discards: true, .. }),
+                );
                 (consumes, consumes, produces)
             }
             None => (0, 0, 1),
@@ -855,6 +862,7 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         // The slot is checked against the scope when it runs, as every other
         // slot is; the chain behind it is the same record `CHAIN` names.
         tag::CHAIN
+        | tag::CHAIN_DISCARD
         | tag::INDEX_SET
         | tag::INDEX_SET_FROM_LOCAL
         | tag::INDEX_SET_FROM_CONST
@@ -1048,7 +1056,13 @@ mod tests {
 
         for chain in past_the_end {
             let temporary = chain.roots_on_stack();
-            let mut ops = vec![Op::Chain(0), Op::Return];
+            let mut ops = vec![
+                Op::Chain {
+                    chain: 0,
+                    discards: false,
+                },
+                Op::Return,
+            ];
             if temporary {
                 ops.insert(0, Op::Unit);
             }
@@ -1078,7 +1092,15 @@ mod tests {
             vec![],
             Tail::Assign { op: Some(2) },
         );
-        let (code, _) = assemble(&[Op::Unit, Op::Chain(0), Op::Return]).expect("must assemble");
+        let (code, _) = assemble(&[
+            Op::Unit,
+            Op::Chain {
+                chain: 0,
+                discards: false,
+            },
+            Op::Return,
+        ])
+        .expect("must assemble");
         let chunk = Chunk::new(0, code.len() as u32, 8);
         assert!(matches!(
             verify(

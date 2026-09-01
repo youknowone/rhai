@@ -273,7 +273,9 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "call_style_receiver_is_also_an_argument"
             | "call_style_receiver_twice_over"
             | "call_style_shared_receiver"
+            | "chain_in_statement_position_at_a_jump_target"
             | "chain_index_coalesce"
+            | "chain_method_in_statement_position"
             | "closure_call_mutates_an_array"
             | "closure_filter_binds_this"
             | "closure_for_each_binds_this"
@@ -382,8 +384,11 @@ pub fn applies_to_this_build(name: &str) -> bool {
             "array_methods"
                 | "call_style_mutating_host_type"
                 | "call_style_shared_receiver"
-                | "char_ops"
+                | "chain_in_statement_position_at_a_jump_target"
+                | "chain_method_in_statement_position"
                 | "chain_property_coalesce"
+                | "chain_property_in_statement_position"
+                | "char_ops"
                 | "closure_call_mutates_an_array"
                 | "closure_call_on_a_local_inline"
                 | "closure_call_on_a_local_reads"
@@ -402,6 +407,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "closure_shared_write"
                 | "empty_literals_nested_in_computed_ones"
                 | "empty_map_nested_in_a_computed_map"
+                | "error_chain_in_statement_position"
                 | "error_const_root_method_step"
                 | "error_fn_ptr_unknown_name"
                 | "error_index_into_an_unindexable_step_deep"
@@ -578,6 +584,25 @@ pub const CASES: &[Case] = &[
     // goes, and it has to arrive at a test rather than past one.
     case("coalesce_guard_ends_in_a_comparison", "let a = (); let b = 1; if a ?? (b < 2) { 1 } else { 2 }"),
     case("coalesce_guard_skips_to_the_branch", "let a = true; let b = 1; if a ?? (b < 2) { 1 } else { 2 }"),
+    // A chain in statement position, which is what a loop writing a container
+    // is made of. The walk runs for the method's effect and nothing reads what
+    // it arrived at, so the instruction drops the value rather than pushing it
+    // for the next one to take off — and what the container ends up holding is
+    // how the two sides say whether the walk still happened.
+    case("chain_method_in_statement_position", "let a = [1]; a.push(2); a"),
+    // A property read there instead, which has no effect at all to run: the
+    // whole statement is a value nothing wants. Rhai still evaluates it, and a
+    // getter registered on a host type would still be called.
+    case("chain_property_in_statement_position", "let m = #{ a: 1 }; m.a; m"),
+    // One that mutates and then raises. What it evaluates to is discarded
+    // either way, so the error is the only thing left to disagree about — and
+    // the mutation before it has to have landed.
+    case("error_chain_in_statement_position", "let w = widget(1); w.bump_then_fail(); w"),
+    // A chain in statement position that something already jumps to: the false
+    // edge of the `if` lands on the `else` arm's own instruction. Arriving
+    // there carries a stack height, so the value has to be pushed and popped
+    // after all rather than never pushed.
+    case("chain_in_statement_position_at_a_jump_target", "let a = [1]; let n = 1; if n > 0 { a.push(2); } else { a.clear(); } a"),
     case("while_loop", "let i = 0; let s = 0; while i < 5 { s += i; i += 1; } s"),
     case("do_while", "let i = 0; do { i += 1; } while i < 3; i"),
     case("do_until", "let i = 0; do { i += 1; } until i >= 3; i"),

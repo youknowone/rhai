@@ -159,6 +159,11 @@ fn the_round_trip_covers_something_worth_covering() {
         "guard_operator_computed_left",
         "guard_operator_computed_left_and_constant",
         "guard_operator_computed_right",
+        // The chain that drops what it arrived at, which is its own tag rather
+        // than a flag inside the general one — reached through a property, so
+        // only the `.` it needs is missing on a build that skips it.
+        #[cfg(not(feature = "no_object"))]
+        "chain_property_in_statement_position",
     ] {
         assert!(names.contains(&required), "`{required}` no longer writes, so the encoder branch it covers is untested",);
     }

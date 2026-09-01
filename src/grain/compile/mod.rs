@@ -615,7 +615,14 @@ impl Lowering {
                 slot,
                 index: named_index,
             },
-            (None, ..) => Op::Chain(index),
+            // Reading or assigning, with the value it arrives at left where
+            // whoever wants it can see it. A statement that wants none of it
+            // retags the instruction rather than popping — see
+            // [`Lowering::discard_trailing_chain`].
+            (None, ..) => Op::Chain {
+                chain: index,
+                discards: false,
+            },
         };
         self.emit_at(op, expr.position());
         self.unwind_to(unwind_depth);
@@ -2502,7 +2509,7 @@ impl Lowering {
     /// Take the value on top of the operand stack off again — by not putting
     /// it there when that is possible, and popping it when it is not.
     fn discard_value(&mut self) {
-        if !self.drop_trailing_unit() {
+        if !self.drop_trailing_unit() && !self.discard_trailing_chain() {
             self.emit(Op::Pop);
         }
     }
@@ -2532,6 +2539,57 @@ impl Lowering {
             return false;
         }
         self.rewind(last);
+        true
+    }
+
+    /// Retag the [`Op::Chain`] a statement ended with as the spelling that
+    /// drops what the walk arrived at, instead of emitting the [`Op::Pop`]
+    /// that would take it off again.
+    ///
+    /// [`Lowering::drop_trailing_unit`]'s trade for the chain that has no unit
+    /// to drop. `a.push(i);` is a whole method call run for its effect, and the
+    /// value it hands back is taken off on the very next instruction — so the
+    /// pair is two trips round the dispatch loop where the walk is one, and it
+    /// is the shape of nearly every chain a loop body writes.
+    ///
+    /// Only a reading chain is retagged. An assigning one already leaves
+    /// nothing, so the value being discarded here came from somewhere before
+    /// it and a retag would take off something that was never pushed.
+    ///
+    /// [`Op::IndexGet`] keeps its `Pop`. It is the same trade in principle,
+    /// but it is three spellings rather than one, so it is three tags — and
+    /// what it would buy is `a[i];` written as a statement, which reads a
+    /// container and does nothing with what it read.
+    ///
+    /// Refused, as the unit is, unless the chain is the last instruction
+    /// emitted and nothing already jumps to it or past it: an arrival carries
+    /// its own stack height, and two edges meeting at different ones is what
+    /// the verifier exists to catch.
+    ///
+    /// Retagged in place rather than re-emitted, so the instruction keeps its
+    /// side-table entry — a chain that raises names the same position either
+    /// way.
+    fn discard_trailing_chain(&mut self) -> bool {
+        let Some(last) = self.code.len().checked_sub(1) else {
+            return false;
+        };
+        let Some(&Op::Chain {
+            chain,
+            discards: false,
+        }) = self.code.get(last)
+        else {
+            return false;
+        };
+        if !matches!(self.chains[chain as usize].tail, Tail::Read) {
+            return false;
+        }
+        if self.patched_max as usize >= last {
+            return false;
+        }
+        self.code[last] = Op::Chain {
+            chain,
+            discards: true,
+        };
         true
     }
 
@@ -3249,7 +3307,7 @@ mod tests {
             ("native function calls", 7, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
             (
                 "native callbacks",
-                5,
+                4,
                 "let a = []; for i in 0..500 { a.push(i); } \
                  let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
             ),

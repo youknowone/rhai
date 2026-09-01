@@ -262,8 +262,8 @@ pub(crate) fn takes_this(code: &[u8], chunk: Chunk, chains: &[Chain]) -> bool {
             | tag::CALL_THIS_REF
             | tag::CALL_FN_PTR_ON_THIS => true,
             // A chain says where it is rooted in the pool, not in the code.
-            tag::CHAIN => match op {
-                Op::Chain(index) => chains
+            tag::CHAIN | tag::CHAIN_DISCARD => match op {
+                Op::Chain { chain: index, .. } => chains
                     .get(index as usize)
                     .map_or(false, |chain| matches!(chain.root, Root::This { .. })),
                 _ => false,

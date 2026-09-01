@@ -739,7 +739,20 @@ pub enum Op {
     /// evaluates to is an [`Op::Unit`] beside it, emitted only where something
     /// reads the value — which lets the peephole that already collapses that
     /// pair for a local assignment collapse this one too.
-    Chain(u32),
+    ///
+    /// `discards` is the same walk with what it arrived at dropped rather than
+    /// pushed, which is a read in statement position: `a.push(i);` runs the
+    /// chain for the method's effect and nothing reads the answer. A spelling
+    /// of the instruction rather than an [`Op::Pop`] behind it, because a `Pop`
+    /// is a whole trip round the dispatch loop spent undoing what the
+    /// instruction before it just did — the same trade the assignment's unit
+    /// above is. Never set on an assigning tail, which leaves nothing to drop.
+    Chain {
+        /// Index into the chain pool.
+        chain: u32,
+        /// Whether what the walk arrived at is dropped rather than pushed.
+        discards: bool,
+    },
 
     /// Truncate the scope back to `.0` locals, dropping everything a block
     /// declared. The compile-time slot model unwinds in step.

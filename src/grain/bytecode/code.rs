@@ -273,6 +273,14 @@ pub mod tag {
     pub const BIN_OP_FROM_LOCAL_JF: u8 = 0x5d;
     /// [`BIN_OP_FROM_CONST`] that is also the branch reading it.
     pub const BIN_OP_FROM_CONST_JF: u8 = 0x5e;
+    /// [`Op::Chain`](super::Op::Chain) whose value is dropped rather than
+    /// pushed.
+    ///
+    /// The same operand layout as [`CHAIN`], and no operand of its own: what
+    /// the walk does is the chain record's business either way, and only what
+    /// becomes of the value it arrives at differs — so the two share a dispatch
+    /// arm.
+    pub const CHAIN_DISCARD: u8 = 0x5f;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -347,6 +355,7 @@ static WIDTHS: [u8; 256] = {
     widths[tag::EVAL_AST as usize] = 3;
     widths[tag::EVAL_AST_KEEP as usize] = 3;
     widths[tag::CHAIN as usize] = 3;
+    widths[tag::CHAIN_DISCARD as usize] = 3;
     widths[tag::MAKE_ARRAY as usize] = 3;
     widths[tag::SWITCH as usize] = 3;
     widths[tag::LOAD_NAMED as usize] = 3;
@@ -748,9 +757,13 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 code.push(*under);
             }
 
-            Op::Chain(index) => {
-                code.push(tag::CHAIN);
-                code.extend_from_slice(&small(*index as usize, "chains")?.to_le_bytes());
+            Op::Chain { chain, discards } => {
+                code.push(if *discards {
+                    tag::CHAIN_DISCARD
+                } else {
+                    tag::CHAIN
+                });
+                code.extend_from_slice(&small(*chain as usize, "chains")?.to_le_bytes());
             }
 
             Op::IndexSet { chain, slot, index } | Op::IndexGet { chain, slot, index } => {
@@ -1024,7 +1037,7 @@ fn encoded_width(op: &Op) -> usize {
         | Op::UnwindTo(..)
         | Op::Statement { .. }
         | Op::EvalAst { .. }
-        | Op::Chain(..)
+        | Op::Chain { .. }
         | Op::Switch(..)
         | Op::LoadNamed(..)
         | Op::AssignNamed { op: None, .. }
@@ -1272,7 +1285,10 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         },
         tag::ROTATE => Op::Rotate(code[at + 1]),
 
-        tag::CHAIN => Op::Chain(u32::from(small(1)?)),
+        tag @ (tag::CHAIN | tag::CHAIN_DISCARD) => Op::Chain {
+            chain: u32::from(small(1)?),
+            discards: tag == tag::CHAIN_DISCARD,
+        },
         // The six share one operand layout and differ in two things: whether
         // the instruction reads or writes, and whether it names its index.
         // The operand word is only read where a tag says it is there.
@@ -1660,8 +1676,16 @@ mod tests {
                 branch: Some(0),
             },
             // The chain pool's index and the slot beside it, in both
-            // specialised spellings and the general one they fall back to.
-            Op::Chain(2),
+            // specialised spellings and the general one they fall back to —
+            // which has a second spelling for the value nothing reads.
+            Op::Chain {
+                chain: 2,
+                discards: false,
+            },
+            Op::Chain {
+                chain: 2,
+                discards: true,
+            },
             Op::IndexSet {
                 chain: 2,
                 slot: 4,

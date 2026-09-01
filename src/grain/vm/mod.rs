@@ -5839,19 +5839,22 @@ impl<'e> Vm<'e> {
                     self.push(value.into());
                 }
 
-                code::tag::CHAIN => {
+                code::tag::CHAIN | code::tag::CHAIN_DISCARD => {
                     let index = u32::from(small!(1));
                     let chain =
                         or_raise!(program.chain(index), malformed(format!("no chain {index}")));
-                    let assigns = matches!(chain.tail, Tail::Assign { .. });
-                    let value = self.run_chain(program, chain, index, scope, base, pos!())?;
                     // An assignment is not an expression here: what it
                     // evaluates to is the `Op::Unit` beside it, emitted only
-                    // where something reads it.
-                    if assigns {
-                        drop(value);
-                    } else {
+                    // where something reads it. A read in statement position
+                    // has nothing behind it to take its value off again, and
+                    // says so in its tag; the walk itself is the same either
+                    // way, so a chain that raises raises identically.
+                    let keeps = matches!(chain.tail, Tail::Read) && tag != code::tag::CHAIN_DISCARD;
+                    let value = self.run_chain(program, chain, index, scope, base, pos!())?;
+                    if keeps {
                         self.push(value);
+                    } else {
+                        drop(value);
                     }
                 }
 
@@ -6452,7 +6455,16 @@ mod tests {
     fn a_method_step_reaching_a_chunk_binds_the_receiver() {
         let program = program_with_chains(
             // `f` is `this.g()`; `g` is `this`.
-            &[&[Op::Chain(0), Op::Return], &[Op::LoadThis, Op::Return]],
+            &[
+                &[
+                    Op::Chain {
+                        chain: 0,
+                        discards: false,
+                    },
+                    Op::Return,
+                ],
+                &[Op::LoadThis, Op::Return],
+            ],
             Vec::new(),
             vec![Chain {
                 root: Root::This {
@@ -6481,7 +6493,13 @@ mod tests {
         let program = program_with_chains(
             // `f` is `this.g()`; `g` is `this = 9`.
             &[
-                &[Op::Chain(0), Op::Return],
+                &[
+                    Op::Chain {
+                        chain: 0,
+                        discards: false,
+                    },
+                    Op::Return,
+                ],
                 &[
                     Op::Const(0),
                     Op::AssignThis { op: None },
@@ -6539,7 +6557,14 @@ mod tests {
     #[cfg(not(feature = "no_index"))]
     fn a_chain_rooted_at_this_mutates_the_hosts_value() {
         let program = program_with_chains(
-            &[&[Op::Const(0), Op::Chain(0), Op::Return]],
+            &[&[
+                Op::Const(0),
+                Op::Chain {
+                    chain: 0,
+                    discards: false,
+                },
+                Op::Return,
+            ]],
             vec![Dynamic::from(2 as INT)],
             vec![Chain {
                 root: Root::This {
@@ -6628,7 +6653,13 @@ mod tests {
     #[test]
     fn a_chain_rooted_at_an_unbound_this_is_an_error() {
         let program = program_with_chains(
-            &[&[Op::Chain(0), Op::Return]],
+            &[&[
+                Op::Chain {
+                    chain: 0,
+                    discards: false,
+                },
+                Op::Return,
+            ]],
             Vec::new(),
             vec![Chain {
                 root: Root::This {
@@ -6656,7 +6687,14 @@ mod tests {
     #[test]
     fn a_coalescing_step_short_circuits_on_unit() {
         let program = program_with_chains(
-            &[&[Op::Unit, Op::Chain(0), Op::Return]],
+            &[&[
+                Op::Unit,
+                Op::Chain {
+                    chain: 0,
+                    discards: false,
+                },
+                Op::Return,
+            ]],
             Vec::new(),
             vec![Chain {
                 root: Root::Temporary,
