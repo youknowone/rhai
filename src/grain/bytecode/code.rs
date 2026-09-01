@@ -256,6 +256,23 @@ pub mod tag {
     pub const INDEX_SET_FROM_LOCAL: u8 = 0x58;
     /// [`Op::IndexSet`](super::Op::IndexSet) with a constant index.
     pub const INDEX_SET_FROM_CONST: u8 = 0x59;
+
+    /// [`Op::BinOp`](super::Op::BinOp) that is also the branch reading it.
+    ///
+    /// The same operand layout as [`BIN_OP`] with the branch target after it,
+    /// so the five below share a dispatch arm with the five above and one
+    /// fallback with all of them. The target goes last rather than first
+    /// because that is what leaves every other operand where the unbranched
+    /// spelling put it.
+    pub const BIN_OP_JF: u8 = 0x5a;
+    /// [`BIN_OP_RHS_LOCAL`] that is also the branch reading it.
+    pub const BIN_OP_RHS_LOCAL_JF: u8 = 0x5b;
+    /// [`BIN_OP_RHS_CONST`] that is also the branch reading it.
+    pub const BIN_OP_RHS_CONST_JF: u8 = 0x5c;
+    /// [`BIN_OP_FROM_LOCAL`] that is also the branch reading it.
+    pub const BIN_OP_FROM_LOCAL_JF: u8 = 0x5d;
+    /// [`BIN_OP_FROM_CONST`] that is also the branch reading it.
+    pub const BIN_OP_FROM_CONST_JF: u8 = 0x5e;
 }
 
 /// How wide each tag's instruction is, with 0 for the tags that are not one.
@@ -375,6 +392,13 @@ static WIDTHS: [u8; 256] = {
 
     widths[tag::BIN_OP_FROM_LOCAL as usize] = 10;
     widths[tag::BIN_OP_FROM_CONST as usize] = 10;
+
+    // Each one its unbranched spelling plus the target.
+    widths[tag::BIN_OP_JF as usize] = 10;
+    widths[tag::BIN_OP_RHS_LOCAL_JF as usize] = 12;
+    widths[tag::BIN_OP_RHS_CONST_JF as usize] = 12;
+    widths[tag::BIN_OP_FROM_LOCAL_JF as usize] = 14;
+    widths[tag::BIN_OP_FROM_CONST_JF as usize] = 14;
 
     widths
 };
@@ -646,11 +670,15 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 op,
                 kind,
                 rhs,
+                branch,
             } => {
-                code.push(match rhs {
-                    None => tag::BIN_OP,
-                    Some(BinOperand::Local(..)) => tag::BIN_OP_RHS_LOCAL,
-                    Some(BinOperand::Const(..)) => tag::BIN_OP_RHS_CONST,
+                code.push(match (rhs, branch) {
+                    (None, None) => tag::BIN_OP,
+                    (Some(BinOperand::Local(..)), None) => tag::BIN_OP_RHS_LOCAL,
+                    (Some(BinOperand::Const(..)), None) => tag::BIN_OP_RHS_CONST,
+                    (None, Some(..)) => tag::BIN_OP_JF,
+                    (Some(BinOperand::Local(..)), Some(..)) => tag::BIN_OP_RHS_LOCAL_JF,
+                    (Some(BinOperand::Const(..)), Some(..)) => tag::BIN_OP_RHS_CONST_JF,
                 });
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*kind as u8);
@@ -661,6 +689,9 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                         BinOperand::Const(index) => small(*index as usize, "constants")?,
                     };
                     code.extend_from_slice(&rhs.to_le_bytes());
+                }
+                if let Some(branch) = branch {
+                    code.extend_from_slice(&target(*branch)?.to_le_bytes());
                 }
             }
 
@@ -870,10 +901,13 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 kind,
                 lhs,
                 rhs,
+                branch,
             } => {
-                code.push(match rhs {
-                    BinOperand::Local(..) => tag::BIN_OP_FROM_LOCAL,
-                    BinOperand::Const(..) => tag::BIN_OP_FROM_CONST,
+                code.push(match (rhs, branch) {
+                    (BinOperand::Local(..), None) => tag::BIN_OP_FROM_LOCAL,
+                    (BinOperand::Const(..), None) => tag::BIN_OP_FROM_CONST,
+                    (BinOperand::Local(..), Some(..)) => tag::BIN_OP_FROM_LOCAL_JF,
+                    (BinOperand::Const(..), Some(..)) => tag::BIN_OP_FROM_CONST_JF,
                 });
                 code.extend_from_slice(&small(*name as usize, "names")?.to_le_bytes());
                 code.push(*kind as u8);
@@ -884,6 +918,9 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                     BinOperand::Const(index) => small(*index as usize, "constants")?,
                 };
                 code.extend_from_slice(&rhs.to_le_bytes());
+                if let Some(branch) = branch {
+                    code.extend_from_slice(&target(*branch)?.to_le_bytes());
+                }
             }
 
             Op::IterNextStore { exit, slot } => {
@@ -1030,17 +1067,39 @@ fn encoded_width(op: &Op) -> usize {
             ..
         } => 7,
         Op::Call { op: Some(..), .. }
-        | Op::BinOp { rhs: None, .. }
+        | Op::BinOp {
+            rhs: None,
+            branch: None,
+            ..
+        }
         | Op::CallRef {
             receiver: Receiver::Local(..) | Receiver::Named(..),
             ..
         } => 6,
-        Op::BinOp { rhs: Some(..), .. } => 8,
+        Op::BinOp {
+            rhs: Some(..),
+            branch: None,
+            ..
+        } => 8,
         Op::AssignLocal { op: Some(..), .. }
         | Op::AssignLocalFrom { op: None, .. }
         | Op::IterNextStore { .. } => 7,
         Op::AssignLocalFrom { op: Some(..), .. } => 9,
-        Op::BinOpFrom { .. } => 10,
+        // Each fused form is its unbranched spelling plus the target.
+        Op::BinOp {
+            rhs: None,
+            branch: Some(..),
+            ..
+        }
+        | Op::BinOpFrom { branch: None, .. } => 10,
+        Op::BinOp {
+            rhs: Some(..),
+            branch: Some(..),
+            ..
+        } => 12,
+        Op::BinOpFrom {
+            branch: Some(..), ..
+        } => 14,
     }
 }
 
@@ -1161,13 +1220,29 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         // A kind byte naming nothing is not an instruction, which is what
         // keeps a corrupt artifact from reaching the VM's operator table with
         // an index it cannot answer.
-        tag::BIN_OP | tag::BIN_OP_RHS_LOCAL | tag::BIN_OP_RHS_CONST => Op::BinOp {
+        tag::BIN_OP
+        | tag::BIN_OP_RHS_LOCAL
+        | tag::BIN_OP_RHS_CONST
+        | tag::BIN_OP_JF
+        | tag::BIN_OP_RHS_LOCAL_JF
+        | tag::BIN_OP_RHS_CONST_JF => Op::BinOp {
             name: u32::from(small(1)?),
             op: u32::from(small(4)?),
             kind: BinOpKind::from_byte(code[at + 3])?,
             rhs: match code[at] {
-                tag::BIN_OP_RHS_LOCAL => Some(BinOperand::Local(small(6)?)),
-                tag::BIN_OP_RHS_CONST => Some(BinOperand::Const(u32::from(small(6)?))),
+                tag::BIN_OP_RHS_LOCAL | tag::BIN_OP_RHS_LOCAL_JF => {
+                    Some(BinOperand::Local(small(6)?))
+                }
+                tag::BIN_OP_RHS_CONST | tag::BIN_OP_RHS_CONST_JF => {
+                    Some(BinOperand::Const(u32::from(small(6)?)))
+                }
+                _ => None,
+            },
+            // The target sits after whatever operand the tag names, which is
+            // the only thing that moves it.
+            branch: match code[at] {
+                tag::BIN_OP_JF => Some(u32_at(code, at + 6)?),
+                tag::BIN_OP_RHS_LOCAL_JF | tag::BIN_OP_RHS_CONST_JF => Some(u32_at(code, at + 8)?),
                 _ => None,
             },
         },
@@ -1287,15 +1362,24 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             exit: u32_at(code, at + 1)?,
             indexed: true,
         },
-        tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_CONST => Op::BinOpFrom {
+        tag::BIN_OP_FROM_LOCAL
+        | tag::BIN_OP_FROM_CONST
+        | tag::BIN_OP_FROM_LOCAL_JF
+        | tag::BIN_OP_FROM_CONST_JF => Op::BinOpFrom {
             name: u32::from(small(1)?),
             kind: BinOpKind::from_byte(code[at + 3])?,
             op: u32::from(small(4)?),
             lhs: small(6)?,
-            rhs: if code[at] == tag::BIN_OP_FROM_LOCAL {
+            rhs: if matches!(code[at], tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_LOCAL_JF) {
                 BinOperand::Local(small(8)?)
             } else {
                 BinOperand::Const(u32::from(small(8)?))
+            },
+            branch: match code[at] {
+                tag::BIN_OP_FROM_LOCAL_JF | tag::BIN_OP_FROM_CONST_JF => {
+                    Some(u32_at(code, at + 10)?)
+                }
+                _ => None,
             },
         },
 
@@ -1505,18 +1589,21 @@ mod tests {
                 op: 3,
                 kind: BinOpKind::Add,
                 rhs: None,
+                branch: None,
             },
             Op::BinOp {
                 name: 1,
                 op: 3,
                 kind: BinOpKind::Add,
                 rhs: Some(BinOperand::Local(5)),
+                branch: None,
             },
             Op::BinOp {
                 name: 1,
                 op: 3,
                 kind: BinOpKind::Less,
                 rhs: Some(BinOperand::Const(6)),
+                branch: None,
             },
             Op::BinOpFrom {
                 name: 1,
@@ -1524,6 +1611,7 @@ mod tests {
                 kind: BinOpKind::Add,
                 lhs: 4,
                 rhs: BinOperand::Local(5),
+                branch: None,
             },
             Op::BinOpFrom {
                 name: 1,
@@ -1531,6 +1619,45 @@ mod tests {
                 kind: BinOpKind::Less,
                 lhs: 4,
                 rhs: BinOperand::Const(6),
+                branch: None,
+            },
+            // The same five carrying the branch that reads their result.
+            Op::BinOp {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                rhs: None,
+                branch: Some(0),
+            },
+            Op::BinOp {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                rhs: Some(BinOperand::Local(5)),
+                branch: Some(0),
+            },
+            Op::BinOp {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                rhs: Some(BinOperand::Const(6)),
+                branch: Some(0),
+            },
+            Op::BinOpFrom {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                lhs: 4,
+                rhs: BinOperand::Local(5),
+                branch: Some(0),
+            },
+            Op::BinOpFrom {
+                name: 1,
+                op: 3,
+                kind: BinOpKind::Less,
+                lhs: 4,
+                rhs: BinOperand::Const(6),
+                branch: Some(0),
             },
             // The chain pool's index and the slot beside it, in both
             // specialised spellings and the general one they fall back to.

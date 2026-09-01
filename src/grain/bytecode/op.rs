@@ -941,6 +941,17 @@ pub enum Op {
     /// Gated at run time on `Engine::fast_operators()` for the same reason
     /// [`Op::Call`]'s built-in short-circuit is: with it off, both the walker
     /// and the VM dispatch, and a host-registered `+` on integers wins in both.
+    ///
+    /// A result nothing reads but the branch that follows it is not pushed at
+    /// all: `branch` names where control goes when the result is false, and
+    /// the instruction *is* the [`Op::JumpIfFalse`] it would have been
+    /// followed by. `while i < n`, `if i % 3 == 0` and every guard written
+    /// that way are one instruction rather than two.
+    ///
+    /// The two halves report against the same place, so one position-table
+    /// entry serves both: Rhai blames a guard that is not a `bool` on the
+    /// guard expression's own position, and the operator that computed it is
+    /// that expression.
     BinOp {
         /// The operator's name, for the dispatch fallback and error messages.
         name: u32,
@@ -950,6 +961,9 @@ pub enum Op {
         kind: BinOpKind,
         /// Where the right operand comes from; popped when absent.
         rhs: Option<BinOperand>,
+        /// Where to go when the result is false, for an operator that is also
+        /// the test of a branch; the result is consumed rather than pushed.
+        branch: Option<u32>,
     },
 
     /// Assign into `local[index]`, with the chain it specialises beside it.
@@ -1054,6 +1068,10 @@ pub enum Op {
     /// left and something else on the right is rare enough that a tag for it
     /// would be dead weight, and a constant on both sides is folded before
     /// lowering ever sees it.
+    ///
+    /// It takes a branch on the same terms [`Op::BinOp`] does, and for the
+    /// same reason: `i < n` at the head of a loop is this instruction, and the
+    /// jump that reads its result is the only thing that ever does.
     BinOpFrom {
         /// The operator's name, for the dispatch fallback and error messages.
         name: u32,
@@ -1065,6 +1083,9 @@ pub enum Op {
         lhs: u16,
         /// Where the right operand comes from.
         rhs: BinOperand,
+        /// Where to go when the result is false, for an operator that is also
+        /// the test of a branch; the result is consumed rather than pushed.
+        branch: Option<u32>,
     },
 
     /// End the chunk, yielding the top of the operand stack, or unit if empty.

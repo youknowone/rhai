@@ -151,6 +151,14 @@ fn the_round_trip_covers_something_worth_covering() {
         // call to get there
         #[cfg(not(any(feature = "no_index", feature = "no_object")))]
         "temp_root_array_method",
+        // An operator that carries the branch reading it, in each of the five
+        // spellings the operand it names gives it: both operands named, the
+        // right one alone named as a slot or as a constant, and neither.
+        "guard_operator_local_and_local",
+        "guard_operator_local_and_constant",
+        "guard_operator_computed_left",
+        "guard_operator_computed_left_and_constant",
+        "guard_operator_computed_right",
     ] {
         assert!(names.contains(&required), "`{required}` no longer writes, so the encoder branch it covers is untested",);
     }

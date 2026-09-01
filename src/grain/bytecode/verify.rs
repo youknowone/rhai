@@ -363,7 +363,17 @@ fn verify_chunk(
 
             Op::JumpIfFalse { target }
             | Op::JumpIfTrue { target }
-            | Op::SkipIfNotUnit { target } => {
+            | Op::SkipIfNotUnit { target }
+            // An operator carrying the branch that reads it has the branch's
+            // two edges, and its operands are already off the stack on both.
+            | Op::BinOp {
+                branch: Some(target),
+                ..
+            }
+            | Op::BinOpFrom {
+                branch: Some(target),
+                ..
+            } => {
                 go(target, next_state)?;
                 work_list.push((next, next_state));
             }
@@ -607,7 +617,13 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
 
         // Its operands are named by the instruction, so only the result is on
         // the stack. The dispatch fallback pushes them and takes them back.
-        Op::BinOpFrom { .. } => (0, 0, 1),
+        //
+        // A fused branch reads that result rather than leaving it, so nothing
+        // reaches the stack along either edge.
+        Op::BinOpFrom { branch: None, .. } => (0, 0, 1),
+        Op::BinOpFrom {
+            branch: Some(..), ..
+        } => (0, 0, 0),
 
         Op::JumpIfFalse { .. } | Op::JumpIfTrue { .. } | Op::Switch(..) => (1, 1, 0),
 
@@ -628,8 +644,11 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // whichever way the instruction ends up running.
         // The named-right form takes only its left operand off the stack; the
         // other it reads for itself, as `BinOpFrom` reads both.
-        Op::BinOp { rhs: Some(..), .. } => (1, 1, 1),
-        Op::BinOp { rhs: None, .. } => (2, 2, 1),
+        Op::BinOp { rhs, branch, .. } => {
+            let operands = if rhs.is_some() { 1 } else { 2 };
+            let result = usize::from(branch.is_none());
+            (operands, operands, result)
+        }
 
         // The same for one operand.
         Op::UnOp { .. } => (1, 1, 1),
@@ -731,7 +750,7 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         // The kind byte is checked here rather than only where the instruction
         // decodes, because this pass walks every instruction and the reachable
         // walk does not — and because the VM dispatches on the byte itself.
-        tag::BIN_OP => {
+        tag::BIN_OP | tag::BIN_OP_JF => {
             bounded(index(1), "name", pools.names)?;
             let kind = u32::from(code[at + 3]);
             if BinOpKind::from_byte(code[at + 3]).is_none() {
@@ -757,7 +776,10 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         }
         // The operands are a slot, which is checked against the scope when it
         // runs, and either a second slot or a constant index.
-        tag::BIN_OP_RHS_LOCAL | tag::BIN_OP_RHS_CONST => {
+        tag::BIN_OP_RHS_LOCAL
+        | tag::BIN_OP_RHS_CONST
+        | tag::BIN_OP_RHS_LOCAL_JF
+        | tag::BIN_OP_RHS_CONST_JF => {
             bounded(index(1), "name", pools.names)?;
             let kind = u32::from(code[at + 3]);
             if BinOpKind::from_byte(code[at + 3]).is_none() {
@@ -768,12 +790,15 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
                 });
             }
             bounded(index(4), "operator", pools.tokens)?;
-            if code[at] == tag::BIN_OP_RHS_CONST {
+            if matches!(code[at], tag::BIN_OP_RHS_CONST | tag::BIN_OP_RHS_CONST_JF) {
                 bounded(index(6), "constant", pools.consts)?;
             }
             Ok(())
         }
-        tag::BIN_OP_FROM_LOCAL | tag::BIN_OP_FROM_CONST => {
+        tag::BIN_OP_FROM_LOCAL
+        | tag::BIN_OP_FROM_CONST
+        | tag::BIN_OP_FROM_LOCAL_JF
+        | tag::BIN_OP_FROM_CONST_JF => {
             bounded(index(1), "name", pools.names)?;
             let kind = u32::from(code[at + 3]);
             if BinOpKind::from_byte(code[at + 3]).is_none() {
@@ -784,7 +809,7 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
                 });
             }
             bounded(index(4), "operator", pools.tokens)?;
-            if code[at] == tag::BIN_OP_FROM_CONST {
+            if matches!(code[at], tag::BIN_OP_FROM_CONST | tag::BIN_OP_FROM_CONST_JF) {
                 bounded(index(8), "constant", pools.consts)?;
             }
             Ok(())

@@ -5260,6 +5260,11 @@ impl<'e> Vm<'e> {
                 | code::tag::BIN_OP_FROM_CONST
                 | code::tag::BIN_OP_RHS_LOCAL
                 | code::tag::BIN_OP_RHS_CONST
+                | code::tag::BIN_OP_JF
+                | code::tag::BIN_OP_FROM_LOCAL_JF
+                | code::tag::BIN_OP_FROM_CONST_JF
+                | code::tag::BIN_OP_RHS_LOCAL_JF
+                | code::tag::BIN_OP_RHS_CONST_JF
                 | code::tag::UN_OP => {
                     // A fused operator names its operands instead of taking
                     // them off the stack; pushed here so that everything below
@@ -5268,7 +5273,10 @@ impl<'e> Vm<'e> {
                     // replaces did exactly this and cost two more trips round
                     // the dispatch loop for it.
                     let typed = match tag {
-                        code::tag::BIN_OP_FROM_LOCAL | code::tag::BIN_OP_FROM_CONST => {
+                        code::tag::BIN_OP_FROM_LOCAL
+                        | code::tag::BIN_OP_FROM_CONST
+                        | code::tag::BIN_OP_FROM_LOCAL_JF
+                        | code::tag::BIN_OP_FROM_CONST_JF => {
                             let slot = small!(6);
                             let index = base + slot as usize;
                             if index >= scope_len!() {
@@ -5277,7 +5285,10 @@ impl<'e> Vm<'e> {
                                 )));
                             }
                             let lhs = scope_entry!(index).flatten_clone();
-                            let rhs = if tag == code::tag::BIN_OP_FROM_LOCAL {
+                            let rhs = if matches!(
+                                tag,
+                                code::tag::BIN_OP_FROM_LOCAL | code::tag::BIN_OP_FROM_LOCAL_JF
+                            ) {
                                 let slot = small!(8);
                                 let index = base + slot as usize;
                                 if index >= scope_len!() {
@@ -5302,8 +5313,14 @@ impl<'e> Vm<'e> {
                         // Only the right operand is named here; the left is
                         // already on the stack, where the expression that
                         // computed it left it.
-                        code::tag::BIN_OP_RHS_LOCAL | code::tag::BIN_OP_RHS_CONST => {
-                            let rhs = if tag == code::tag::BIN_OP_RHS_LOCAL {
+                        code::tag::BIN_OP_RHS_LOCAL
+                        | code::tag::BIN_OP_RHS_CONST
+                        | code::tag::BIN_OP_RHS_LOCAL_JF
+                        | code::tag::BIN_OP_RHS_CONST_JF => {
+                            let rhs = if matches!(
+                                tag,
+                                code::tag::BIN_OP_RHS_LOCAL | code::tag::BIN_OP_RHS_LOCAL_JF
+                            ) {
                                 let slot = small!(6);
                                 let index = base + slot as usize;
                                 if index >= scope_len!() {
@@ -5324,8 +5341,49 @@ impl<'e> Vm<'e> {
                             self.push(rhs);
                             true
                         }
-                        _ => tag == code::tag::BIN_OP,
+                        _ => matches!(tag, code::tag::BIN_OP | code::tag::BIN_OP_JF),
                     };
+
+                    // Where the target of the branch this instruction also is
+                    // sits, when it is one. Behind whatever operand the tag
+                    // names, which is the only thing that moves it.
+                    let branch = match tag {
+                        code::tag::BIN_OP_JF => Some(6),
+                        code::tag::BIN_OP_RHS_LOCAL_JF | code::tag::BIN_OP_RHS_CONST_JF => Some(8),
+                        code::tag::BIN_OP_FROM_LOCAL_JF | code::tag::BIN_OP_FROM_CONST_JF => {
+                            Some(10)
+                        }
+                        _ => None,
+                    };
+                    // What the operator's result is for: pushed, or read by
+                    // the branch the instruction swallowed and not pushed at
+                    // all. Every way out of this arm goes through here, so an
+                    // operand pair the typed arms decline reaches the same
+                    // branch by the same rule the pair of instructions reached
+                    // it by. Rhai requires a boolean guard and reports the
+                    // mismatch at the guard's own position, which is this
+                    // instruction's (`eval/stmt.rs:487-490`).
+                    macro_rules! deliver {
+                        ($floor:expr, $value:expr) => {{
+                            let value = $value;
+                            truncate_stack!($floor);
+                            match branch {
+                                None => self.push(value),
+                                Some(offset) => {
+                                    let holds = match value.as_bool() {
+                                        Ok(holds) => holds,
+                                        Err(actual) => {
+                                            return Err(self.mismatch::<bool>(actual, pos!()))
+                                        }
+                                    };
+                                    if !holds {
+                                        transfer!(wide!(offset) as usize);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }};
+                    }
 
                     // The typed operator, ahead of every pool read: an
                     // instruction that runs here touches its own bytes, the top
@@ -5363,8 +5421,7 @@ impl<'e> Vm<'e> {
                                 // `fast_operators` Rhai returns a built-in's
                                 // error untouched, which is why `1 / 0` has
                                 // none. See `dispatch_failure`.
-                                truncate_stack!(under);
-                                self.push(value);
+                                deliver!(under, value);
                                 pc += width;
                                 continue;
                             }
@@ -5447,8 +5504,7 @@ impl<'e> Vm<'e> {
                             let context = need_context
                                 .then(|| (self.engine, name, None, &self.global, pos!()).into());
                             let value = func(context, &mut [lhs, rhs])?;
-                            truncate_stack!(first);
-                            self.push(value);
+                            deliver!(first, value);
                             pc += width;
                             continue;
                         }
@@ -5465,8 +5521,7 @@ impl<'e> Vm<'e> {
                         capture,
                         pos!(),
                     )?;
-                    truncate_stack!(first);
-                    self.push(value);
+                    deliver!(first, value);
                 }
 
                 code::tag::CALL_LOCAL_REF

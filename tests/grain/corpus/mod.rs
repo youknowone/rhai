@@ -164,6 +164,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
     if matches!(
         name,
         "error_divide_by_zero"
+            | "error_guard_operator_fails"
             | "error_temp_root_index_runs_first"
             // The guards are what these cases are, and `unchecked` removes
             // them: the operator overflows or shifts past the width in Rust
@@ -227,6 +228,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "for_over_captured_array"
                 | "for_return_from_body"
                 | "fn_call_captures_parent_scope"
+                | "guard_operator_on_a_shared_operand"
                 | "is_def_fn"
                 | "map_computed_order"
                 | "map_read_of_absent_key_is_not_visible_to_a_closure"
@@ -554,6 +556,28 @@ pub const CASES: &[Case] = &[
     case("switch_stmt_range_arm", "let s = 0; for i in 0..8 { switch i { 3 => s += 2, 0..=2 => s += 1, _ => s += 3 } } s"),
     case("switch_stmt_guarded", "let s = 0; for i in 0..8 { switch i % 4 { 0 if i > 3 => s += 1, 0 => s += 2, _ => s += 3 } } s"),
     case("switch_value_position_kept", "let i = 2; let s = switch i { 0 => \"a\", 2 => \"c\", _ => \"z\" }; s"),
+    // A guard that is an operator: the instruction that computes it is the
+    // branch that reads it, so what it does when the result is not a `bool`,
+    // when the operands are a pair the typed arms decline, and when the
+    // operator itself fails all have to be what the pair of instructions did.
+    case("guard_operator_local_and_local", "let a = 1; let b = 2; if a < b { 1 } else { 2 }"),
+    case("guard_operator_local_and_constant", "let a = 1; if a < 2 { 1 } else { 2 }"),
+    case("guard_operator_computed_left", "let a = 1; let b = 2; if a + 1 < b { 1 } else { 2 }"),
+    case("guard_operator_computed_left_and_constant", "let a = 1; if a + 1 < 2 { 1 } else { 2 }"),
+    case("guard_operator_computed_right", "let a = 1; let b = 2; if a < b + 1 { 1 } else { 2 }"),
+    case("guard_operator_on_strings", r#"let a = "x"; let b = "y"; if a < b { 1 } else { 2 }"#),
+    case("guard_operator_on_a_shared_operand", "let a = 1; let b = 2; let r = 0; { let f = || a; if a < b { r = 1; } } r"),
+    case("guard_operator_two_comparisons", "let a = 1; let b = 2; if a < b && b < 3 { 1 } else { 2 }"),
+    case("error_guard_operator_result_is_not_a_bool", "let i = 1; if i + 1 { 1 } else { 2 }"),
+    case("error_guard_operator_fails", "let i = 1; if i / 0 { 1 } else { 2 }"),
+    case("error_and_operand_operator_result_is_not_a_bool", "let i = 1; if i + 1 && true { 1 } else { 2 }"),
+    case("error_while_guard_operator_result_is_not_a_bool", "let i = 0; while i + 1 { i += 1; } i"),
+    case("error_do_until_guard_operator_result_is_not_a_bool", "let i = 0; do { i += 1; } until i + 1; i"),
+    // The operator a `??` ends with is not the branch's to take: the edge
+    // that skips a non-unit operand is patched to exactly where the branch
+    // goes, and it has to arrive at a test rather than past one.
+    case("coalesce_guard_ends_in_a_comparison", "let a = (); let b = 1; if a ?? (b < 2) { 1 } else { 2 }"),
+    case("coalesce_guard_skips_to_the_branch", "let a = true; let b = 1; if a ?? (b < 2) { 1 } else { 2 }"),
     case("while_loop", "let i = 0; let s = 0; while i < 5 { s += i; i += 1; } s"),
     case("do_while", "let i = 0; do { i += 1; } while i < 3; i"),
     case("do_until", "let i = 0; do { i += 1; } until i >= 3; i"),

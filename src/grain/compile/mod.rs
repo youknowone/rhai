@@ -1594,8 +1594,8 @@ impl Lowering {
                 self.expression(expr);
                 if until {
                     // `do ... until c` loops while `c` is false, which is a
-                    // false-jump straight back to the top.
-                    self.emit_at(Op::JumpIfFalse { target: top }, expr.position());
+                    // false-branch straight back to the top.
+                    self.emit_branch_if_false(top, expr.position());
                 } else {
                     let exit = self.emit_jump_if_false(expr.position());
                     self.emit_at(Op::Jump(top), body.position());
@@ -2201,6 +2201,7 @@ impl Lowering {
                         kind,
                         lhs,
                         rhs,
+                        branch: None,
                     },
                     pos,
                 );
@@ -2216,6 +2217,7 @@ impl Lowering {
                     op,
                     kind,
                     rhs,
+                    branch: None,
                 },
                 pos,
             );
@@ -2403,15 +2405,15 @@ impl Lowering {
         for operand in operands {
             self.expression(operand);
             let pos = operand.position();
-            let site = self.code.len();
-            self.emit_at(
-                if stop_on {
-                    Op::JumpIfTrue { target: u32::MAX }
-                } else {
-                    Op::JumpIfFalse { target: u32::MAX }
-                },
-                pos,
-            );
+            // Only the false half folds: an operator carrying the branch that
+            // reads it has one spelling, and `||` stops on the other answer.
+            let site = if stop_on {
+                let site = self.code.len();
+                self.emit_at(Op::JumpIfTrue { target: u32::MAX }, pos);
+                site
+            } else {
+                self.emit_jump_if_false(pos)
+            };
             decided.push(site);
         }
 
@@ -2709,9 +2711,59 @@ impl Lowering {
     }
 
     fn emit_jump_if_false(&mut self, pos: Position) -> usize {
+        self.emit_branch_if_false(u32::MAX, pos)
+    }
+
+    /// Emit the false-branch that reads a condition, returning its site.
+    ///
+    /// Folded into the operator that computed the condition whenever there is
+    /// one — see [`Self::fold_branch`] — so the site returned may be an
+    /// instruction that was already there.
+    fn emit_branch_if_false(&mut self, target: u32, pos: Position) -> usize {
+        if let Some(site) = self.fold_branch(target, pos) {
+            return site;
+        }
         let site = self.code.len();
-        self.emit_at(Op::JumpIfFalse { target: u32::MAX }, pos);
+        self.emit_at(Op::JumpIfFalse { target }, pos);
         site
+    }
+
+    /// Give the operator that computed a condition the branch that reads it.
+    ///
+    /// `while i < n`, `if i % 3 == 0` and every guard written that way push a
+    /// `bool` that the very next instruction takes straight off again — the
+    /// same trade [`BinOperand`] is for elsewhere, made on an operator's
+    /// result rather than on its operands. The operator instruction carries
+    /// the dispatching form it falls back to, so a pair the typed arms decline
+    /// still answers what the two instructions answered.
+    ///
+    /// Refused unless the operator is the last instruction emitted and its
+    /// position is the branch's own, so that the one position-table entry
+    /// left serves both errors: a guard that is not a `bool` is blamed on the
+    /// guard expression, and that expression is the operator.
+    ///
+    /// Refused, too, when anything has already been patched to where the
+    /// branch would go. That edge exists — an `&&` operand's short circuit
+    /// leaves one behind — and it has to arrive at a test rather than past
+    /// one.
+    fn fold_branch(&mut self, target: u32, pos: Position) -> Option<usize> {
+        let last = self.code.len().checked_sub(1)?;
+        if self.patched_max as usize > last || self.positions[last] != pos {
+            return None;
+        }
+        match &mut self.code[last] {
+            Op::BinOp {
+                branch: branch @ None,
+                ..
+            }
+            | Op::BinOpFrom {
+                branch: branch @ None,
+                ..
+            } => *branch = Some(target),
+            _ => return None,
+        }
+        self.note_target(target);
+        Some(last)
     }
 
     /// Point a previously emitted jump at the next instruction.
@@ -2916,7 +2968,17 @@ fn jump_target_mut(op: &mut Op) -> Option<&mut u32> {
         | Op::SkipIfNotUnit { target, .. }
         | Op::IterNext { exit: target, .. }
         | Op::IterNextStore { exit: target, .. }
-        | Op::PushHandler { target, .. } => Some(target),
+        | Op::PushHandler { target, .. }
+        // An operator that is also the branch reading it is patched and
+        // threaded as the branch it swallowed would have been.
+        | Op::BinOp {
+            branch: Some(target),
+            ..
+        }
+        | Op::BinOpFrom {
+            branch: Some(target),
+            ..
+        } => Some(target),
         _ => None,
     }
 }
@@ -3161,10 +3223,10 @@ mod tests {
         // body to fewer instructions is the point, and only raising one of
         // these numbers should have to be argued for.
         const SOURCES: &[(&str, usize, &str)] = &[
-            ("tight integer loop", 5, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
-            ("float arithmetic", 8, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
+            ("tight integer loop", 4, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
+            ("float arithmetic", 7, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
             ("script fn calls", 5, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
-            ("recursive fibonacci", 14, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
+            ("recursive fibonacci", 13, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
             (
                 "switch, 4 arms",
                 11,
@@ -3183,7 +3245,7 @@ mod tests {
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
                  } s",
             ),
-            ("branch heavy", 13, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
+            ("branch heavy", 11, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
             ("native function calls", 7, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
             (
                 "native callbacks",
@@ -3299,6 +3361,66 @@ mod tests {
                 "{name} lowers its body to {total} instructions, up from {ceiling}"
             );
         }
+    }
+
+    /// The guard's operator carries the branch that reads it, and the one
+    /// edge that must not be folded is not.
+    #[test]
+    fn a_guards_operator_carries_its_branch() {
+        let engine = crate::Engine::new();
+        let lowered = |source: &str| -> Vec<Op> {
+            let ast = engine.compile(source).expect("must compile");
+            let program = Compiler::new().compile(&ast);
+            crate::grain::bytecode::code::disassemble(program.code())
+                .map(|(.., op)| op)
+                .collect()
+        };
+
+        let branched = |ops: &[Op]| {
+            ops.iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        Op::BinOp {
+                            branch: Some(..),
+                            ..
+                        } | Op::BinOpFrom {
+                            branch: Some(..),
+                            ..
+                        }
+                    )
+                })
+                .count()
+        };
+        let tests = |ops: &[Op]| {
+            ops.iter()
+                .filter(|op| matches!(op, Op::JumpIfFalse { .. }))
+                .count()
+        };
+
+        for source in [
+            "let a = 1; let b = 2; if a < b { 1 } else { 2 }",
+            "let a = 1; if a < 2 { 1 } else { 2 }",
+            "let a = 1; let b = 2; if a + 1 < b { 1 } else { 2 }",
+            "let a = 1; let b = 2; if a < b + 1 { 1 } else { 2 }",
+            "let i = 0; while i < 3 { i += 1; } i",
+            "let i = 0; do { i += 1; } until i >= 3; i",
+        ] {
+            let ops = lowered(source);
+            assert_eq!(branched(&ops), 1, "`{source}` must fold its one branch");
+            assert_eq!(
+                tests(&ops),
+                0,
+                "`{source}` must be left with no separate test"
+            );
+        }
+
+        // The edge that skips a non-unit `??` operand is patched to exactly
+        // where the branch goes, so the operator it ends with keeps its result
+        // and the branch stays an instruction of its own.
+        let ops = lowered("let a = (); let b = 1; if a ?? (b < 2) { 1 } else { 2 }");
+        assert_eq!(branched(&ops), 0, "a `??` operand's operator must not fold");
+        assert_eq!(tests(&ops), 1, "the branch it feeds must survive");
     }
 
     #[test]
