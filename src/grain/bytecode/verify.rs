@@ -197,6 +197,22 @@ pub fn verify(
         });
     }
 
+    // A parameter's name is a pool index like any other, but it is reached
+    // through the function table rather than through an instruction, so the
+    // operand walk above never sees it. Unchecked, a binding would have no name
+    // to take.
+    for function in functions {
+        for &param in &function.params {
+            if param as usize >= pools.names {
+                return Err(VerifyError::BadIndex {
+                    at: function.chunk.entry() as usize,
+                    what: "name",
+                    index: param,
+                });
+            }
+        }
+    }
+
     chunks
         .iter()
         .map(|chunk| verify_chunk(caps, code, chunk, &starts, pools))

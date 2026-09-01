@@ -36,6 +36,14 @@ pub struct Function {
     /// Parameter names, in order, as name-pool indices. They become the
     /// callee's first locals, which is what makes them slot 0 upwards.
     pub params: Vec<u32>,
+    /// The same names, as the scope stores them.
+    ///
+    /// Derived from `params` by [`Program::new`] rather than encoded. A scope
+    /// entry is keyed by an `ImmutableString`, and the name pool hands out
+    /// `&str`, so binding a parameter from the pool allocates one per call;
+    /// interned once, binding it is the refcount bump Rhai's own call does
+    /// (`func/script.rs:75`).
+    pub param_names: Vec<ImmutableString>,
     /// The receiver type this function was declared for, as a name-pool index.
     ///
     /// `fn <Type>.name()`. Rhai folds it into the function's hash rather than
@@ -315,6 +323,11 @@ impl<'a> Program<'a> {
         let mut functions = functions;
         for function in &mut functions {
             function.takes_this = takes_this(&code, function.chunk, &parts.chains);
+            function.param_names = function
+                .params
+                .iter()
+                .map(|&param| parts.names.get(param).unwrap_or_default().into())
+                .collect();
         }
 
         // Derived from the diagnostics it was built with, unless a loader
@@ -807,6 +820,7 @@ mod tests {
                 params: vec![0; argc],
                 this_type,
                 takes_this: false,
+                param_names: Vec::new(),
                 chunk: whole,
             })
             .collect();

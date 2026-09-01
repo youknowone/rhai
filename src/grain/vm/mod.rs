@@ -1488,7 +1488,7 @@ impl<'e> Vm<'e> {
                 this,
             );
         };
-        let (params, chunk) = (&*function.params, function.chunk);
+        let (params, chunk) = (&*function.param_names, function.chunk);
 
         // `call_compiled` takes its arguments off the operand stack, where a
         // compiled call site would already have put them.
@@ -2346,7 +2346,7 @@ impl<'e> Vm<'e> {
                     let typed = self.engine.map_type_name(type_name);
                     program
                         .method(name_index, argc, typed)
-                        .map(|f| (&*f.params, f.chunk))
+                        .map(|f| (&*f.param_names, f.chunk))
                 };
 
                 let mut args: FnArgsVec<Dynamic> =
@@ -3141,7 +3141,7 @@ impl<'e> Vm<'e> {
         // receiver alongside them.
         let function = program
             .function_named(pointer.fn_name(), curried + taken)
-            .map(|f| (&*f.params, f.chunk));
+            .map(|f| (&*f.param_names, f.chunk));
 
         // Bound once, whichever path takes it. Curried values are spliced in
         // above `at`, so the receiver's index is unaffected either way.
@@ -3558,7 +3558,7 @@ impl<'e> Vm<'e> {
             return self.call_compiled(
                 program,
                 name,
-                &function.params,
+                &function.param_names,
                 function.chunk,
                 first,
                 scope,
@@ -3872,7 +3872,7 @@ impl<'e> Vm<'e> {
         &mut self,
         program: &Program,
         name: &str,
-        params: &[u32],
+        params: &[ImmutableString],
         chunk: Chunk,
         first: usize,
         scope: &mut Scope,
@@ -3901,7 +3901,7 @@ impl<'e> Vm<'e> {
         &mut self,
         program: &Program,
         name: &str,
-        params: &[u32],
+        params: &[ImmutableString],
         chunk: Chunk,
         first: usize,
         scope: &mut Scope,
@@ -3937,7 +3937,7 @@ impl<'e> Vm<'e> {
         &mut self,
         program: &Program,
         name: &str,
-        params: &[u32],
+        params: &[ImmutableString],
         chunk: Chunk,
         first: usize,
         scope: &mut Scope,
@@ -3967,7 +3967,6 @@ impl<'e> Vm<'e> {
             .map_or(0, |dbg| dbg.call_stack().len());
 
         for (param, slot) in params.iter().zip(first..) {
-            let name = or_raise!(program.name(*param), malformed(format!("no name {param}")));
             // Taken, not cloned — Rhai consumes the caller's argument slots
             // (`func/script.rs:75`), and the caller truncates them away after.
             let value = or_raise!(
@@ -3975,7 +3974,7 @@ impl<'e> Vm<'e> {
                 malformed("call with too few arguments".to_string())
             )
             .take();
-            scope.push_dynamic(name, value);
+            scope.push_entry(param.clone(), value.access_mode(), value);
         }
         let scope_end_len = scope.len();
 
@@ -4956,9 +4955,12 @@ impl<'e> Vm<'e> {
 
                 code::tag::DECLARE_LOCAL | code::tag::DECLARE_CONST => {
                     let index = u32::from(small!(1));
-                    // A `Scope` entry name is an `Identifier`, which is a
-                    // `SmartString` — short names live inline, so handing it a
-                    // borrowed `&str` costs a copy rather than an allocation.
+                    // A `Scope` entry is keyed by an `ImmutableString`, which
+                    // is a refcounted `SmartString`, so building one from the
+                    // pool's `&str` copies the bytes and boxes them. A
+                    // declaration runs once per `let` rather than per call,
+                    // which is why the name is taken from the pool here and
+                    // interned ahead of time for parameters only.
                     let name =
                         or_raise!(program.name(index), malformed(format!("no name {index}")));
                     // Flattened, as Rhai flattens a declaration's initializer
@@ -6290,6 +6292,7 @@ mod tests {
             .map(|(index, span)| Function {
                 name: index as u32,
                 params: Vec::new(),
+                param_names: Vec::new(),
                 this_type: None,
                 takes_this: false,
                 chunk: Chunk::new(end_of(span.start), end_of(span.end), 8),

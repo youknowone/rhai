@@ -167,6 +167,7 @@ impl Compiler {
                 // Derived from the chunk by `Program::new`, which is the one
                 // place that can see the assembled bytes.
                 takes_this: false,
+                param_names: Vec::new(),
                 chunk: Chunk::new(
                     offsets[f.first_op],
                     offsets[f.first_op + f.op_count],
