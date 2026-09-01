@@ -700,8 +700,9 @@ impl Lowering {
         let unwind_depth = self.slots.depth();
 
         // Sorted because Rhai's map iterates in whatever order its hasher put
-        // the entries in, and an artifact should not depend on that — and
-        // because `Switch::dispatch` bisects the table it ends up in.
+        // the entries in, and an artifact should not depend on that. The
+        // lookup does not: `Switch::dispatch` keys on the hash of a case, not
+        // on where in the table it sits.
         let mut groups: Vec<(u64, Vec<usize>)> = sw
             .cases
             .iter()
@@ -912,29 +913,29 @@ impl Lowering {
             }
         };
 
-        self.switches[cases_table as usize] = Switch {
-            cases: groups
+        self.switches[cases_table as usize] = Switch::new(
+            groups
                 .iter()
                 .map(|(hash, blocks)| SwitchCase {
                     hash: *hash,
                     target: case_target(blocks),
                 })
                 .collect(),
-            ranges: Vec::new(),
-            default: case_fallback,
-        };
+            Vec::new(),
+            case_fallback,
+        );
         if let Some((.., ranges_table)) = ranges_dispatch {
-            self.switches[ranges_table as usize] = Switch {
-                cases: Vec::new(),
-                ranges: ranges
+            self.switches[ranges_table as usize] = Switch::new(
+                Vec::new(),
+                ranges
                     .iter()
                     .map(|(range, blocks)| SwitchRange {
                         target: range_target(blocks),
                         ..*range
                     })
                     .collect(),
-                default: default_at,
-            };
+                default_at,
+            );
         }
 
         true
@@ -994,11 +995,7 @@ impl Lowering {
 
     /// Reserve a table, to be filled in once its arms have addresses.
     fn push_switch(&mut self) -> u32 {
-        self.switches.push(Switch {
-            cases: Vec::new(),
-            ranges: Vec::new(),
-            default: 0,
-        });
+        self.switches.push(Switch::new(Vec::new(), Vec::new(), 0));
         (self.switches.len() - 1) as u32
     }
 

@@ -1154,7 +1154,9 @@ pub fn resolve_switch_targets(
     offsets: &[u32],
 ) -> Result<(), AssembleError> {
     for (table, switch) in switches.iter_mut().enumerate() {
-        let resolve = |target: &mut u32| -> Result<(), AssembleError> {
+        // Through `retarget` rather than over the fields: a case's target is
+        // also in the table's index, and one pass writes both.
+        switch.retarget(|target: &mut u32| -> Result<(), AssembleError> {
             *target =
                 *offsets
                     .get(*target as usize)
@@ -1163,15 +1165,7 @@ pub fn resolve_switch_targets(
                         target: *target,
                     })?;
             Ok(())
-        };
-
-        for case in &mut switch.cases {
-            resolve(&mut case.target)?;
-        }
-        for range in &mut switch.ranges {
-            resolve(&mut range.target)?;
-        }
-        resolve(&mut switch.default)?;
+        })?;
     }
     Ok(())
 }

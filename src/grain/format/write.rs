@@ -303,8 +303,8 @@ fn put_switches(out: &mut Vec<u8>, switches: &[crate::grain::bytecode::Switch]) 
     out.extend_from_slice(&crate::grain::bytecode::probe().to_le_bytes());
 
     for switch in switches {
-        put_uvarint(out, switch.cases.len() as u64);
-        for case in &switch.cases {
+        put_uvarint(out, switch.cases().len() as u64);
+        for case in switch.cases() {
             // Fixed width: a hash is eight bytes of noise, which a varint
             // would spend ten on.
             out.extend_from_slice(&case.hash.to_le_bytes());

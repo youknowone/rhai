@@ -398,11 +398,14 @@ fn get_switches(cursor: &mut Cursor) -> Result<Vec<Switch>, ReadError> {
             });
         }
 
-        // `Switch::dispatch` bisects the cases, so they have to be ascending
-        // by hash. A writer of ours already sorted them; a corrupt or foreign
-        // artifact may not have, and an unsorted table would send subjects to
-        // arms they do not name. Sorted stably, so a table holding one hash
-        // twice keeps the entry a scan would have found first.
+        // Normalized to the order a writer of ours emits, so a program read
+        // back compares equal to the one written; a corrupt or foreign
+        // artifact may arrive in any order. Not for the lookup's sake —
+        // `Switch::dispatch` keys on the hash of a case rather than on where
+        // it sits — but nothing else here rebuilds the compiler's table.
+        // Sorted stably, so a table holding one hash twice keeps the entry
+        // that came first in the file, which is the entry the lookup answers
+        // with.
         cases.sort_by_key(|case| case.hash);
 
         let mut ranges = Vec::new();
@@ -415,11 +418,12 @@ fn get_switches(cursor: &mut Cursor) -> Result<Vec<Switch>, ReadError> {
             });
         }
 
-        switches.push(Switch {
-            cases,
-            ranges,
-            default: cursor.index()?,
-        });
+        // `Switch::new` derives the case index here, and the format carries
+        // none: the hashes it keys on are in the artifact already, so writing
+        // one out would put a second copy of them on the wire for a reader to
+        // disagree with. See `bytecode::switch`.
+        let default = cursor.index()?;
+        switches.push(Switch::new(cases, ranges, default));
     }
     Ok(switches)
 }

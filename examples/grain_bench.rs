@@ -106,9 +106,9 @@ const CASES: &[Case] = &[
         callbacks: false,
         floor: 1.50,
     },
-    // The VM bisects its ascending case hashes; Rhai probes a hash map. Two
-    // sizes, because which of those wins is a question about how many arms
-    // there are.
+    // Both sides index a hash: the VM masks it into a table of its own case
+    // hashes, Rhai looks it up in a map. Two sizes, because the arms a switch
+    // has are what the rest of the statement's cost is measured against.
     Case {
         name: "switch, 4 arms",
         source: "let s = 0; for i in 0..20000 { \
