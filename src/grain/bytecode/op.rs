@@ -1009,6 +1009,19 @@ pub enum Op {
         /// Where the index comes from, when the instruction names it rather
         /// than reading it off the stack.
         index: Option<BinOperand>,
+        /// The constant the write assigns, where it names it rather than
+        /// taking it off the stack.
+        ///
+        /// A constant and not a slot, because a value that is not a literal is
+        /// stashed into a local before the operands are evaluated and read back
+        /// afterwards -- that is what keeps Rhai's evaluation order -- and the
+        /// stash is what the fold would have to see through. A literal is the
+        /// one thing left in place, so it is the only thing there is to name.
+        ///
+        /// Only ever set where `index` is: the value is written after the
+        /// index, and there is no layout that holds the second without the
+        /// first.
+        value: Option<u32>,
     },
 
     /// Read `local[index]`, with the chain it specialises beside it.

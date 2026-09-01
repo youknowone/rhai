@@ -604,12 +604,20 @@ impl Lowering {
         // the instruction can name it instead of taking it off the stack.
         let named_index =
             specialised.and_then(|_| self.fold_index_operand(rewind_mark, operands_end));
+        // The value only where the index is named too: the encoding writes the
+        // value after the index and has no room for the second alone. Taking
+        // the index moved the value's push down by the instruction that went,
+        // so this is where it starts now.
+        let named_value = named_index
+            .filter(|_| assigns)
+            .and_then(|_| self.fold_value_operand(operands_end - 1));
         let index = self.push_chain(chain);
         let op = match (specialised, assigns) {
             (Some(slot), true) => Op::IndexSet {
                 chain: index,
                 slot,
                 index: named_index,
+                value: named_value,
             },
             (Some(slot), false) => Op::IndexGet {
                 chain: index,
@@ -2794,6 +2802,37 @@ impl Lowering {
         Some(src)
     }
 
+    /// Take back the push of the value a specialised write assigns, naming
+    /// what it reads.
+    ///
+    /// The value is the last thing such a chain lowers, so unlike
+    /// [`Self::fold_index_operand`] this reads back from the end. `end` is
+    /// where the value's own code starts, and it has to be the whole of it: a
+    /// value that took more than one instruction leaves the rest on the stack
+    /// with nothing to take them off.
+    ///
+    /// A literal is the only thing there is to take: anything else is stashed
+    /// into a local before the operands run, which is what keeps Rhai's
+    /// evaluation order, and the stash is not a lone push. See
+    /// [`is_one_pushed_value`], which is the same set.
+    fn fold_value_operand(&mut self, end: usize) -> Option<u32> {
+        let last = self.code.len().checked_sub(1)?;
+        if last != end || self.patched_max as usize > last {
+            return None;
+        }
+        let src = match self.code[last] {
+            Op::Const(index) => index,
+            // Pushed by an instruction of their own rather than out of the
+            // pool, so naming them means putting them in it.
+            Op::Bool(value) => self.push_const(value.into()),
+            Op::Unit => self.push_const(Dynamic::UNIT),
+            _ => return None,
+        };
+        self.code.remove(last);
+        self.positions.remove(last);
+        Some(src)
+    }
+
     /// Take back the two pushes emitted since `mark` when they are a local
     /// read and a local read or a constant, naming what they read.
     ///
@@ -3373,7 +3412,7 @@ mod tests {
             ),
             (
                 "primes",
-                4,
+                3,
                 r#"
             const SIZE = 1_000_000;
 

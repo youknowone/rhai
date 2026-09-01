@@ -4822,7 +4822,9 @@ impl<'e> Vm<'e> {
                 ($offset:expr, $under:expr) => {{
                     let mut found = None;
                     match tag {
-                        code::tag::INDEX_GET_FROM_LOCAL | code::tag::INDEX_SET_FROM_LOCAL => {
+                        code::tag::INDEX_GET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST => {
                             let at = base + small!($offset) as usize;
                             if at < scope_len!() {
                                 if let Union::Int(i, ..) = scope_entry!(at).0 {
@@ -4830,7 +4832,9 @@ impl<'e> Vm<'e> {
                                 }
                             }
                         }
-                        code::tag::INDEX_GET_FROM_CONST | code::tag::INDEX_SET_FROM_CONST => {
+                        code::tag::INDEX_GET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
                             let index = u32::from(small!($offset));
                             #[cfg(feature = "grain-jit")]
                             let constant = jit::program_constant(program, index);
@@ -4852,31 +4856,51 @@ impl<'e> Vm<'e> {
                 }};
             }
 
-            // The same index as a value, for the walk that answers a declined
+            // A named operand as a value, for the walk that answers a declined
             // instruction: it reads its operands off the stack, and a named
-            // index has never been there.
+            // operand has never been there. The tag is what says whether the
+            // number names a slot or a constant, and which tags mean which
+            // depends on the operand, so the caller decides that much.
+            macro_rules! operand_value {
+                ($offset:expr, $is_local:expr) => {{
+                    if $is_local {
+                        let slot = small!($offset);
+                        let at = base + slot as usize;
+                        if at >= scope_len!() {
+                            return Err(malformed(format!("local slot {slot} is out of scope")));
+                        }
+                        scope_entry!(at).flatten_clone()
+                    } else {
+                        let index = u32::from(small!($offset));
+                        #[cfg(feature = "grain-jit")]
+                        let constant = jit::program_constant(program, index);
+                        #[cfg(not(feature = "grain-jit"))]
+                        let constant = program.constant(index);
+                        or_raise!(constant, malformed(format!("no constant {index}"))).clone()
+                    }
+                }};
+            }
+
+            // The index a naming tag carries.
             macro_rules! indexed_value {
                 ($offset:expr) => {{
-                    match tag {
-                        code::tag::INDEX_GET_FROM_LOCAL | code::tag::INDEX_SET_FROM_LOCAL => {
-                            let slot = small!($offset);
-                            let at = base + slot as usize;
-                            if at >= scope_len!() {
-                                return Err(malformed(format!(
-                                    "local slot {slot} is out of scope"
-                                )));
-                            }
-                            scope_entry!(at).flatten_clone()
-                        }
-                        _ => {
-                            let index = u32::from(small!($offset));
-                            #[cfg(feature = "grain-jit")]
-                            let constant = jit::program_constant(program, index);
-                            #[cfg(not(feature = "grain-jit"))]
-                            let constant = program.constant(index);
-                            or_raise!(constant, malformed(format!("no constant {index}"))).clone()
-                        }
-                    }
+                    operand_value!(
+                        $offset,
+                        matches!(
+                            tag,
+                            code::tag::INDEX_GET_FROM_LOCAL
+                                | code::tag::INDEX_SET_FROM_LOCAL
+                                | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                        )
+                    )
+                }};
+            }
+
+            // The constant an assigning naming tag carries, which is its
+            // last operand and so sits two bytes from the end.
+            macro_rules! assigned_value {
+                () => {{
+                    operand_value!(width - 2, false)
                 }};
             }
 
@@ -5920,7 +5944,9 @@ impl<'e> Vm<'e> {
 
                 code::tag::INDEX_SET
                 | code::tag::INDEX_SET_FROM_LOCAL
-                | code::tag::INDEX_SET_FROM_CONST => {
+                | code::tag::INDEX_SET_FROM_CONST
+                | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
                     // The compiler has already decided the shape, so what is
                     // left to test is the types — which it could not know. A
                     // slot holding a writable, unshared `Array` and an index
@@ -5937,11 +5963,19 @@ impl<'e> Vm<'e> {
                     // nothing left here to be fast about, and the compiler
                     // emits no `IndexSet` on that build either.
                     let named = tag != code::tag::INDEX_SET;
+                    // A named value was never pushed, so the index it would
+                    // have sat on top of is the top of the stack instead.
+                    let valued = matches!(
+                        tag,
+                        code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                            | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                    );
                     #[cfg_attr(feature = "no_index", allow(unused_mut))]
                     let mut assigned = false;
                     #[cfg(not(feature = "no_index"))]
                     'fast: {
-                        let Some(i) = indexed_int!(5, self.depth.checked_sub(2)) else {
+                        let under = self.depth.checked_sub(if valued { 1 } else { 2 });
+                        let Some(i) = indexed_int!(5, under) else {
                             break 'fast;
                         };
                         // A negative index counts from the end, which is
@@ -5953,6 +5987,13 @@ impl<'e> Vm<'e> {
                         if at >= scope_len!() {
                             break 'fast;
                         }
+                        // Read before the array is borrowed out of the same
+                        // scope, which a named value may be read from too.
+                        let named_value = if valued {
+                            Some(assigned_value!())
+                        } else {
+                            None
+                        };
                         let Union::Array(array, _, AccessMode::ReadWrite) = &mut scope_entry!(at).0
                         else {
                             break 'fast;
@@ -5960,7 +6001,10 @@ impl<'e> Vm<'e> {
                         let Some(cell) = array.get_mut(i) else {
                             break 'fast;
                         };
-                        *cell = self.pop_or_unit();
+                        *cell = match named_value {
+                            Some(value) => value,
+                            None => self.pop_or_unit(),
+                        };
                         if !named {
                             // The index operand, done with.
                             drop(self.pop_or_unit());
@@ -5974,10 +6018,16 @@ impl<'e> Vm<'e> {
 
                     // Declined, so the walk runs — and it reads its operands
                     // off the stack, where the index belongs under the value.
-                    if named {
-                        let value = self.pop_or_unit();
-                        let index = indexed_value!(5);
-                        self.push(index);
+                    if named || valued {
+                        let value = if valued {
+                            assigned_value!()
+                        } else {
+                            self.pop_or_unit()
+                        };
+                        if named {
+                            let index = indexed_value!(5);
+                            self.push(index);
+                        }
                         self.push(value);
                     }
 

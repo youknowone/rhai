@@ -137,6 +137,12 @@ fn the_round_trip_covers_something_worth_covering() {
         "index_assign_local_index",
         #[cfg(not(feature = "no_index"))]
         "index_assign_computed_index",
+        // The two ways an assigning instruction names its value, which is one
+        // tag each: the index beside it is named on its own terms.
+        #[cfg(not(feature = "no_index"))]
+        "index_assign_named_local_const",
+        #[cfg(not(feature = "no_index"))]
+        "index_assign_named_const_const",
         #[cfg(not(feature = "no_index"))]
         "index_read_local_array",
         #[cfg(not(feature = "no_index"))]

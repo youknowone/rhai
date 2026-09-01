@@ -590,16 +590,13 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
                 // with a chain that declares no operand at all, and reading
                 // that as an underflow would be a panic where every other
                 // malformation is a rejection.
-                let named = usize::from(matches!(
-                    op,
-                    Op::IndexSet {
-                        index: Some(..),
-                        ..
-                    } | Op::IndexGet {
-                        index: Some(..),
-                        ..
+                let named = match op {
+                    Op::IndexSet { index, value, .. } => {
+                        usize::from(index.is_some()) + usize::from(value.is_some())
                     }
-                ));
+                    Op::IndexGet { index, .. } => usize::from(index.is_some()),
+                    _ => 0,
+                };
                 let consumes = chain.consumes().saturating_sub(named);
                 // A discarding tag over an assigning tail names a value that
                 // was never pushed, which is a corrupt artifact rather than a
@@ -888,13 +885,24 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         | tag::INDEX_SET_FROM_CONST
         | tag::INDEX_GET
         | tag::INDEX_GET_FROM_LOCAL
-        | tag::INDEX_GET_FROM_CONST => {
+        | tag::INDEX_GET_FROM_CONST
+        | tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+        | tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
             bounded(index(1), "chain", pools.chains.len())?;
             if matches!(
                 code[at],
-                tag::INDEX_SET_FROM_CONST | tag::INDEX_GET_FROM_CONST
+                tag::INDEX_SET_FROM_CONST
+                    | tag::INDEX_GET_FROM_CONST
+                    | tag::INDEX_SET_FROM_CONST_VALUE_CONST
             ) {
                 bounded(index(5), "constant", pools.consts)?;
+            }
+            // The value is the last operand, so it is two bytes from the end.
+            if matches!(
+                code[at],
+                tag::INDEX_SET_FROM_LOCAL_VALUE_CONST | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+            ) {
+                bounded(index(7), "constant", pools.consts)?;
             }
             check_chain_indices(at, &pools.chains[index(1) as usize], pools)
         }

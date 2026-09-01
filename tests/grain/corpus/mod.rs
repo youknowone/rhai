@@ -246,6 +246,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "type_of_a_pointer"
                 | "if_stmt_arm_returns"
                 | "index_assign_is_a_function_bodys_value"
+                | "index_assign_named_value_shared_root"
                 | "index_assign_through_a_shared_index"
                 | "index_read_of_a_shared_element"
                 | "index_read_through_a_shared_index"
@@ -292,6 +293,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_host_index_bounds"
             | "error_index_assign_constant_is_not_an_integer"
             | "error_index_assign_float_index"
+            | "error_index_assign_named_value_out_of_bounds"
             | "error_index_assign_out_of_bounds"
             | "error_index_into_an_unindexable_step"
             | "error_index_into_an_unindexable_step_deep"
@@ -325,7 +327,15 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "index_assign_is_the_scripts_value"
             | "index_assign_local_index"
             | "index_assign_map_root"
+            | "index_assign_named_bool"
+            | "index_assign_named_const_const"
+            | "index_assign_named_local_const"
+            | "index_assign_named_value_map_root"
+            | "index_assign_named_value_negative"
+            | "index_assign_named_value_shared_root"
             | "index_assign_negative"
+            | "index_assign_stashed_local_value"
+            | "index_assign_stashed_value_const_index"
             | "index_assign_nested"
             | "index_assign_through_a_shared_index"
             | "index_expression_reads_the_root"
@@ -430,6 +440,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "host_string_index_property_op_assign_fallback"
                 | "host_temp_string_index_property_set_fallback"
                 | "index_assign_map_root"
+                | "index_assign_named_value_map_root"
                 | "index_assign_nested"
                 | "index_expression_reads_the_root"
                 | "interpolation_of_containers"
@@ -850,6 +861,29 @@ pub const CASES: &[Case] = &[
     // like every other assignment, and the instruction that says so is emitted
     // only here — a statement-position one leaves nothing at all — so the
     // three places a value is read from are each worth a case.
+    // The value an assigning instruction names rather than takes off the
+    // stack. Four spellings, because the index is named on its own terms and
+    // the value on its own: the tag carries the pair.
+    case("index_assign_named_local_const", "let a = [1, 2, 3]; let i = 1; a[i] = 9; a"),
+    case("index_assign_named_const_const", "let a = [1, 2, 3]; a[1] = 9; a"),
+    // A value that is not a literal is stashed into a local before the
+    // operands run, and the stash is what leaves nothing for the fold to take
+    // -- so these keep the general instruction, and prove the fold does not
+    // reach through a stash and take the load it ends with.
+    case("index_assign_stashed_local_value", "let a = [1, 2, 3]; let i = 1; let v = 9; a[i] = v; a"),
+    case("index_assign_stashed_value_const_index", "let a = [1, 2, 3]; let v = 9; a[1] = v; a"),
+    // A boolean is pushed by an instruction of its own rather than out of the
+    // constant pool, and folding it names a constant that nothing else in the
+    // program mentions.
+    case("index_assign_named_bool", "let a = [true, true]; a[1] = false; a"),
+    // The same four, declined: the walk reads its operands off the stack, and
+    // a named value was never pushed there. An index off the end is the
+    // cheapest way to reach that path, and a map root reaches it without
+    // raising at all.
+    case("error_index_assign_named_value_out_of_bounds", "let a = [1, 2]; let v = 9; a[7] = v; a"),
+    case("index_assign_named_value_map_root", r#"let m = #{}; let v = 9; m["k"] = v; m"#),
+    case("index_assign_named_value_negative", "let a = [1, 2, 3]; a[-1] = 9; a"),
+    case("index_assign_named_value_shared_root", "let a = [1, 2]; let v = 9; { let f = || a; a[0] = v; } a"),
     case("index_assign_is_the_scripts_value", "let a = [1, 2, 3]; a[1] = 99"),
     case("property_assign_is_the_scripts_value", "let m = #{ a: 1 }; m.a = 7"),
     case("index_assign_is_a_function_bodys_value", "fn place(a) { a[0] = 9 } let a = [1, 2, 3]; [place(a), a]"),
