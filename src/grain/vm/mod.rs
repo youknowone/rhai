@@ -214,6 +214,34 @@ fn dispatch_failure(err: Box<EvalAltResult>, pos: Position) -> Box<EvalAltResult
     positioned(err, pos)
 }
 
+/// A/B gate — a measurement scaffold, deleted with the measurement it serves.
+///
+/// A candidate whose two spellings produce the same bytecode cannot be graded
+/// by building two programs, and grading it by building two binaries compares
+/// two code layouts rather than two spellings (`examples/grain_nsiter.rs`).
+/// So both spellings are compiled into this binary and one relaxed load picks
+/// between them. Both legs pay that load, so what is compared is the two
+/// spellings and not one leg's branch against the other's absence of one.
+#[doc(hidden)]
+pub mod ab_gate {
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    static ON: AtomicBool = AtomicBool::new(false);
+
+    /// Pick the leg the gated sites take from here on.
+    #[inline]
+    pub fn set(on: bool) {
+        ON.store(on, Ordering::Relaxed);
+    }
+
+    /// Which leg a gated site should take.
+    #[must_use]
+    #[inline(always)]
+    pub fn on() -> bool {
+        ON.load(Ordering::Relaxed)
+    }
+}
+
 /// How many operator sites the memo below holds at once.
 ///
 /// Direct-mapped and small on purpose. A memo is worth having because a site

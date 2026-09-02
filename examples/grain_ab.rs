@@ -1,17 +1,19 @@
-//! One binary, two lowerings, alternating legs.
+//! One binary, two spellings, alternating legs.
 //!
-//! Grading a lowering change by building two binaries compares two code
-//! layouts as well as two bytecodes, and on a loaded machine the layout term
-//! is the same size as the effect. This binary emits both shapes from one
-//! build, so the only thing that differs between the legs is the bytecode.
+//! Grading a change by building two binaries compares two code layouts as well
+//! as two spellings, and on a loaded machine the layout term is the same size
+//! as the effect (`examples/grain_nsiter.rs` records two builds of a
+//! byte-identical tree reading 38.4 and 61.1 ns/iter). This binary compiles
+//! both spellings and picks between them with `grain::ab_gate`, so the only
+//! thing that differs between the legs is which spelling runs.
 //!
-//! Cases whose bytecode is identical under both settings are the control set:
-//! they run the same bytes through the same machine code and must read 1.000.
-//! If they do not, the round is noise and the rest of it says nothing.
+//! A case that never reaches a gated site is a control: both legs run the same
+//! machine code down the same path and must read 1.000. If a control does not,
+//! the round is noise and the rest of it says nothing.
 
 use std::time::{Duration, Instant};
 
-use rhai::grain::{Compiler, Program, Vm};
+use rhai::grain::{ab_gate, Compiler, Program, Vm};
 use rhai::{Dynamic, Engine, Scope, Shared};
 
 /// One side of the comparison: a program and the entry point its capabilities
@@ -30,13 +32,6 @@ impl Leg {
             Self::Shared(program.into_shared())
         } else {
             Self::Owned(Box::new(program))
-        }
-    }
-
-    fn code(&self) -> &[u8] {
-        match self {
-            Self::Owned(program) => program.code(),
-            Self::Shared(program) => program.code(),
         }
     }
 
@@ -60,18 +55,22 @@ struct Case {
     /// Whether the run needs the callback wrappers installed, which costs an
     /// owned program and a module built per run.
     callbacks: bool,
+    /// Whether the source reaches a gated site. A case that does not is a
+    /// control and must read 1.000.
+    gated: bool,
 }
 
 const CASES: &[Case] = &[
-    Case { name: "tight integer loop", source: "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s", iterations: 20, callbacks: false },
-    Case { name: "float arithmetic", source: "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x", iterations: 20, callbacks: false },
-    Case { name: "script fn calls", source: "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s", iterations: 20, callbacks: false },
-    Case { name: "recursive fibonacci", source: "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)", iterations: 1, callbacks: false },
+    Case { name: "tight integer loop", source: "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s", iterations: 20, callbacks: false, gated: false },
+    Case { name: "float arithmetic", source: "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x", iterations: 20, callbacks: false, gated: false },
+    Case { name: "script fn calls", source: "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s", iterations: 20, callbacks: false, gated: false },
+    Case { name: "recursive fibonacci", source: "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)", iterations: 1, callbacks: false, gated: false },
     Case {
         name: "switch, 4 arms",
         source: "let s = 0; for i in 0..20000 { switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } } s",
         iterations: 20,
         callbacks: false,
+        gated: false,
     },
     Case {
         name: "switch, 16 arms",
@@ -82,14 +81,16 @@ const CASES: &[Case] = &[
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } } s",
         iterations: 20,
         callbacks: false,
+        gated: false,
     },
     Case {
         name: "branch heavy",
         source: "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s",
         iterations: 20,
         callbacks: false,
+        gated: false,
     },
-    Case { name: "native function calls", source: "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a", iterations: 20, callbacks: false },
+    Case { name: "native function calls", source: "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a", iterations: 20, callbacks: false, gated: false },
     Case {
         name: "primes",
         source: "const SIZE = 1_000_000; let prime_mask = []; prime_mask.pad(SIZE + 1, true); \
@@ -98,6 +99,17 @@ const CASES: &[Case] = &[
                  for i in range(2 * p, SIZE + 1, p) { prime_mask[i] = false; } } total_primes_found",
         iterations: 1,
         callbacks: false,
+        gated: true,
+    },
+    // Index reads and nothing else, so the gated site is priced per element
+    // here rather than diluted by a sieve's inner write loop.
+    Case {
+        name: "indexed reads",
+        source: "let a = []; a.pad(64, 1); let s = 0; \
+                 for i in 0..20000 { s += a[i % 64]; } s",
+        iterations: 20,
+        callbacks: false,
+        gated: true,
     },
     // The one case the VM is expected to lose: every element crosses out of it
     // into a second `Vm` for the closure body, so a call-path change is priced
@@ -108,12 +120,14 @@ const CASES: &[Case] = &[
                  let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
         iterations: 20,
         callbacks: true,
+        gated: false,
     },
     Case {
         name: "while, no operator fold",
         source: "let s = 0; let i = 0; let n = 20000; while `${i}` != `${n}` { s += i; i += 1; } s",
         iterations: 2,
         callbacks: false,
+        gated: false,
     },
 ];
 
@@ -169,19 +183,19 @@ fn main() {
     println!("rounds={rounds} runs_per_round={RUNS}");
     println!("load average at start: {}", load_average());
 
-    // Compiled once, outside the timed region: the legs differ in the
-    // bytecode they run, not in the work of producing it.
+    // Compiled once, outside the timed region: the legs differ in which
+    // spelling runs, not in the work of producing the program. One program
+    // serves both legs, because the two spellings compile to the same bytes.
     let mut cases = Vec::new();
     for case in CASES {
         let ast = engine.compile(case.source).expect("must compile");
-        let a = Leg::of(Compiler::new().rotate_while(false).compile(&ast), case.callbacks);
-        let b = Leg::of(Compiler::new().rotate_while(true).compile(&ast), case.callbacks);
-        let differs = a.code() != b.code();
+        let leg = Leg::of(Compiler::new().compile(&ast), case.callbacks);
 
         let expected = engine
             .eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &ast)
             .expect("walker must succeed");
-        for (which, leg) in [("A", &a), ("B", &b)] {
+        for (which, on) in [("A", false), ("B", true)] {
+            ab_gate::set(on);
             let actual = leg.run(&engine);
             assert_eq!(
                 format!("{expected:?}"),
@@ -191,11 +205,11 @@ fn main() {
             );
         }
         println!(
-            "{:<24} bytecode {}",
+            "{:<24} {}",
             case.name,
-            if differs { "DIFFERS" } else { "identical" }
+            if case.gated { "reaches the gate" } else { "control" }
         );
-        cases.push((case, a, b));
+        cases.push((case, leg));
     }
 
     println!();
@@ -205,13 +219,24 @@ fn main() {
     );
     let mut ratios: Vec<(&str, bool, Vec<f64>)> = cases
         .iter()
-        .map(|(case, a, b)| (case.name, a.code() != b.code(), Vec::new()))
+        .map(|(case, _)| (case.name, case.gated, Vec::new()))
         .collect();
 
     for round in 0..rounds {
-        for (index, (case, leg_a, leg_b)) in cases.iter().enumerate() {
+        for (index, (case, leg)) in cases.iter().enumerate() {
             let samples = RUNS * case.iterations;
-            let (a, b) = paired(samples, || drop(leg_a.run(&engine)), || drop(leg_b.run(&engine)));
+            // The store lands inside the timed region, and both legs pay one.
+            let (a, b) = paired(
+                samples,
+                || {
+                    ab_gate::set(false);
+                    drop(leg.run(&engine));
+                },
+                || {
+                    ab_gate::set(true);
+                    drop(leg.run(&engine));
+                },
+            );
             let ratio = best(&b) / best(&a);
             let spread = (median(&b) / best(&b) - 1.0).max(median(&a) / best(&a) - 1.0);
             println!(

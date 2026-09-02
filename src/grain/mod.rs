@@ -150,7 +150,7 @@ mod vm;
 pub use compile::Compiler;
 pub use format::{Sidecar, Stripped};
 pub use program::Program;
-pub use vm::{Fault, Vm};
+pub use vm::{ab_gate, Fault, Vm};
 pub(crate) use vm::CrossingPool;
 // The lowered tables are build output, so what can be asserted about them is
 // only observable from outside the crate.
