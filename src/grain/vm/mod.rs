@@ -2212,10 +2212,17 @@ impl<'e> Vm<'e> {
         }
         #[cfg(not(feature = "grain-jit"))]
         {
-            // The slot above the top holds whatever the last owner of it left
-            // — unit, once `Vm::truncate_stack` or a take has been past it —
-            // and releasing that is the drop this instruction pays for.
-            overwrite(stack_mut(self, depth), value);
+            // Every slot at or above the depth holds unit — `Vm::stack` says
+            // so, and `Vm::truncate_stack` and `stack_take` are what keep it
+            // true — so what this replaces owns nothing, and the read-back
+            // that would decide whether to drop it decides nothing. Asserted
+            // rather than assumed: a slot that held something would leak it.
+            let slot = stack_mut(self, depth);
+            debug_assert!(
+                slot.is_unit(),
+                "a slot at or above the operand stack's top holds unit"
+            );
+            mem::forget(mem::replace(slot, value));
         }
         self.depth = depth + 1;
     }
@@ -4706,10 +4713,19 @@ impl<'e> Vm<'e> {
     /// Borrowed rather than taken: reading a guard is `Dynamic::as_bool`, which
     /// reads through a reference, so the caller keeps the value and can release
     /// it itself rather than leaving it to the drop a move would have implied.
-    fn guard_holds(&self, value: &Dynamic, pos: Position) -> Result<bool, Box<EvalAltResult>> {
+    ///
+    /// The position arrives as a closure for the reason
+    /// [`Engine::track_operation_at`](crate::Engine) takes one: it is a table
+    /// lookup keyed on the address, and a guard that holds — which is every
+    /// turn of every loop but the last — never reports one.
+    fn guard_holds(
+        &self,
+        value: &Dynamic,
+        pos: impl FnOnce() -> Position,
+    ) -> Result<bool, Box<EvalAltResult>> {
         value
             .as_bool()
-            .map_err(|actual| self.mismatch::<bool>(actual, pos))
+            .map_err(|actual| self.mismatch::<bool>(actual, pos()))
     }
 
     /// What reading a key a map does not have produces.
@@ -5814,7 +5830,7 @@ impl<'e> Vm<'e> {
                                 // to fall out of scope: a swallowed branch is
                                 // the one exit that keeps nothing, and it runs
                                 // once per turn of every loop with a condition.
-                                let holds = self.guard_holds(&value, pos!())?;
+                                let holds = self.guard_holds(&value, || pos!())?;
                                 release(value);
                                 if holds == taken_when {
                                     transfer!(wide!(width - 4) as usize);
