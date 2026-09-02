@@ -56,7 +56,9 @@ struct Case {
     /// owned program and a module built per run.
     callbacks: bool,
     /// Whether the source reaches a gated site. A case that does not is a
-    /// control and must read 1.000.
+    /// control and must read 1.000 — so with no candidate gated, every case
+    /// is one, and a round where they all do is the harness reporting itself
+    /// healthy rather than a result.
     gated: bool,
 }
 
@@ -99,7 +101,7 @@ const CASES: &[Case] = &[
                  for i in range(2 * p, SIZE + 1, p) { prime_mask[i] = false; } } total_primes_found",
         iterations: 1,
         callbacks: false,
-        gated: true,
+        gated: false,
     },
     // Index reads and nothing else, so the gated site is priced per element
     // here rather than diluted by a sieve's inner write loop.
@@ -109,7 +111,7 @@ const CASES: &[Case] = &[
                  for i in 0..20000 { s += a[i % 64]; } s",
         iterations: 20,
         callbacks: false,
-        gated: true,
+        gated: false,
     },
     // The one case the VM is expected to lose: every element crosses out of it
     // into a second `Vm` for the closure body, so a call-path change is priced
