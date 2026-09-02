@@ -891,23 +891,37 @@ fn check_indices(at: usize, code: &[u8], pools: &Pools) -> Result<(), VerifyErro
         | tag::INDEX_GET_FROM_LOCAL
         | tag::INDEX_GET_FROM_CONST
         | tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
-        | tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
+        | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+        | tag::INDEX_SET_OP
+        | tag::INDEX_SET_OP_FROM_LOCAL
+        | tag::INDEX_SET_OP_FROM_CONST
+        | tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+        | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
             bounded(index(1), "chain", pools.chains.len())?;
             if matches!(
                 code[at],
                 tag::INDEX_SET_FROM_CONST
                     | tag::INDEX_GET_FROM_CONST
                     | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                    | tag::INDEX_SET_OP_FROM_CONST
+                    | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
             ) {
                 bounded(index(5), "constant", pools.consts)?;
             }
-            // The value is the last operand, so it is two bytes from the end.
+            // The value is written after the index, so a form that names it
+            // holds it at seven whichever way the index is named.
             if matches!(
                 code[at],
-                tag::INDEX_SET_FROM_LOCAL_VALUE_CONST | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                    | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                    | tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                    | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
             ) {
                 bounded(index(7), "constant", pools.consts)?;
             }
+            // The operator is a kind byte rather than a pool index, so there
+            // is nothing here to bound: a byte naming no operator makes the
+            // specialised arm decline, and the chain answers.
             check_chain_indices(at, &pools.chains[index(1) as usize], pools)
         }
         tag::SWITCH => bounded(index(1), "switch", pools.switches.len()),

@@ -356,6 +356,37 @@ fn a_const_array_refuses_an_indexed_write() {
     assert!(stock.scope.iter().any(|(name, value)| name == "A" && value.contains('1') && !value.contains('9')), "the constant was written despite the refusal: {:?}", stock.scope,);
 }
 
+/// An indexed op-assignment that fails leaves the element alone, on both sides.
+///
+/// The specialised write applies the operator to the element where it lies, so
+/// an operator that raises is the one path on which it has already reached the
+/// element — and it has to hand the whole thing back untouched. Nothing else
+/// covers that: like [`a_const_array_refuses_an_indexed_write`], the case
+/// cannot live in the corpus, because Rhai blames such a failure on the `/=`
+/// while the VM blames it on the chain, a position divergence that predates
+/// this instruction and is not what the instruction decides.
+///
+/// So this compares what the instruction is responsible for — that both sides
+/// raise the same arithmetic error and that neither writes the element — and
+/// ignores the position they disagree about.
+#[cfg(all(not(feature = "no_index"), not(feature = "unchecked")))]
+#[test]
+fn an_indexed_op_assignment_that_fails_leaves_the_element_alone() {
+    let engine = corpus::engine();
+    const SOURCE: &str = "let a = [1, 2, 3]; let z = 0; a[0] /= z; a";
+
+    let stock = run_stock(&engine, SOURCE);
+    let vm = run_vm(&engine, SOURCE);
+
+    for (arm, outcome) in [("rhai", &stock), ("vm", &vm)] {
+        let err = outcome.result.as_ref().expect_err(&format!("{arm} must raise"));
+        assert!(err.contains("Division by zero"), "{arm} raised the wrong error: {err}",);
+    }
+
+    assert_eq!(stock.scope, vm.scope, "the two sides left different values behind",);
+    assert!(stock.scope.iter().any(|(name, value)| name == "a" && value == "[1, 2, 3]"), "the element was written despite the failure: {:?}", stock.scope,);
+}
+
 /// The same for the one unary operator that has a typed instruction.
 ///
 /// `Op::UnOp` runs `!` on a `bool` without resolving a function, so it must sit

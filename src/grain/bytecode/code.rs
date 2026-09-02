@@ -264,6 +264,23 @@ pub mod tag {
     pub const INDEX_SET_FROM_LOCAL_VALUE_CONST: u8 = 0x61;
     /// [`INDEX_SET_FROM_CONST`] with a constant value.
     pub const INDEX_SET_FROM_CONST_VALUE_CONST: u8 = 0x62;
+
+    /// [`INDEX_SET`] through an operator.
+    ///
+    /// One per spelling of [`INDEX_SET`], because the operands a write names
+    /// are decided the same way whether or not there is an operator. Each is
+    /// its plain spelling with the operator's kind byte appended, so the
+    /// chain, the slot, the index and the value are read at the offsets they
+    /// are read at without one — and the kind sits one byte from the end.
+    pub const INDEX_SET_OP: u8 = 0x65;
+    /// [`INDEX_SET_FROM_LOCAL`] through an operator.
+    pub const INDEX_SET_OP_FROM_LOCAL: u8 = 0x66;
+    /// [`INDEX_SET_FROM_CONST`] through an operator.
+    pub const INDEX_SET_OP_FROM_CONST: u8 = 0x67;
+    /// [`INDEX_SET_FROM_LOCAL_VALUE_CONST`] through an operator.
+    pub const INDEX_SET_OP_FROM_LOCAL_VALUE_CONST: u8 = 0x68;
+    /// [`INDEX_SET_FROM_CONST_VALUE_CONST`] through an operator.
+    pub const INDEX_SET_OP_FROM_CONST_VALUE_CONST: u8 = 0x69;
     /// [`Op::BinOpFrom`](super::Op::BinOpFrom) whose branch is taken when the
     /// result is *true*, with the right operand in a slot.
     ///
@@ -422,6 +439,13 @@ static WIDTHS: [u8; 256] = {
 
     widths[tag::INDEX_SET_FROM_LOCAL_VALUE_CONST as usize] = 9;
     widths[tag::INDEX_SET_FROM_CONST_VALUE_CONST as usize] = 9;
+
+    // Each one its plain spelling plus the operator's kind byte.
+    widths[tag::INDEX_SET_OP as usize] = 6;
+    widths[tag::INDEX_SET_OP_FROM_LOCAL as usize] = 8;
+    widths[tag::INDEX_SET_OP_FROM_CONST as usize] = 8;
+    widths[tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST as usize] = 10;
+    widths[tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST as usize] = 10;
 
     widths[tag::BIN_OP_RHS_LOCAL as usize] = 8;
     widths[tag::BIN_OP_RHS_CONST as usize] = 8;
@@ -911,19 +935,31 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 slot,
                 index,
                 value,
+                op,
             } => {
-                code.push(match (index, value) {
-                    (None, None) => tag::INDEX_SET,
+                // Which operands the instruction names, and beside it the same
+                // spelling through an operator: the two columns hold the same
+                // operand layout, so what a form names is decided once and the
+                // operator only picks between them.
+                let (plain, applied) = match (index, value) {
+                    (None, None) => (tag::INDEX_SET, tag::INDEX_SET_OP),
                     (None, Some(..)) => return Err(AssembleError::ValueWithoutIndex),
-                    (Some(BinOperand::Local(..)), None) => tag::INDEX_SET_FROM_LOCAL,
-                    (Some(BinOperand::Const(..)), None) => tag::INDEX_SET_FROM_CONST,
-                    (Some(BinOperand::Local(..)), Some(..)) => {
-                        tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                    (Some(BinOperand::Local(..)), None) => {
+                        (tag::INDEX_SET_FROM_LOCAL, tag::INDEX_SET_OP_FROM_LOCAL)
                     }
-                    (Some(BinOperand::Const(..)), Some(..)) => {
-                        tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                    (Some(BinOperand::Const(..)), None) => {
+                        (tag::INDEX_SET_FROM_CONST, tag::INDEX_SET_OP_FROM_CONST)
                     }
-                });
+                    (Some(BinOperand::Local(..)), Some(..)) => (
+                        tag::INDEX_SET_FROM_LOCAL_VALUE_CONST,
+                        tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST,
+                    ),
+                    (Some(BinOperand::Const(..)), Some(..)) => (
+                        tag::INDEX_SET_FROM_CONST_VALUE_CONST,
+                        tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST,
+                    ),
+                };
+                code.push(if op.is_some() { applied } else { plain });
                 code.extend_from_slice(&small(*chain as usize, "chains")?.to_le_bytes());
                 code.extend_from_slice(&slot.to_le_bytes());
                 // The index first and the value last, so a form that names one
@@ -933,6 +969,10 @@ pub fn assemble(ops: &[Op]) -> Result<(Vec<u8>, Vec<u32>), AssembleError> {
                 }
                 if let Some(value) = value {
                     code.extend_from_slice(&small(*value as usize, "constants")?.to_le_bytes());
+                }
+                // After every operand, so naming one moves nothing.
+                if let Some(kind) = op {
+                    code.push(*kind as u8);
                 }
             }
 
@@ -1242,32 +1282,29 @@ fn encoded_width(op: &Op) -> usize {
         | Op::JumpIfFalse { .. }
         | Op::SkipIfNotUnit { .. }
         | Op::IterNext { .. }
-        | Op::IndexSet {
-            index: None,
-            value: None,
-            ..
-        }
         | Op::IndexGet { index: None, .. }
         | Op::PushHandler {
             catch_var: None, ..
         } => 5,
-        Op::IndexSet {
-            index: Some(..),
-            value: None,
-            ..
-        }
-        | Op::IndexGet {
+        Op::IndexGet {
             index: Some(..), ..
         }
         | Op::PushHandler {
             catch_var: Some(..),
             ..
         } => 7,
-        // The pair, and beside it the shape `encode` refuses: it never reaches
-        // a buffer, so what it would have measured is moot.
+        // Counted rather than grouped: a specialised write names its index,
+        // its value and its operator each on its own terms, so its width is a
+        // sum where every other instruction's is a constant. The shape
+        // `encode` refuses — a value with no index — is counted here too and
+        // never reaches a buffer, so what it measures is moot.
         Op::IndexSet {
-            value: Some(..), ..
-        } => 9,
+            index, value, op, ..
+        } => {
+            5 + 2 * usize::from(index.is_some())
+                + 2 * usize::from(value.is_some())
+                + usize::from(op.is_some())
+        }
         Op::Call { op: Some(..), .. }
         | Op::BinOp {
             rhs: None,
@@ -1485,9 +1522,10 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
             chain: u32::from(small(1)?),
             discards: tag == tag::CHAIN_DISCARD,
         },
-        // The six share one operand layout and differ in two things: whether
-        // the instruction reads or writes, and whether it names its index.
-        // The operand word is only read where a tag says it is there.
+        // The whole family shares one operand layout and differs in three
+        // things: whether the instruction reads or writes, whether it names
+        // its index and value, and whether it writes through an operator.
+        // Each operand is only read where a tag says it is there.
         tag::INDEX_SET
         | tag::INDEX_SET_FROM_LOCAL
         | tag::INDEX_SET_FROM_CONST
@@ -1495,40 +1533,64 @@ pub fn decode(code: &[u8], at: usize) -> Option<Op> {
         | tag::INDEX_GET_FROM_LOCAL
         | tag::INDEX_GET_FROM_CONST
         | tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
-        | tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
+        | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+        | tag::INDEX_SET_OP
+        | tag::INDEX_SET_OP_FROM_LOCAL
+        | tag::INDEX_SET_OP_FROM_CONST
+        | tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+        | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
             let chain = u32::from(small(1)?);
             let slot = small(3)?;
             let index = match code[at] {
                 tag::INDEX_SET_FROM_LOCAL
                 | tag::INDEX_GET_FROM_LOCAL
-                | tag::INDEX_SET_FROM_LOCAL_VALUE_CONST => Some(BinOperand::Local(small(5)?)),
+                | tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                | tag::INDEX_SET_OP_FROM_LOCAL
+                | tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST => Some(BinOperand::Local(small(5)?)),
                 tag::INDEX_SET_FROM_CONST
                 | tag::INDEX_GET_FROM_CONST
-                | tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
+                | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                | tag::INDEX_SET_OP_FROM_CONST
+                | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
                     Some(BinOperand::Const(u32::from(small(5)?)))
                 }
                 _ => None,
             };
+            // The value is written after the index, so a form that names it
+            // reads it at seven whichever way the index is named.
+            let value = match code[at] {
+                tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                | tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                | tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => Some(u32::from(small(7)?)),
+                _ => None,
+            };
+            // The operator is written after every operand, so where it is
+            // depends on how many of them the form names. A byte naming no
+            // operator reads as none, which is what it means to the VM: the
+            // arm declines and the chain answers.
+            let op = match code[at] {
+                tag::INDEX_SET_OP => BinOpKind::from_byte(*code.get(at + 5)?),
+                tag::INDEX_SET_OP_FROM_LOCAL | tag::INDEX_SET_OP_FROM_CONST => {
+                    BinOpKind::from_byte(*code.get(at + 7)?)
+                }
+                tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                | tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
+                    BinOpKind::from_byte(*code.get(at + 9)?)
+                }
+                _ => None,
+            };
             match code[at] {
-                tag::INDEX_SET | tag::INDEX_SET_FROM_LOCAL | tag::INDEX_SET_FROM_CONST => {
-                    Op::IndexSet {
-                        chain,
-                        slot,
-                        index,
-                        value: None,
-                    }
+                tag::INDEX_GET | tag::INDEX_GET_FROM_LOCAL | tag::INDEX_GET_FROM_CONST => {
+                    Op::IndexGet { chain, slot, index }
                 }
-                // The value is the last operand, so it sits two bytes from the
-                // end whichever way the index is named.
-                tag::INDEX_SET_FROM_LOCAL_VALUE_CONST | tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
-                    Op::IndexSet {
-                        chain,
-                        slot,
-                        index,
-                        value: Some(u32::from(small(7)?)),
-                    }
-                }
-                _ => Op::IndexGet { chain, slot, index },
+                _ => Op::IndexSet {
+                    chain,
+                    slot,
+                    index,
+                    value,
+                    op,
+                },
             }
         }
         tag::SWITCH => Op::Switch(u32::from(small(1)?)),
@@ -1956,30 +2018,72 @@ mod tests {
                 slot: 4,
                 index: None,
                 value: None,
+                op: None,
             },
             Op::IndexSet {
                 chain: 2,
                 slot: 4,
                 index: Some(BinOperand::Local(5)),
                 value: None,
+                op: None,
             },
             Op::IndexSet {
                 chain: 2,
                 slot: 4,
                 index: Some(BinOperand::Const(6)),
                 value: None,
+                op: None,
             },
             Op::IndexSet {
                 chain: 2,
                 slot: 4,
                 index: Some(BinOperand::Local(5)),
                 value: Some(8),
+                op: None,
             },
             Op::IndexSet {
                 chain: 2,
                 slot: 4,
                 index: Some(BinOperand::Const(6)),
                 value: Some(8),
+                op: None,
+            },
+            // The same five through an operator, which is the kind byte the
+            // instruction ends with and nothing else.
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: None,
+                value: None,
+                op: Some(BinOpKind::Add),
+            },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Local(5)),
+                value: None,
+                op: Some(BinOpKind::Subtract),
+            },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Const(6)),
+                value: None,
+                op: Some(BinOpKind::Multiply),
+            },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Local(5)),
+                value: Some(8),
+                op: Some(BinOpKind::Divide),
+            },
+            Op::IndexSet {
+                chain: 2,
+                slot: 4,
+                index: Some(BinOperand::Const(6)),
+                value: Some(8),
+                op: Some(BinOpKind::Modulo),
             },
             Op::IndexGet {
                 chain: 2,

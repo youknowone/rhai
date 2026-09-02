@@ -626,13 +626,14 @@ impl Lowering {
             tail,
             operands,
         };
-        // `local[i] = v` and `local[i]`, which is what a loop over an array is
-        // made of, get an instruction that names the slot and skips the walk.
-        // Decided on the lowered chain rather than on the tree, so a shape that
-        // lowers to anything else — a second step, an op-assignment, a root
-        // with no slot, a null-conditional index — keeps the general
+        // `local[i] = v`, `local[i] op= v` and `local[i]`, which is what a
+        // loop over an array is made of, get an instruction that names the
+        // slot and skips the walk. Decided on the lowered chain rather than on
+        // the tree, so a shape that lowers to anything else — a second step, a
+        // root with no slot, a null-conditional index — keeps the general
         // instruction. See [`Op::IndexSet`] and [`Op::IndexGet`].
-        let specialised = indexed_slot(&chain);
+        let applied = self.chain_operator(&chain);
+        let specialised = indexed_slot(&chain, applied);
         // A specialised chain lowers its index and then, if it assigns, its
         // value — nothing else — so a lone push is still recognisable here and
         // the instruction can name it instead of taking it off the stack.
@@ -652,6 +653,7 @@ impl Lowering {
                 slot,
                 index: named_index,
                 value: named_value,
+                op: applied,
             },
             (Some(slot), false) => Op::IndexGet {
                 chain: index,
@@ -2851,6 +2853,19 @@ impl Lowering {
         Some(src)
     }
 
+    /// The operator a specialised write would apply to the element itself.
+    ///
+    /// `None` for a chain that does not assign through one, and for an operator
+    /// [`BinOpKind`] does not name — a host's `Engine::register_custom_operator`
+    /// has no built-in to reach. Either keeps the general [`Op::Chain`], which
+    /// resolves the operator out of the pool as it always did.
+    fn chain_operator(&self, chain: &Chain) -> Option<BinOpKind> {
+        let Tail::Assign { op: Some(op) } = chain.tail else {
+            return None;
+        };
+        self.assign_ops.get(op as usize).and_then(|op| op.kind)
+    }
+
     /// Take back an indexed chain's index push, naming what it read.
     ///
     /// The same trade as [`Self::fold_pushed_operand`], for an operand that is
@@ -3412,15 +3427,18 @@ fn declaration_order(def: &ScriptFuncDef) -> (&str, usize, Option<&str>) {
 /// and a root that is a slot — the only root a write can land in without a
 /// write-back, and the only one a read reaches without evaluating anything.
 ///
-/// An op-assignment is refused. `a[i] += 1` reads, applies and writes back
-/// through one `Target`, and neither instruction here is built to hold the
-/// element open across the operator.
-fn indexed_slot(chain: &Chain) -> Option<u16> {
+/// `applied` is the tail's operator where the VM has an arm that applies it to
+/// the element in place — [`Lowering::chain_operator`] is what decides that. An
+/// op-assignment with no such operator keeps the general instruction: what the
+/// specialised write buys is holding the element open across the operator, and
+/// there is nothing to hold it open across.
+fn indexed_slot(chain: &Chain, applied: Option<BinOpKind>) -> Option<u16> {
     let Root::Local { slot, .. } = chain.root else {
         return None;
     };
     match chain.tail {
         Tail::Read | Tail::Assign { op: None } => {}
+        Tail::Assign { op: Some(..) } if applied.is_some() => {}
         Tail::Assign { op: Some(..) } => return None,
     }
     let [Step::Index {

@@ -1005,11 +1005,12 @@ pub enum Op {
     /// Assign into `local[index]`, with the chain it specialises beside it.
     ///
     /// [`Op::Chain`] for the one shape that dominates a loop writing an array:
-    /// a root that is a local slot, exactly one [`Step::Index`], and a plain
-    /// `=` tail. The compiler emits it only for that shape, so the VM does not
-    /// re-derive it; what the VM still tests is the *types*, which no compiler
-    /// can know — the local has to hold an unshared, writable `Array` and the
-    /// index has to be a non-negative in-range integer.
+    /// a root that is a local slot, exactly one [`Step::Index`], and a tail
+    /// that is `=` or an op-assignment the VM can apply in place. The compiler
+    /// emits it only for that shape, so the VM does not re-derive it; what the
+    /// VM still tests is the *types*, which no compiler can know — the local
+    /// has to hold an unshared, writable `Array` and the index has to be a
+    /// non-negative in-range integer.
     ///
     /// Anything it declines runs `chain`, which is the very chain this
     /// replaced, so a receiver that turns out to be a map, a shared cell, a
@@ -1045,6 +1046,16 @@ pub enum Op {
         /// index, and there is no layout that holds the second without the
         /// first.
         value: Option<u32>,
+        /// The operator of an op-assignment tail, for the arm that applies it
+        /// to the element where it lies.
+        ///
+        /// The kind itself rather than an index into the op-assignment pool,
+        /// on [`Op::BinOp`]'s trade: the element is held open across one
+        /// `match`, and reaching the pool for the operator would be the read
+        /// this instruction exists to skip. The pool entry is still what the
+        /// declining walk uses — the chain record names it, and it carries the
+        /// tokens and names an operator this cannot apply is dispatched by.
+        op: Option<BinOpKind>,
     },
 
     /// Read `local[index]`, with the chain it specialises beside it.

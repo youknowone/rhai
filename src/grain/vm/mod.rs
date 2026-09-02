@@ -641,6 +641,12 @@ fn apply_unary(kind: UnOpKind, operand: &Dynamic) -> Option<Dynamic> {
 /// and they are not the same set: `f += 1` is there and `i += 1.5` is not —
 /// an integer target with a float operand has no built-in op-assignment and
 /// expands into `i = i + 1.5`, which is a different answer and Rhai's.
+///
+/// `target` is untouched unless the answer is `Ok(Some(()))`: an operator that
+/// declines has written nothing, and one that fails computes its result before
+/// there is anywhere to put it. A caller that answers a failure by handing the
+/// same operands to the walk rests on this, and would apply the operator twice
+/// without it.
 #[inline]
 fn apply_assign(kind: BinOpKind, target: &mut Dynamic, rhs: &Dynamic) -> RhaiResultOf<Option<()>> {
     match (&mut target.0, &rhs.0) {
@@ -5222,42 +5228,56 @@ impl<'e> Vm<'e> {
                 }};
             }
 
-            // Where an `INDEX_GET`/`INDEX_SET` instruction's index comes from:
-            // the operand word at `$offset` for the four naming tags, or the
-            // stack entry `$under` for the two plain ones. `None` is the fast
-            // path declining, which the walk below then answers.
+            // Whether an `INDEX_GET`/`INDEX_SET` instruction names its index in
+            // a slot. Its own macro because the answer is wanted twice: once
+            // to read the index and once to push it back for a walk that has
+            // to find it on the stack.
+            macro_rules! index_is_local {
+                () => {{
+                    matches!(
+                        tag,
+                        code::tag::INDEX_GET_FROM_LOCAL
+                            | code::tag::INDEX_SET_FROM_LOCAL
+                            | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                            | code::tag::INDEX_SET_OP_FROM_LOCAL
+                            | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                    )
+                }};
+            }
+
+            // The index itself: the operand word at `$offset` for the naming
+            // tags, or the stack entry `$under` for the plain ones, which name
+            // it in neither place. `None` is the fast path declining, which
+            // the walk below then answers.
             macro_rules! indexed_int {
                 ($offset:expr, $under:expr) => {{
                     let mut found = None;
-                    match tag {
-                        code::tag::INDEX_GET_FROM_LOCAL
-                        | code::tag::INDEX_SET_FROM_LOCAL
-                        | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST => {
-                            let at = base + small!($offset) as usize;
-                            if at < scope_len!() {
-                                if let Union::Int(i, ..) = scope_entry!(at).0 {
-                                    found = Some(i);
-                                }
+                    if index_is_local!() {
+                        let at = base + small!($offset) as usize;
+                        if at < scope_len!() {
+                            if let Union::Int(i, ..) = scope_entry!(at).0 {
+                                found = Some(i);
                             }
                         }
+                    } else if matches!(
+                        tag,
                         code::tag::INDEX_GET_FROM_CONST
-                        | code::tag::INDEX_SET_FROM_CONST
-                        | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
-                            let index = u32::from(small!($offset));
-                            #[cfg(feature = "grain-jit")]
-                            let constant = jit::program_constant(program, index);
-                            #[cfg(not(feature = "grain-jit"))]
-                            let constant = program.constant(index);
-                            if let Some(Union::Int(i, ..)) = constant.map(|value| &value.0) {
-                                found = Some(*i);
-                            }
+                            | code::tag::INDEX_SET_FROM_CONST
+                            | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                            | code::tag::INDEX_SET_OP_FROM_CONST
+                            | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
+                    ) {
+                        let index = u32::from(small!($offset));
+                        #[cfg(feature = "grain-jit")]
+                        let constant = jit::program_constant(program, index);
+                        #[cfg(not(feature = "grain-jit"))]
+                        let constant = program.constant(index);
+                        if let Some(Union::Int(i, ..)) = constant.map(|value| &value.0) {
+                            found = Some(*i);
                         }
-                        _ => {
-                            if let Some(under) = $under {
-                                if let Union::Int(i, ..) = stack_ref(self, under).0 {
-                                    found = Some(i);
-                                }
-                            }
+                    } else if let Some(under) = $under {
+                        if let Union::Int(i, ..) = stack_ref(self, under).0 {
+                            found = Some(i);
                         }
                     }
                     found
@@ -5295,23 +5315,16 @@ impl<'e> Vm<'e> {
             // The index a naming tag carries.
             macro_rules! indexed_value {
                 ($offset:expr) => {{
-                    operand_value!(
-                        $offset,
-                        matches!(
-                            tag,
-                            code::tag::INDEX_GET_FROM_LOCAL
-                                | code::tag::INDEX_SET_FROM_LOCAL
-                                | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
-                        )
-                    )
+                    operand_value!($offset, index_is_local!())
                 }};
             }
 
-            // The constant an assigning naming tag carries, which is its
-            // last operand and so sits two bytes from the end.
+            // The constant an assigning naming tag carries. The value is
+            // written after the index and before the operator, so it sits at
+            // seven however the form spells the other two.
             macro_rules! assigned_value {
                 () => {{
-                    operand_value!(width - 2, false)
+                    operand_value!(7, false)
                 }};
             }
 
@@ -6325,7 +6338,12 @@ impl<'e> Vm<'e> {
                 | code::tag::INDEX_SET_FROM_LOCAL
                 | code::tag::INDEX_SET_FROM_CONST
                 | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
-                | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST => {
+                | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                | code::tag::INDEX_SET_OP
+                | code::tag::INDEX_SET_OP_FROM_LOCAL
+                | code::tag::INDEX_SET_OP_FROM_CONST
+                | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
                     // The compiler has already decided the shape, so what is
                     // left to test is the types — which it could not know. A
                     // slot holding a writable, unshared `Array` and an index
@@ -6341,13 +6359,15 @@ impl<'e> Vm<'e> {
                     // destructures with the rest of indexing — so there is
                     // nothing left here to be fast about, and the compiler
                     // emits no `IndexSet` on that build either.
-                    let named = tag != code::tag::INDEX_SET;
+                    let named = !matches!(tag, code::tag::INDEX_SET | code::tag::INDEX_SET_OP);
                     // A named value was never pushed, so the index it would
                     // have sat on top of is the top of the stack instead.
                     let valued = matches!(
                         tag,
                         code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
                             | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                            | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                            | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
                     );
                     #[cfg_attr(feature = "no_index", allow(unused_mut))]
                     let mut assigned = false;
@@ -6366,6 +6386,32 @@ impl<'e> Vm<'e> {
                         if at >= scope_len!() {
                             break 'fast;
                         }
+                        // The operator an op-assignment applies, which is the
+                        // kind byte the instruction ends with. Gated on
+                        // `fast_operators()` for the reason every typed arm is:
+                        // with it off the walk resolves a function, and a
+                        // host-registered `+=` on integers wins on both sides.
+                        let kind = match tag {
+                            code::tag::INDEX_SET_OP
+                            | code::tag::INDEX_SET_OP_FROM_LOCAL
+                            | code::tag::INDEX_SET_OP_FROM_CONST
+                            | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                            | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
+                                if !fast_operators!() {
+                                    break 'fast;
+                                }
+                                // A byte naming no operator is not an error:
+                                // the walk reads the operator out of the
+                                // chain's pool entry and answers whatever it
+                                // answers, which is what a verified program's
+                                // byte can never make it do.
+                                let Some(kind) = BinOpKind::from_byte(byte!(width - 1)) else {
+                                    break 'fast;
+                                };
+                                Some(kind)
+                            }
+                            _ => None,
+                        };
                         // Read before the array is borrowed out of the same
                         // scope, which a named value may be read from too.
                         let named_value = if valued {
@@ -6380,11 +6426,46 @@ impl<'e> Vm<'e> {
                         let Some(cell) = array.get_mut(i) else {
                             break 'fast;
                         };
-                        let value = match named_value {
-                            Some(value) => value,
-                            None => self.pop_or_unit(),
-                        };
-                        overwrite(cell, value);
+                        match kind {
+                            // The operator applied to the element where it
+                            // lies, which is the whole of what this spelling
+                            // buys: an element reached as a `&mut Dynamic`
+                            // needs no `Target` to read through, no copy of it
+                            // to apply to and no second walk to write back.
+                            //
+                            // Nothing is consumed until it has answered. A
+                            // pair the arm has no entry for — a string, a
+                            // shared cell, an integer element under a float
+                            // operand — and an operator that fails both leave
+                            // every operand where the walk expects it, and the
+                            // walk is what answers, error included.
+                            Some(kind) => {
+                                let rhs = match named_value.as_ref() {
+                                    Some(value) => value,
+                                    None => {
+                                        let Some(top) = self.depth.checked_sub(1) else {
+                                            break 'fast;
+                                        };
+                                        stack_ref(self, top)
+                                    }
+                                };
+                                match apply_assign(kind, cell, rhs) {
+                                    Ok(Some(())) => {}
+                                    Ok(None) | Err(..) => break 'fast,
+                                }
+                                match named_value {
+                                    Some(value) => release(value),
+                                    None => release(self.pop_or_unit()),
+                                }
+                            }
+                            None => {
+                                let value = match named_value {
+                                    Some(value) => value,
+                                    None => self.pop_or_unit(),
+                                };
+                                overwrite(cell, value);
+                            }
+                        }
                         if !named {
                             // The index operand, done with.
                             release(self.pop_or_unit());

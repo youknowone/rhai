@@ -175,6 +175,8 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_int_modulo_by_zero"
             | "error_int_power_negative"
             | "error_op_assign_int_power_negative"
+            | "op_assign_indexed_divide_by_zero_is_caught"
+            | "op_assign_indexed_overflow_is_caught"
             // Not a guard but the same problem: `1 << 100` is a Rust shift
             // past the width, which panics in a test build. The two operator
             // censuses beside it stay in — every operand they use is in range,
@@ -202,6 +204,8 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "int_float_comparisons"
             | "error_index_assign_float_index"
             | "error_index_read_float_index"
+            | "op_assign_indexed_float"
+            | "op_assign_indexed_int_by_float"
     ) {
         return false;
     }
@@ -223,6 +227,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
             name,
             "block_as_argument"
                 | "closure_captures_a_callees_local"
+                | "closure_op_assign_indexed_shared_array"
                 | "closure_outlives_later_calls_to_its_maker"
                 | "closure_writes_a_callees_local"
                 | "error_a_skipped_function_cannot_see_the_caller"
@@ -293,6 +298,8 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "closure_map_repeated"
             | "closure_map_takes_an_argument"
             | "closure_map_then_filter"
+            | "closure_op_assign_indexed_shared_array"
+            | "closure_op_assign_indexed_shared_element"
             | "closure_shared_chain_root"
             | "const_root_index_read"
             | "empty_literals_nested_in_computed_ones"
@@ -311,6 +318,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_index_read_out_of_bounds"
             | "error_index_read_slot_is_not_an_integer"
             | "error_no_function_for_the_receiver"
+            | "error_op_assign_indexed_out_of_bounds"
             | "error_property_on_a_temporary"
             | "error_temp_root_index_runs_first"
             | "error_temp_root_out_of_bounds"
@@ -370,6 +378,20 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "map_read_of_absent_key_is_not_visible_to_a_closure"
             | "nested_containers"
             | "op_assign_indexed"
+            | "op_assign_indexed_computed_index"
+            | "op_assign_indexed_constant_root_is_caught"
+            | "op_assign_indexed_divide_by_zero_is_caught"
+            | "op_assign_indexed_float"
+            | "op_assign_indexed_int_by_float"
+            | "op_assign_indexed_int_forms"
+            | "op_assign_indexed_map_root"
+            | "op_assign_indexed_named_const_const"
+            | "op_assign_indexed_named_local_const"
+            | "op_assign_indexed_negative"
+            | "op_assign_indexed_overflow_is_caught"
+            | "op_assign_indexed_stashed_local_value"
+            | "op_assign_indexed_stashed_value_const_index"
+            | "op_assign_indexed_string"
             | "string_char_assign"
             | "string_slice_inclusive"
             | "string_slice_read"
@@ -464,6 +486,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "index_expression_reads_the_root"
                 | "interpolation_of_containers"
                 | "nested_containers"
+                | "op_assign_indexed_map_root"
                 | "property_assign_deep"
                 | "string_ops"
                 | "temp_root_array_method"
@@ -892,6 +915,46 @@ pub const CASES: &[Case] = &[
     // visible from outside the expression that invented it.
     case("map_read_of_absent_key_is_not_visible_to_a_closure", "let m = #{}; let r = 0; { let f = || m; r = m.zz; } [m, r]"),
     case("op_assign_indexed", "let a = [1, 2, 3]; a[0] += 10; a"),
+    // The same instruction through an operator, which applies it to the
+    // element itself. Every operator the arm answers for, so that one which
+    // resolved differently from the walker's would show here rather than in a
+    // benchmark.
+    case("op_assign_indexed_int_forms", "let a = [20, 20, 20, 20, 20]; a[0] += 3; a[1] -= 3; a[2] *= 3; a[3] /= 3; a[4] %= 3; a"),
+    case("op_assign_indexed_float", "let a = [1.5, 2.5]; a[0] += 0.25; a[1] *= 2.0; a"),
+    // The four spellings of what the instruction names, which for an
+    // op-assignment are the same four a plain write has: the index in a slot
+    // or in the pool, and the value in the pool or stashed into a local.
+    case("op_assign_indexed_named_local_const", "let a = [1, 2, 3]; let i = 1; a[i] += 9; a"),
+    case("op_assign_indexed_named_const_const", "let a = [1, 2, 3]; a[1] += 9; a"),
+    case("op_assign_indexed_stashed_local_value", "let a = [1, 2, 3]; let i = 1; let v = 9; a[i] += v; a"),
+    case("op_assign_indexed_stashed_value_const_index", "let a = [1, 2, 3]; let v = 9; a[1] += v; a"),
+    // An index the instruction cannot name, over a loop, which is the shape a
+    // program that walks an array actually has.
+    case("op_assign_indexed_computed_index", "let a = [1, 2, 3, 4]; let i = 0; while i < 4 { a[i % 4] += i; i += 1; } a"),
+    // The pairs the operator arm has no entry for, and which therefore have to
+    // reach the same resolution the walk reaches: an integer element under a
+    // float operand has no op-assignment built-in at all and expands into
+    // `a[0] = a[0] + 1.5`, changing the element's type; two strings resolve a
+    // registered function.
+    case("op_assign_indexed_int_by_float", "let a = [1, 2]; a[0] += 1.5; a"),
+    case("op_assign_indexed_string", r#"let a = ["x", "y"]; a[0] += "z"; a"#),
+    // A shared cell cannot be operated on where it lies — the walk reaches the
+    // value inside it through a guard — so both the element and the array
+    // being one have to hand back.
+    case("closure_op_assign_indexed_shared_element", "let a = [shared_cell(), 2]; a[0] += 1; a"),
+    case("closure_op_assign_indexed_shared_array", "let a = [1, 2]; { let f = || a; a[0] += 5; } a"),
+    // The shapes the write speculates on and must hand back: an index that
+    // counts from the end, one that is off the end, and a root that is a map
+    // rather than an array.
+    case("op_assign_indexed_negative", "let a = [1, 2, 3]; a[-1] += 5; a"),
+    case("error_op_assign_indexed_out_of_bounds", "let a = [1, 2]; a[7] += 1; a"),
+    case("op_assign_indexed_map_root", r#"let m = #{ k: 1 }; m["k"] += 5; m"#),
+    // A failure the walk raises, caught rather than propagated: what these are
+    // compared on is the element the refused write and the failed operator
+    // each left alone, and the run that carried on past it.
+    case("op_assign_indexed_constant_root_is_caught", "const A = [1, 2]; let r = 0; try { A[0] += 1; } catch { r = 1; } [A, r]"),
+    case("op_assign_indexed_divide_by_zero_is_caught", "let a = [1, 2]; let z = 0; let r = 0; try { a[0] /= z; } catch { r = 1; } [a, r]"),
+    case("op_assign_indexed_overflow_is_caught", "let a = [1]; let n = 0; let r = 0; try { while n < 200 { a[0] *= 2; n += 1; } } catch { r = 1; } [a, n, r]"),
     // The shapes `Op::IndexSet` speculates on but must hand back: an index
     // that counts from the end, one that is off the end, a root that is a map
     // rather than an array, and one whose cell is shared with a closure. Each
