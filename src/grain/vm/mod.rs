@@ -43,6 +43,9 @@ mod jit;
 pub mod jit_state;
 #[cfg(feature = "grain-jit")]
 pub mod jitcodes;
+mod value;
+
+use value::{clone_value, flatten_clone_value, overwrite, release};
 
 use crate::grain::bytecode::{
     code, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail,
@@ -901,7 +904,7 @@ fn store_shared(
     if is_shared!(entry) {
         *place(entry, "", pos())? = value;
     } else {
-        *entry = value;
+        overwrite(entry, value);
     }
     Ok(())
 }
@@ -1001,12 +1004,12 @@ fn operand_mut(slot: &mut OperandSlot) -> &mut Dynamic {
 
 #[inline(always)]
 fn clone_operand(slot: &OperandSlot) -> Dynamic {
-    operand_ref(slot).clone()
+    clone_value(operand_ref(slot))
 }
 
 #[inline(always)]
 fn set_operand(slot: &mut OperandSlot, value: Dynamic) {
-    *operand_mut(slot) = value;
+    overwrite(operand_mut(slot), value);
 }
 
 #[inline(always)]
@@ -1247,7 +1250,7 @@ pub struct Vm<'e> {
 /// where the cell was.
 fn bind_this(receiver: &mut Dynamic) -> (Dynamic, bool) {
     if receiver.is_read_only() {
-        (receiver.clone().into_read_only(), false)
+        (clone_value(receiver).into_read_only(), false)
     } else {
         (mem::take(receiver), true)
     }
@@ -1915,7 +1918,10 @@ impl<'e> Vm<'e> {
         }
         #[cfg(not(feature = "grain-jit"))]
         {
-            *stack_mut(self, depth) = value;
+            // The slot above the top holds whatever the last owner of it left
+            // — unit, once `Vm::truncate_stack` or a take has been past it —
+            // and releasing that is the drop this instruction pays for.
+            overwrite(stack_mut(self, depth), value);
         }
         self.depth = depth + 1;
     }
@@ -1950,7 +1956,7 @@ impl<'e> Vm<'e> {
         }
         let mut slot = depth;
         while slot < self.depth {
-            *stack_mut(self, slot) = Dynamic::UNIT;
+            overwrite(stack_mut(self, slot), Dynamic::UNIT);
             slot += 1;
         }
         self.depth = depth;
@@ -2302,7 +2308,7 @@ impl<'e> Vm<'e> {
         let Some((step, rest)) = steps.split_first() else {
             // The end of the chain, reached with nothing to do: a bare `a` is
             // not a chain, so this only happens for an empty step list.
-            return Ok((target.clone(), false));
+            return Ok((clone_value(target), false));
         };
         let last = rest.is_empty();
         let coalescing = match step {
@@ -2337,7 +2343,7 @@ impl<'e> Vm<'e> {
                     operands.get_mut(*operand as usize),
                     malformed("chain index operand missing".to_string())
                 );
-                let mut idx = idx.clone();
+                let mut idx = clone_value(idx);
                 // Rhai reports an out-of-bounds index against the index and a
                 // value that cannot be indexed at all against this step's `[`.
                 // Both belong to the step, and neither is the chain's.
@@ -2501,7 +2507,7 @@ impl<'e> Vm<'e> {
         // parameter is bound by `take` (`func/register.rs:69`) — so afterwards
         // there is nothing left to address the setter with. Only the paths that
         // can write need it; a read returns below without ever looking.
-        let index_for_setter = (!last || value.is_some()).then(|| idx.clone());
+        let index_for_setter = (!last || value.is_some()).then(|| clone_value(idx));
 
         let mut item = match self.engine.get_indexed_mut(
             &mut self.global,
@@ -2585,7 +2591,7 @@ impl<'e> Vm<'e> {
         let mut new_val = value;
 
         if matches!(chain.tail, Tail::Assign { op: Some(_) }) {
-            let mut probe = index.clone();
+            let mut probe = clone_value(index);
             if let Ok(mut current) = self.engine.call_indexer_get(
                 &mut self.global,
                 &mut self.caches,
@@ -2774,7 +2780,7 @@ impl<'e> Vm<'e> {
                     return Ok((Dynamic::UNIT, true));
                 }
                 return match map.get(key) {
-                    Some(entry) => Ok((entry.clone(), false)),
+                    Some(entry) => Ok((clone_value(entry), false)),
                     None => self.absent_key(key, step_pos).map(|unit| (unit, false)),
                 };
             }
@@ -3033,9 +3039,9 @@ impl<'e> Vm<'e> {
 
         if let Some(value) = scope.get(name) {
             return Ok(if flatten {
-                value.flatten_clone()
+                flatten_clone_value(value)
             } else {
-                value.clone()
+                clone_value(value)
             });
         }
 
@@ -3220,7 +3226,7 @@ impl<'e> Vm<'e> {
             let curried = pointer.curry();
             self.open_slots(first, curried.len());
             for (offset, value) in curried.iter().enumerate() {
-                set_operand(&mut self.stack[first + offset], value.clone());
+                set_operand(&mut self.stack[first + offset], clone_value(value));
             }
 
             // A function pointer call always starts with an empty scope.
@@ -3851,7 +3857,7 @@ impl<'e> Vm<'e> {
             // what carried the lookup's position (see [`Receiver::Named`]), and
             // it is exactly the value Rhai would pass.
             if let Site::Slot(index) = at {
-                let value = scope.get_mut_by_index(index).flatten_clone();
+                let value = flatten_clone_value(scope.get_mut_by_index(index));
                 self.open_slots(first, 1);
                 set_operand(&mut self.stack[first], value);
             }
@@ -4402,7 +4408,11 @@ impl<'e> Vm<'e> {
     /// Rhai requires a boolean guard and reports the mismatch at the guard's
     /// own position (`eval/stmt.rs:487-490`), which is the fused instruction's
     /// -- the operator that computed the guard *is* the guard expression.
-    fn guard_holds(&self, value: Dynamic, pos: Position) -> Result<bool, Box<EvalAltResult>> {
+    ///
+    /// Borrowed rather than taken: reading a guard is `Dynamic::as_bool`, which
+    /// reads through a reference, so the caller keeps the value and can release
+    /// it itself rather than leaving it to the drop a move would have implied.
+    fn guard_holds(&self, value: &Dynamic, pos: Position) -> Result<bool, Box<EvalAltResult>> {
         value
             .as_bool()
             .map_err(|actual| self.mismatch::<bool>(actual, pos))
@@ -4957,14 +4967,17 @@ impl<'e> Vm<'e> {
                         if at >= scope_len!() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
-                        scope_entry!(at).flatten_clone()
+                        flatten_clone_value(scope_entry!(at))
                     } else {
                         let index = u32::from(small!($offset));
                         #[cfg(feature = "grain-jit")]
                         let constant = jit::program_constant(program, index);
                         #[cfg(not(feature = "grain-jit"))]
                         let constant = program.constant(index);
-                        or_raise!(constant, malformed(format!("no constant {index}"))).clone()
+                        clone_value(or_raise!(
+                            constant,
+                            malformed(format!("no constant {index}"))
+                        ))
                     }
                 }};
             }
@@ -5046,7 +5059,7 @@ impl<'e> Vm<'e> {
                     #[cfg(not(feature = "grain-jit"))]
                     let constant = program.constant(index);
                     let value = or_raise!(constant, malformed(format!("no constant {index}")));
-                    self.push(value.clone());
+                    self.push(clone_value(value));
                 }
 
                 code::tag::UNIT => self.push(Dynamic::UNIT),
@@ -5062,7 +5075,7 @@ impl<'e> Vm<'e> {
                     // Reads clone out, matching how Rhai's own variable reads
                     // leave the scope entry alone (`eval/expr.rs:276-278`), and
                     // flattening any shared cell the way a read should.
-                    self.push(scope_entry!(index).flatten_clone());
+                    self.push(flatten_clone_value(scope_entry!(index)));
                 }
 
                 code::tag::STORE_LOCAL | code::tag::STORE_CONST => {
@@ -5192,7 +5205,7 @@ impl<'e> Vm<'e> {
                             if index >= scope_len!() {
                                 return Err(malformed(format!("local slot {src} is out of scope")));
                             }
-                            scope_entry!(index).flatten_clone()
+                            flatten_clone_value(scope_entry!(index))
                         }
                         // A constant is read exactly as the `Op::Const` this
                         // form swallowed read it, then flattened as the pop it
@@ -5206,7 +5219,7 @@ impl<'e> Vm<'e> {
                             let constant = program.constant(index);
                             let value =
                                 or_raise!(constant, malformed(format!("no constant {index}")));
-                            value.flatten_clone()
+                            flatten_clone_value(value)
                         }
                         None => self.pop()?.flatten(),
                     };
@@ -5257,6 +5270,10 @@ impl<'e> Vm<'e> {
                             },
                         };
                         if done.handled {
+                            // The built-in read the right-hand side in place
+                            // and left it, so this is where the copy taken
+                            // above goes — the only owner of it left.
+                            release(rhs);
                             if let Some(error) = done.error {
                                 return Err(error);
                             }
@@ -5291,9 +5308,9 @@ impl<'e> Vm<'e> {
                     // (`eval/expr.rs:272`); its consumers do. Which tag this is
                     // is which consumer asked.
                     self.push(if tag == code::tag::LOAD_THIS {
-                        value.flatten_clone()
+                        flatten_clone_value(value)
                     } else {
-                        value.clone()
+                        clone_value(value)
                     });
                 }
 
@@ -5353,7 +5370,7 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::POP => {
-                    let _ = self.pop()?;
+                    release(self.pop()?);
                 }
 
                 code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
@@ -5412,6 +5429,7 @@ impl<'e> Vm<'e> {
                         Ok(holds) => holds,
                         Err(actual) => return Err(self.mismatch::<bool>(actual, pos!())),
                     };
+                    release(condition);
                     if holds == (tag == code::tag::JUMP_IF_TRUE) {
                         transfer!(target);
                         continue;
@@ -5503,9 +5521,17 @@ impl<'e> Vm<'e> {
                             truncate_stack!($floor);
                             if !branching {
                                 self.push(value);
-                            } else if self.guard_holds(value, pos!())? == taken_when {
-                                transfer!(wide!(width - 4) as usize);
-                                continue;
+                            } else {
+                                // Read and then released here rather than left
+                                // to fall out of scope: a swallowed branch is
+                                // the one exit that keeps nothing, and it runs
+                                // once per turn of every loop with a condition.
+                                let holds = self.guard_holds(&value, pos!())?;
+                                release(value);
+                                if holds == taken_when {
+                                    transfer!(wide!(width - 4) as usize);
+                                    continue;
+                                }
                             }
                         }};
                     }
@@ -5574,7 +5600,7 @@ impl<'e> Vm<'e> {
                                 if branching {
                                     deliver!(under, value);
                                 } else {
-                                    *stack_mut(self, under) = value;
+                                    overwrite(stack_mut(self, under), value);
                                 }
                                 pc += width;
                                 continue;
@@ -5794,7 +5820,9 @@ impl<'e> Vm<'e> {
                     let subject = self.pop()?;
                     // Always a jump: an arm that matched nothing still has the
                     // default to go to.
-                    transfer!(table.dispatch(&subject) as usize);
+                    let target = table.dispatch(&subject) as usize;
+                    release(subject);
+                    transfer!(target);
                     continue;
                 }
 
@@ -5806,7 +5834,7 @@ impl<'e> Vm<'e> {
                     }
                     // Cloned, not flattened: cloning a shared `Dynamic` clones
                     // the `Rc`, which is the capture.
-                    self.push(scope_entry!(index).clone());
+                    self.push(clone_value(scope_entry!(index)));
                 }
 
                 // Emitted only for a closure capture, which cannot be parsed
@@ -6048,13 +6076,14 @@ impl<'e> Vm<'e> {
                         let Some(cell) = array.get_mut(i) else {
                             break 'fast;
                         };
-                        *cell = match named_value {
+                        let value = match named_value {
                             Some(value) => value,
                             None => self.pop_or_unit(),
                         };
+                        overwrite(cell, value);
                         if !named {
                             // The index operand, done with.
-                            drop(self.pop_or_unit());
+                            release(self.pop_or_unit());
                         }
                         assigned = true;
                     }
