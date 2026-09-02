@@ -526,7 +526,18 @@ pub fn form(tag: u8) -> u16 {
 #[must_use]
 #[inline]
 pub fn width(code: &[u8], at: usize) -> Option<usize> {
-    let size = WIDTHS[*code.get(at)? as usize] as usize;
+    width_of(*code.get(at)?, code, at)
+}
+
+/// The same, for a caller that has already read the tag.
+///
+/// [`width`] is that read followed by this one. A caller that dispatches on the
+/// tag has it in hand, and reading it a second time to ask its width is a load
+/// and a bounds check that the first read already paid for.
+#[must_use]
+#[inline]
+pub fn width_of(tag: u8, code: &[u8], at: usize) -> Option<usize> {
+    let size = WIDTHS[tag as usize] as usize;
     if size == 0 {
         return None;
     }

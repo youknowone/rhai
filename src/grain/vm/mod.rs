@@ -5117,7 +5117,7 @@ impl<'e> Vm<'e> {
             };
             #[cfg(not(feature = "grain-jit"))]
             let width = or_raise!(
-                code::width(program.code(), pc),
+                code::width_of(tag, program.code(), pc),
                 malformed("undecodable instruction".to_string())
             );
             // Macros rather than closures, for the reason the position lookup
