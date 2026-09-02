@@ -6700,7 +6700,7 @@ impl<'e> Vm<'e> {
                         if is_shared!(*cell) {
                             break 'fast;
                         }
-                        let value = cell.clone();
+                        let value = clone_value(cell);
                         if named {
                             self.push(value);
                         } else {
