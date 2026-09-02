@@ -1122,6 +1122,19 @@ pub struct Vm<'e> {
     stack: Vec<OperandSlot>,
     /// One past the top operand — `pyframe.py:88 valuestackdepth`.
     depth: usize,
+    /// Emptied `Scope`s that finished calls gave back. See [`Vm::take_scope`].
+    ///
+    /// Inline storage rather than a `Vec`, because a crossing builds a whole
+    /// `Vm` per element a native calls back over
+    /// ([`callback::invoke`](crate::grain::vm::callback)) and a heap-allocated
+    /// pool would be one allocation per crossing for the first call inside it
+    /// — moving the cost rather than removing it. Inline, a pool that is never
+    /// used costs nothing to build and nothing to walk.
+    ///
+    /// It grows to the deepest the call stack has been, which
+    /// `max_call_levels` bounds wherever `unchecked` is off; the operand stack
+    /// beside it is retained on the same terms.
+    scopes: crate::StaticVec<Scope<'static>>,
     #[cfg_attr(any(feature = "no_index", feature = "no_object"), allow(unused))]
     strings_interner: StringsInterner,
     /// One entry per `for` loop currently running.
@@ -1287,6 +1300,7 @@ impl<'e> Vm<'e> {
             strings_interner: StringsInterner::new(256),
             stack: Vec::new(),
             depth: 0,
+            scopes: crate::StaticVec::new(),
             iterators: Vec::new(),
             handlers: Vec::new(),
             sizes: Vec::new(),
@@ -1334,6 +1348,7 @@ impl<'e> Vm<'e> {
             strings_interner: StringsInterner::new(256),
             stack: Vec::new(),
             depth: 0,
+            scopes: crate::StaticVec::new(),
             iterators: Vec::new(),
             handlers: Vec::new(),
             sizes: Vec::new(),
@@ -2403,18 +2418,19 @@ impl<'e> Vm<'e> {
                     let at = self.depth;
                     self.push_all(args.into_iter());
                     // A chained call always starts an empty scope.
-                    let new_scope = &mut Scope::new();
+                    let mut new_scope = self.take_scope();
                     let (result, returned) = self.call_compiled_with_this(
                         program,
                         name,
                         params,
                         chunk,
                         at,
-                        new_scope,
+                        &mut new_scope,
                         true,
                         step_pos,
                         Some(bound),
                     );
+                    self.give_scope(new_scope);
                     self.truncate_stack(at);
                     // Before `?`: a body that mutated and then raised has
                     // already written, as it would through Rhai's pointer.
@@ -3208,7 +3224,7 @@ impl<'e> Vm<'e> {
             }
 
             // A function pointer call always starts with an empty scope.
-            let new_scope = &mut Scope::new();
+            let mut new_scope = self.take_scope();
 
             let (result, returned) = self.call_compiled_with_this(
                 program,
@@ -3216,11 +3232,12 @@ impl<'e> Vm<'e> {
                 params,
                 chunk,
                 first,
-                new_scope,
+                &mut new_scope,
                 true,
                 pos,
                 bound.take(),
             );
+            self.give_scope(new_scope);
             bound = returned;
             result
         } else {
@@ -3610,6 +3627,22 @@ impl<'e> Vm<'e> {
             );
         }
 
+        self.call_dispatched(name_index, name, first, scope, pos)
+    }
+
+    /// The half of [`Vm::call_stacked`] that is Rhai's: a call this compiler
+    /// did not lower, resolved and run by the engine's own dispatch.
+    ///
+    /// Split out because the scope a call needs is decided by which half it
+    /// lands in, and a caller that already knows can go straight to one.
+    fn call_dispatched(
+        &mut self,
+        name_index: u32,
+        name: &str,
+        first: usize,
+        scope: &mut Scope,
+        pos: Position,
+    ) -> VmResult {
         // Arguments are already contiguous at the top of the operand stack,
         // which is exactly the shape Rhai's ABI wants (`func/call.rs:36`). It
         // consumes them, replacing each with unit, so the caller truncates
@@ -3647,6 +3680,41 @@ impl<'e> Vm<'e> {
         )
     }
 
+    /// An empty `Scope` for a call that starts one of its own.
+    ///
+    /// A call binds its parameters into a scope that holds nothing else, and
+    /// the first push into an empty one reserves `MIN_SCOPE_ENTRIES` on both
+    /// of its arrays (`types/scope.rs:414-420`) — two allocations per call,
+    /// and two frees when it drops. A scope lent back instead comes with those
+    /// arrays still at capacity and only their lengths taken to zero, so the
+    /// reserve finds the room already there and asks the allocator for
+    /// nothing.
+    ///
+    /// Nothing here is `Scope`'s to know: it is lent by the `Vm`, to callers
+    /// that were building one anyway.
+    fn take_scope(&mut self) -> Scope<'static> {
+        self.scopes.pop().unwrap_or_default()
+    }
+
+    /// Take a finished call's scope back, for [`Vm::take_scope`] to lend again.
+    ///
+    /// Emptied first, and unconditionally: the scope belongs to the call that
+    /// has just ended, so whatever is still in it is exactly what dropping it
+    /// would have discarded — including anything Rhai's own dispatch left
+    /// behind on the way through (`func/call.rs:801-806`).
+    ///
+    /// That is also what makes lending safe where a closure captured out of the
+    /// scope. Capturing shares the *value*: the entry is turned into a cell and
+    /// the closure holds a clone of the cell, so clearing drops this end of the
+    /// share and leaves the closure's alone. No later call can be handed a cell
+    /// an earlier closure holds, because what is lent is the array and never an
+    /// entry. Nor can anything still point into the array — the scope is moved
+    /// in here, so every borrow of it has ended.
+    fn give_scope(&mut self, mut scope: Scope<'static>) {
+        scope.clear();
+        self.scopes.push(scope);
+    }
+
     /// This is the main entry-point for function calls.
     ///
     /// First check whether the call is a syntactic one (e.g. `is_def_fn`)
@@ -3667,20 +3735,40 @@ impl<'e> Vm<'e> {
         pos: Position,
     ) -> VmResult {
         // Check if it is a built-in syntactic function.
-        match self.call_syntactic(program, name, argc, first, scope, pos)? {
-            Some(value) => Ok(value),
-            None => {
-                // Detach the scope with a new one if not capturing the parent's.
-                let mut detached;
-                let scope = if !capture {
-                    detached = Scope::new();
-                    &mut detached
-                } else {
-                    scope
-                };
-                self.call_stacked(program, name_index, name, argc, first, scope, pos)
-            }
+        if let Some(value) = self.call_syntactic(program, name, argc, first, scope, pos)? {
+            return Ok(value);
         }
+
+        // A capturing call runs in the parent's scope, which is not this VM's
+        // to lend or to take back.
+        if capture {
+            return self.call_stacked(program, name_index, name, argc, first, scope, pos);
+        }
+
+        // Only a compiled function binds anything into the scope it is given.
+        // Rhai's dispatch fills one only for a function it evaluates itself,
+        // and a native never touches it at all — so the lending is worth its
+        // bookkeeping on one of the two halves and not on the other.
+        //
+        // Written as its own arm rather than as a scope chosen between the two:
+        // a lent scope is a `Scope<'static>`, and `&mut Scope<'static>` is not
+        // a `&mut Scope<'_>`, since `&mut` is invariant in the lifetime the
+        // caller's scope carries.
+        let Some(function) = program.function(name_index, argc) else {
+            return self.call_dispatched(name_index, name, first, &mut Scope::new(), pos);
+        };
+        let mut detached = self.take_scope();
+        let result = self.call_compiled(
+            program,
+            name,
+            &function.param_names,
+            function.chunk,
+            first,
+            &mut detached,
+            pos,
+        );
+        self.give_scope(detached);
+        result
     }
 
     /// The same call, with a variable as its first argument and Rhai's

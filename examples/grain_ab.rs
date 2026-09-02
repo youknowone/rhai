@@ -12,7 +12,43 @@
 use std::time::{Duration, Instant};
 
 use rhai::grain::{Compiler, Program, Vm};
-use rhai::{Dynamic, Engine, Scope};
+use rhai::{Dynamic, Engine, Scope, Shared};
+
+/// One side of the comparison: a program and the entry point its capabilities
+/// require.
+enum Leg {
+    /// Boxed only so the two variants are the same size; nothing reads it per
+    /// instruction.
+    Owned(Box<Program<'static>>),
+    /// What a program whose function pointers can escape into a native needs.
+    Shared(Shared<Program<'static>>),
+}
+
+impl Leg {
+    fn of(program: Program<'static>, callbacks: bool) -> Self {
+        if callbacks {
+            Self::Shared(program.into_shared())
+        } else {
+            Self::Owned(Box::new(program))
+        }
+    }
+
+    fn code(&self) -> &[u8] {
+        match self {
+            Self::Owned(program) => program.code(),
+            Self::Shared(program) => program.code(),
+        }
+    }
+
+    fn run(&self, engine: &Engine) -> Dynamic {
+        let mut scope = Scope::new();
+        match self {
+            Self::Owned(program) => Vm::new(engine).eval_with_scope(&mut scope, program),
+            Self::Shared(program) => Vm::new(engine).eval_with_callbacks(&mut scope, program),
+        }
+        .expect("vm must succeed")
+    }
+}
 
 /// Script runs per leg per round.
 const RUNS: usize = 9;
@@ -21,17 +57,21 @@ struct Case {
     name: &'static str,
     source: &'static str,
     iterations: usize,
+    /// Whether the run needs the callback wrappers installed, which costs an
+    /// owned program and a module built per run.
+    callbacks: bool,
 }
 
 const CASES: &[Case] = &[
-    Case { name: "tight integer loop", source: "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s", iterations: 20 },
-    Case { name: "float arithmetic", source: "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x", iterations: 20 },
-    Case { name: "script fn calls", source: "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s", iterations: 20 },
-    Case { name: "recursive fibonacci", source: "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)", iterations: 1 },
+    Case { name: "tight integer loop", source: "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s", iterations: 20, callbacks: false },
+    Case { name: "float arithmetic", source: "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x", iterations: 20, callbacks: false },
+    Case { name: "script fn calls", source: "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s", iterations: 20, callbacks: false },
+    Case { name: "recursive fibonacci", source: "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)", iterations: 1, callbacks: false },
     Case {
         name: "switch, 4 arms",
         source: "let s = 0; for i in 0..20000 { switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } } s",
         iterations: 20,
+        callbacks: false,
     },
     Case {
         name: "switch, 16 arms",
@@ -41,13 +81,15 @@ const CASES: &[Case] = &[
                  8 => s += 9, 9 => s += 10, 10 => s += 11, 11 => s += 12, \
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } } s",
         iterations: 20,
+        callbacks: false,
     },
     Case {
         name: "branch heavy",
         source: "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s",
         iterations: 20,
+        callbacks: false,
     },
-    Case { name: "native function calls", source: "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a", iterations: 20 },
+    Case { name: "native function calls", source: "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a", iterations: 20, callbacks: false },
     Case {
         name: "primes",
         source: "const SIZE = 1_000_000; let prime_mask = []; prime_mask.pad(SIZE + 1, true); \
@@ -55,11 +97,23 @@ const CASES: &[Case] = &[
                  for p in 2..=SIZE { if !prime_mask[p] { continue; } total_primes_found += 1; \
                  for i in range(2 * p, SIZE + 1, p) { prime_mask[i] = false; } } total_primes_found",
         iterations: 1,
+        callbacks: false,
+    },
+    // The one case the VM is expected to lose: every element crosses out of it
+    // into a second `Vm` for the closure body, so a call-path change is priced
+    // per element here and nowhere else.
+    Case {
+        name: "native callbacks",
+        source: "let a = []; for i in 0..500 { a.push(i); } \
+                 let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len",
+        iterations: 20,
+        callbacks: true,
     },
     Case {
         name: "while, no operator fold",
         source: "let s = 0; let i = 0; let n = 20000; while `${i}` != `${n}` { s += i; i += 1; } s",
         iterations: 2,
+        callbacks: false,
     },
 ];
 
@@ -120,30 +174,28 @@ fn main() {
     let mut cases = Vec::new();
     for case in CASES {
         let ast = engine.compile(case.source).expect("must compile");
-        let plain: Program = Compiler::new().rotate_while(false).compile(&ast);
-        let rotated: Program = Compiler::new().rotate_while(true).compile(&ast);
-        let differs = plain.code() != rotated.code();
+        let a = Leg::of(Compiler::new().rotate_while(false).compile(&ast), case.callbacks);
+        let b = Leg::of(Compiler::new().rotate_while(true).compile(&ast), case.callbacks);
+        let differs = a.code() != b.code();
 
         let expected = engine
             .eval_ast_with_scope::<Dynamic>(&mut Scope::new(), &ast)
             .expect("walker must succeed");
-        for (which, program) in [("plain", &plain), ("rotated", &rotated)] {
-            let actual = Vm::new(&engine)
-                .eval_with_scope(&mut Scope::new(), program)
-                .expect("vm must succeed");
+        for (which, leg) in [("A", &a), ("B", &b)] {
+            let actual = leg.run(&engine);
             assert_eq!(
                 format!("{expected:?}"),
                 format!("{actual:?}"),
-                "{} disagreed on the {which} lowering",
+                "{} disagreed on leg {which}",
                 case.name,
             );
         }
         println!(
             "{:<24} bytecode {}",
             case.name,
-            if differs { "DIFFERS" } else { "identical (control)" }
+            if differs { "DIFFERS" } else { "identical" }
         );
-        cases.push((case, plain, rotated));
+        cases.push((case, a, b));
     }
 
     println!();
@@ -153,25 +205,13 @@ fn main() {
     );
     let mut ratios: Vec<(&str, bool, Vec<f64>)> = cases
         .iter()
-        .map(|(case, plain, rotated)| (case.name, plain.code() != rotated.code(), Vec::new()))
+        .map(|(case, a, b)| (case.name, a.code() != b.code(), Vec::new()))
         .collect();
 
     for round in 0..rounds {
-        for (index, (case, plain, rotated)) in cases.iter().enumerate() {
+        for (index, (case, leg_a, leg_b)) in cases.iter().enumerate() {
             let samples = RUNS * case.iterations;
-            let (a, b) = paired(
-                samples,
-                || {
-                    let _ = Vm::new(&engine)
-                        .eval_with_scope(&mut Scope::new(), plain)
-                        .unwrap();
-                },
-                || {
-                    let _ = Vm::new(&engine)
-                        .eval_with_scope(&mut Scope::new(), rotated)
-                        .unwrap();
-                },
-            );
+            let (a, b) = paired(samples, || drop(leg_a.run(&engine)), || drop(leg_b.run(&engine)));
             let ratio = best(&b) / best(&a);
             let spread = (median(&b) / best(&b) - 1.0).max(median(&a) / best(&a) - 1.0);
             println!(
@@ -191,7 +231,7 @@ fn main() {
     println!();
     println!(
         "{:<24} {:>8} {:>9} {:>9} {:>16}",
-        "", "kind", "median", "best", "rounds rotated won"
+        "", "kind", "median", "best", "rounds B won"
     );
     for (name, differs, samples) in &ratios {
         let mut sorted = samples.clone();

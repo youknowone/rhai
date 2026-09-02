@@ -222,6 +222,9 @@ pub fn applies_to_this_build(name: &str) -> bool {
         || matches!(
             name,
             "block_as_argument"
+                | "closure_captures_a_callees_local"
+                | "closure_outlives_later_calls_to_its_maker"
+                | "closure_writes_a_callees_local"
                 | "error_a_skipped_function_cannot_see_the_caller"
                 | "error_op_assign_to_a_constant_parameter_from_a_local"
                 | "error_wrong_arity"
@@ -408,14 +411,17 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "closure_call_on_this"
                 | "closure_capture_mutate"
                 | "closure_capture_read"
+                | "closure_captures_a_callees_local"
                 | "closure_filter_binds_this"
                 | "closure_for_each_binds_this"
                 | "closure_in_filter"
                 | "closure_in_map"
                 | "closure_map_binds_this"
                 | "closure_map_takes_an_argument"
+                | "closure_outlives_later_calls_to_its_maker"
                 | "closure_shared_op_assign"
                 | "closure_shared_write"
+                | "closure_writes_a_callees_local"
                 | "empty_literals_nested_in_computed_ones"
                 | "empty_map_nested_in_a_computed_map"
                 | "error_chain_in_statement_position"
@@ -432,6 +438,7 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "error_this_is_not_inherited"
                 | "fn_mutating_method"
                 | "fn_ptr_call"
+                | "fn_ptr_call_repeated"
                 | "fn_ptr_curried"
                 | "fn_ptr_from_dynamic_name"
                 | "fn_ptr_to_native"
@@ -786,6 +793,11 @@ pub const CASES: &[Case] = &[
     // In a block for the same reason the closure cases are: what the pointer
     // *does* matches, what it renders as does not.
     case("fn_ptr_call", "fn triple(x) { x * 3 } let r = 0; { let f = Fn(\"triple\"); r = f.call(4); } r"),
+    // The same site taken repeatedly, which is the other door a compiled body
+    // is reached through and so the other place a call's scope is lent from
+    // ([`Vm::take_scope`]). A single call cannot tell a scope built afresh from
+    // one handed on.
+    case("fn_ptr_call_repeated", "fn add(a, b) { a + b } let s = 0; { let p = Fn(\"add\"); let i = 0; while i < 3 { s = p.call(s, i); i += 1; } } s"),
     // The same through a name that is not a constant, so Rhai's optimizer
     // cannot fold it into a pointer carrying an environment.
     case("fn_ptr_from_dynamic_name", "fn triple(x) { x * 3 } let n = \"trip\" + \"le\"; let f = Fn(n); f.call(4)"),
@@ -832,6 +844,24 @@ pub const CASES: &[Case] = &[
     case("is_shared_after_capture", "let x = 1; let r = false; { let f = || x; r = is_shared(f); } [is_shared(x), r]"),
     case("closure_in_map", "[1, 2, 3].map(|x| x * 2)"),
     case("closure_in_filter", "[1, 2, 3, 4].filter(|x| x % 2 == 0)"),
+    // Everything above captures out of the top-level scope, which lives for the
+    // whole run. These capture out of a *call's* scope, which does not: the
+    // callee's scope is emptied when the call ends and the VM may lend it to
+    // the next call ([`Vm::take_scope`]). A closure holding a cell that came
+    // out of one is the case where lending would be visible if what was lent
+    // were an entry rather than an array — the second call would answer with
+    // the first call's value, or the closure with the second call's.
+    //
+    // Three calls with two pointers still alive across the third, so a lent
+    // scope has to be handed on twice before the answers are read.
+    case("closure_captures_a_callees_local", "fn make(k) { let t = k; || t } let r = 0; { let p = make(1); let q = make(2); make(3); r = p.call() * 10 + q.call(); } r"),
+    // The same with the calls after the capture rather than around it, so the
+    // pointer is read once every later call has had the scope.
+    case("closure_outlives_later_calls_to_its_maker", "fn make(k) { let t = k; || t } let r = 0; { let p = make(1); make(2); make(3); r = p.call(); } r"),
+    // And a write through the cell rather than a read, since a write is what
+    // severs silently: the second call must see its own argument, not the
+    // first call's incremented one.
+    case("closure_writes_a_callees_local", "fn bump(k) { let t = k; { let g = || t += 1; g.call(); } t } bump(1) + bump(10)"),
     // --- chained lvalues --------------------------------------------------
     // Each of these needs a different `Target` variant and its write-back.
     case("index_assign_array", "let a = [1, 2, 3]; a[1] = 99; a"),
@@ -1132,6 +1162,11 @@ pub const CASES: &[Case] = &[
     case("this_as_first_argument", "fn grow() { push(this, 3); } let a = [1, 2]; a.grow(); a"),
     case("this_as_first_argument_pure", "fn size() { len(this) } let a = [1, 2]; a.size()"),
     case("this_as_a_later_argument", "fn plus(n) { n + this } let v = 1; v.plus(2)"),
+    // The same site taken repeatedly. A chained method call starts a scope of
+    // its own, and the VM may lend that scope on to the next call
+    // ([`Vm::take_scope`]) — which a single call cannot distinguish from
+    // building one, so the loop is the assertion.
+    case("this_method_call_repeated", "fn plus(k) { this + k } let s = 0; let i = 0; while i < 3 { s = s.plus(i); i += 1; } s"),
     // Arity excludes the receiver, so these are two different functions.
     case("this_method_arity", "fn f() { 1 } fn f(x) { this + x } let v = 10; [v.f(), v.f(5)]"),
     // `obj.call(f)` binds `obj` as the closure's `this` by reference, so a
