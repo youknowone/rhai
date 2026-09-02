@@ -71,6 +71,14 @@ pub struct GlobalRuntimeState {
     /// Where a Grain program failed, innermost frame first.
     #[cfg(feature = "grain")]
     pub(crate) grain_faults: Option<crate::Shared<crate::Locked<Vec<crate::grain::Fault>>>>,
+    /// What the run's finished crossings left for its next one.
+    ///
+    /// Carried here because a native calling a compiled function back is handed
+    /// a `NativeCallContext` and nothing else, and this state is the part of it
+    /// the run owns. `Some` only for a run that installed the callback wrappers
+    /// — see `Vm::eval_with_callbacks` and `grain::vm::callback`.
+    #[cfg(feature = "grain")]
+    pub(crate) grain_crossings: Option<crate::grain::CrossingPool>,
     /// Custom state that can be used by the external host.
     pub tag: Dynamic,
     /// Debugging interface.
@@ -107,6 +115,8 @@ impl Engine {
 
             #[cfg(feature = "grain")]
             grain_faults: None,
+            #[cfg(feature = "grain")]
+            grain_crossings: None,
 
             tag: self.default_tag().clone(),
 

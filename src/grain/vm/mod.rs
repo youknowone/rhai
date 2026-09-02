@@ -53,6 +53,18 @@ use crate::grain::bytecode::{
 };
 use crate::grain::program::{Program, SharedModule, SharedProgram};
 
+pub(crate) use callback::CrossingPool;
+
+/// The pool the run a crossing arrived from is lending, if it lends one.
+///
+/// Reached through the state rather than through the closure that was called,
+/// because that state is what a crossing inherits and a closure is not: see
+/// [`callback::Crossings`].
+#[must_use]
+fn crossing_pool<'a>(context: &'a NativeCallContext<'_>) -> Option<&'a CrossingPool> {
+    context.global_runtime_state().grain_crossings.as_ref()
+}
+
 /// Rhai's own `RhaiResult`, which it does not re-export.
 pub type VmResult = Result<Dynamic, Box<EvalAltResult>>;
 
@@ -1102,6 +1114,222 @@ impl GrainFrame<'_, '_> {
     }
 }
 
+/// What a resolution cache was filled against, and so what it may answer for.
+///
+/// `resolve_fn` keys its cache on a hash of the name and the argument types
+/// alone (`func/call.rs:221-223`), and then searches the function libraries,
+/// the engine's modules and the imported ones (`func/call.rs:238-262`) — so
+/// what the cache means depends on a set the key does not name. Rhai carries
+/// one `Caches` across a whole evaluation and reaches for the same three
+/// answers under every library it stacks, clearing or layering the cache only
+/// where an `import` brings global functions (`eval/stmt.rs:88-100`). A pool
+/// spans no more than that evaluation, so it could rest on the same argument.
+///
+/// It does not. The set is recorded and compared instead, because the one
+/// thing that must never happen is a cache filled against one engine being
+/// consulted by another — which the engine address alone settles, and which
+/// the libraries beside it settle for a run whose crossings do not all arrive
+/// through the same environment.
+///
+/// Identities rather than counts: [`num_imports`] keys an entry that cannot
+/// outlive a frame, and a frame is a span across which none of this can
+/// change; a pool is not.
+#[derive(Default, PartialEq, Eq)]
+struct Searched {
+    /// The engine whose registrations the search reached, as an address.
+    ///
+    /// A run holds the engine by shared reference and registering wants it by
+    /// mutable one, so an engine cannot gain a function while a pool that
+    /// searched it is alive — the pool belongs to the run
+    /// ([`Vm::eval_with_callbacks`]) and dies with it.
+    engine: usize,
+    /// The function libraries stacked around the call, each as the address of
+    /// the module it shares.
+    #[cfg(not(feature = "no_function"))]
+    lib: crate::StaticVec<usize>,
+    /// The modules imported at the call, the same way.
+    #[cfg(not(feature = "no_module"))]
+    imports: crate::StaticVec<usize>,
+}
+
+impl Searched {
+    /// What a crossing running against this state searches.
+    ///
+    /// Recorded once, as a crossing ends, rather than on both sides of the
+    /// pool: the state a cache was last filled under is the state the crossing
+    /// finished in, and [`Searched::matches`] answers the other half without
+    /// building anything.
+    fn of(engine: &Engine, global: &GlobalRuntimeState) -> Self {
+        Self {
+            engine: engine as *const Engine as usize,
+            #[cfg(not(feature = "no_function"))]
+            lib: global.lib.iter().map(module_address).collect(),
+            #[cfg(not(feature = "no_module"))]
+            imports: global
+                .scan_imports_raw()
+                .map(|(_, module)| module_address(module))
+                .collect(),
+        }
+    }
+
+    /// Whether a crossing about to run against this state searches the same.
+    fn matches(&self, engine: &Engine, global: &GlobalRuntimeState) -> bool {
+        if self.engine != engine as *const Engine as usize {
+            return false;
+        }
+        #[cfg(not(feature = "no_function"))]
+        if self.lib.len() != global.lib.len()
+            || self
+                .lib
+                .iter()
+                .zip(global.lib.iter())
+                .any(|(&was, module)| was != module_address(module))
+        {
+            return false;
+        }
+        #[cfg(not(feature = "no_module"))]
+        if self.imports.len() != global.num_imports()
+            || self
+                .imports
+                .iter()
+                .zip(global.scan_imports_raw())
+                .any(|(&was, (_, module))| was != module_address(module))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+/// A shared module named by where it is, which is the only way to ask whether
+/// two libraries hold the same one.
+#[cfg(any(not(feature = "no_function"), not(feature = "no_module")))]
+#[inline]
+#[must_use]
+fn module_address(module: &SharedModule) -> usize {
+    crate::Shared::as_ptr(module) as usize
+}
+
+/// The parts of a [`Vm`] that one crossing may hand to the next.
+///
+/// A crossing builds a whole `Vm` per element a native calls back over
+/// ([`callback::invoke`]), and the module doc for [`mod@callback`] names what
+/// that costs: a second VM whose resolution cache starts empty. Everything
+/// here is what a later crossing may inherit so that it does not.
+///
+/// Split out as a value rather than reached through a flag, so that
+/// [`Vm::reentrant`] *is* the pooled constructor called with a cold
+/// [`Warm::new`]. A reused `Vm` is then indistinguishable from a fresh one by
+/// construction: a field is either named here, and carried, or seeded from the
+/// [`NativeCallContext`] on every crossing exactly as it was.
+///
+/// What may be carried is what answers a question the context cannot change:
+///
+/// * `caches` is Rhai's function-resolution cache. It is the whole cost this
+///   exists to remove, and the only part whose answer depends on anything
+///   outside the `Vm` — hence [`Searched`] beside it.
+/// * `strings_interner` maps text to an `ImmutableString` and nothing else.
+/// * `stack`, `scopes`, `iterators`, `handlers`, `sizes` and `pending_steps`
+///   are storage. Each is empty when a crossing ends — the operand stack
+///   because every slot at or above the depth holds unit (see [`Vm::stack`])
+///   and the crossing's frame truncated the depth to zero, the others because
+///   [`Vm::execute`] floors them to what it found — so what carries over is an
+///   allocation and never a value. [`Warm::reset`] states that rather than
+///   assuming it.
+/// * `operator_memo`, `call_memo` and `last_generation` **travel together or
+///   not at all**. An entry is readable only by the generation that stamped
+///   it, and [`Vm::execute`] mints one by incrementing `last_generation`.
+///   Carrying the tables while restarting the counter would hand a frame a
+///   number an entry of an earlier crossing already holds — a hit on a memo of
+///   another program, which is a wrong answer rather than a slow one. Carried
+///   together, a generation is still never handed out twice and every entry
+///   from an earlier crossing is unreadable, which is exactly the guarantee
+///   two frames of one `Vm` have. See [`Vm::generation`].
+///
+/// What is not named here is not carried. `global` is cloned from the context
+/// on every crossing and is what holds the call level, the source, the
+/// function library and the operation count; `depth`, `generation`, `this`,
+/// `owns_trace`, `chain_step`, `pending_slot` and `unwind_floor` belong to the
+/// frame and start where a fresh `Vm` starts them; `callbacks` is the share of
+/// the program this crossing came out of, and is dropped rather than lent so
+/// that a pool never keeps a program alive.
+pub(super) struct Warm {
+    caches: Caches,
+    searched: Searched,
+    strings_interner: StringsInterner,
+    stack: Vec<OperandSlot>,
+    scopes: crate::StaticVec<Scope<'static>>,
+    iterators: Vec<Iteration>,
+    handlers: Vec<Handler>,
+    sizes: Vec<(usize, usize, usize)>,
+    operator_memo: [OperatorMemo; OPERATOR_MEMO_SLOTS],
+    call_memo: Option<Box<CallMemoTable>>,
+    last_generation: u64,
+    #[cfg(feature = "debugging")]
+    pending_steps: Vec<(usize, u16, crate::eval::DebuggerStatus)>,
+}
+
+impl Warm {
+    /// Nothing carried, which is what a crossing that inherits nothing gets.
+    ///
+    /// Every value here is the one [`Vm::new`] uses, so a `Vm` built on this is
+    /// the `Vm` a crossing built before there was a pool.
+    #[must_use]
+    pub(super) fn new() -> Self {
+        Self {
+            caches: Caches::new(),
+            searched: Searched::default(),
+            strings_interner: StringsInterner::new(256),
+            stack: Vec::new(),
+            scopes: crate::StaticVec::new(),
+            iterators: Vec::new(),
+            handlers: Vec::new(),
+            sizes: Vec::new(),
+            operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
+            call_memo: None,
+            last_generation: 0,
+            #[cfg(feature = "debugging")]
+            pending_steps: Vec::new(),
+        }
+    }
+
+    /// Make this fit to be lent to a crossing arriving with this state.
+    ///
+    /// The resolution cache is the one part that can be wrong rather than
+    /// merely cold, so it is thrown away exactly when what it was filled
+    /// against is no longer what is being searched. Everything else is storage,
+    /// or is keyed on a generation this carries, and neither depends on the
+    /// libraries. See [`Searched`].
+    fn fit(&mut self, engine: &Engine, global: &GlobalRuntimeState) {
+        if !self.searched.matches(engine, global) {
+            self.caches = Caches::new();
+        }
+    }
+
+    /// Empty this out, the way [`Vm::give_scope`] empties a scope it takes
+    /// back.
+    ///
+    /// Everything here is already empty — the field list above says why — and
+    /// clearing regardless is what makes that a property of this type rather
+    /// than of every path that reaches it. A `clear` on an empty container is
+    /// a length store, and the capacity is what was worth keeping.
+    ///
+    /// The cache stack is rewound to its bottom layer on the same terms. That
+    /// layer is the one a crossing of this run filled; anything above it was
+    /// pushed by a nesting inside the crossing that has since ended, and Rhai
+    /// rewinds those itself (`func/script.rs:94,206`).
+    fn reset(&mut self) {
+        if self.caches.fn_resolution_caches_len() > 1 {
+            self.caches.rewind_fn_resolution_caches(1);
+        }
+        self.iterators.clear();
+        self.handlers.clear();
+        self.sizes.clear();
+        #[cfg(feature = "debugging")]
+        self.pending_steps.clear();
+    }
+}
+
 /// Executes a [`Program`] against an `Engine`.
 ///
 /// Holds one `GlobalRuntimeState` and one `Caches` for its whole lifetime, so
@@ -1333,28 +1561,42 @@ impl<'e> Vm<'e> {
     /// its own.
     ///
     /// The empty `Caches` is the cost, and it is the one thing a `Vm` normally
-    /// exists to avoid. It cannot be helped: the outer `Vm` is borrowed by the
-    /// frame still running beneath this one — and it is what is left of the
-    /// difference now that a pointer this program hands out carries its body
-    /// and is called without being resolved, as Rhai's own is. A crossing
-    /// measures 0.87x. See the `callback` module.
+    /// exists to avoid. The outer `Vm` cannot lend its own: it is borrowed by
+    /// the frame still running beneath this one. What one crossing can lend the
+    /// next is the subject of `grain::vm::callback`, and this constructor is
+    /// that one called with nothing lent.
     ///
-    /// Operation counting has the same shape and the same reason: increments
-    /// inside the callback land on the clone and are lost when it drops, as
+    /// Operation counting has the same shape and the same reason as the clone:
+    /// increments inside the callback land on it and are lost when it drops, as
     /// they are for any reentrant call Rhai makes.
     #[must_use]
     pub fn reentrant(context: &'e NativeCallContext<'_>) -> Self {
+        Self::reentrant_from(context, Warm::new())
+    }
+
+    /// The same, with the parts an earlier crossing finished with.
+    ///
+    /// Every field the context decides is seeded here on every crossing, and
+    /// every field [`Warm`] names is taken from it — so the two are exhaustive
+    /// between them and a reused `Vm` differs from a fresh one only in what
+    /// [`Warm`] argues may differ.
+    #[must_use]
+    pub(super) fn reentrant_from(context: &'e NativeCallContext<'_>, mut warm: Warm) -> Self {
+        let engine = context.engine();
+        let global = context.global_runtime_state().clone();
+        warm.fit(engine, &global);
+
         Self {
-            engine: context.engine(),
-            global: context.global_runtime_state().clone(),
-            caches: Caches::new(),
-            strings_interner: StringsInterner::new(256),
-            stack: Vec::new(),
+            engine,
+            global,
+            caches: warm.caches,
+            strings_interner: warm.strings_interner,
+            stack: warm.stack,
             depth: 0,
-            scopes: crate::StaticVec::new(),
-            iterators: Vec::new(),
-            handlers: Vec::new(),
-            sizes: Vec::new(),
+            scopes: warm.scopes,
+            iterators: warm.iterators,
+            handlers: warm.handlers,
+            sizes: warm.sizes,
             unwind_floor: 0,
             // A crossing carries no receiver: Rhai binds one only where it
             // dispatches a method, and this arrives through `call_fn_raw`.
@@ -1364,21 +1606,57 @@ impl<'e> Vm<'e> {
             owns_trace: false,
             chain_step: 0,
             pending_slot: None,
-            // A memo names a site in a frame of this `Vm`, and a crossing has
-            // none yet.
-            operator_memo: [OperatorMemo::EMPTY; OPERATOR_MEMO_SLOTS],
-            call_memo: None,
+            // A memo names a site in a frame, and the counter that names frames
+            // comes with the tables. See [`Warm`].
+            operator_memo: warm.operator_memo,
+            call_memo: warm.call_memo,
             // Set by [`callback::invoke`], which has the share of the program
             // this crossing came out of. A crossing reached any other way has
             // none, and hands out the pointers it can rather than none at all.
             callbacks: None,
             generation: 0,
-            last_generation: 0,
+            last_generation: warm.last_generation,
             // A step belongs to the statement that asked for it, and that
             // statement is running in the `Vm` this crossing came from.
             #[cfg(feature = "debugging")]
-            pending_steps: Vec::new(),
+            pending_steps: warm.pending_steps,
         }
+    }
+
+    /// The parts of a finished crossing, for the next one to start from.
+    ///
+    /// Consumes the `Vm`, so every borrow of what is handed over has ended —
+    /// the same thing that makes [`Vm::give_scope`] safe. What is not taken is
+    /// dropped here, which is where the share of the program the crossing
+    /// carried goes.
+    #[must_use]
+    pub(super) fn cool(mut self) -> Warm {
+        // The frame the crossing ran left the depth where it found it, so this
+        // is already zero; doing it anyway is what lets [`Warm`] say the stack
+        // it lends holds nothing, rather than assuming the caller's path.
+        self.truncate_stack(0);
+
+        // Before anything moves: what the cache in hand was last filled
+        // against is the state the crossing finished in.
+        let searched = Searched::of(self.engine, &self.global);
+
+        let mut warm = Warm {
+            caches: self.caches,
+            searched,
+            strings_interner: self.strings_interner,
+            stack: self.stack,
+            scopes: self.scopes,
+            iterators: self.iterators,
+            handlers: self.handlers,
+            sizes: self.sizes,
+            operator_memo: self.operator_memo,
+            call_memo: self.call_memo,
+            last_generation: self.last_generation,
+            #[cfg(feature = "debugging")]
+            pending_steps: self.pending_steps,
+        };
+        warm.reset();
+        warm
     }
 
     /// Where the last run failed, innermost frame first.
@@ -1490,19 +1768,26 @@ impl<'e> Vm<'e> {
         level: usize,
         pos: Position,
     ) -> VmResult {
-        let scope = &mut Scope::new();
-        self.call_function_with_this(
-            program,
-            name,
-            Some(index),
-            args,
-            level,
-            scope,
-            true,
-            pos,
-            None,
-        )
-        .0
+        // Lent rather than built, which the entry point above cannot do: the
+        // scope a call binds into is this `Vm`'s to hand out, and the two
+        // arrays a fresh one reserves on its first push are two allocations
+        // per crossing. See [`Vm::take_scope`].
+        let mut detached = self.take_scope();
+        let result = self
+            .call_function_with_this(
+                program,
+                name,
+                Some(index),
+                args,
+                level,
+                &mut detached,
+                true,
+                pos,
+                None,
+            )
+            .0;
+        self.give_scope(detached);
+        result
     }
 
     /// The same, against a receiver the callee owns for the duration.
@@ -1784,7 +2069,16 @@ impl<'e> Vm<'e> {
         // Put back rather than cleared: a `Vm` reentered from a callback is
         // running the program its own field already names.
         let outer = mem::replace(&mut self.callbacks, Some(program.clone()));
+        // The same for the pool the crossings of this run share, and on the
+        // same condition as the wrappers: a program with no compiled functions
+        // has no pointer to hand out and so nothing can cross back into it.
+        // Installed here and nowhere else, so that a pool holds the engine this
+        // run holds for exactly as long as this run does — see
+        // `callback::Crossings`.
+        let pool = wrappers.is_some().then(callback::pool);
+        let outer_pool = mem::replace(&mut self.global.grain_crossings, pool);
         let result = self.run_with(program, scope, wrappers);
+        self.global.grain_crossings = outer_pool;
         self.callbacks = outer;
         result
     }

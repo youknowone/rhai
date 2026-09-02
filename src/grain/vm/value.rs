@@ -130,6 +130,21 @@ mod tests {
     /// is what says [`release`] ran a destructor it was not allowed to skip.
     static CUSTOMS: core::sync::atomic::AtomicIsize = core::sync::atomic::AtomicIsize::new(0);
 
+    /// The count above is one cell for the whole process and the harness runs
+    /// tests in parallel, so every test that makes a `Custom` holds this for as
+    /// long as it has one alive. Without it the test that reads the count sees
+    /// another test's values come and go.
+    static COUNTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Hold [`COUNTING`], whether or not an earlier failure left it poisoned:
+    /// what it guards is a count, and a panic elsewhere does not make this
+    /// test's own arithmetic unsound.
+    fn counting() -> std::sync::MutexGuard<'static, ()> {
+        COUNTING
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// A type with no `Union` variant of its own — the `Union::Variant` arm,
     /// which clones through `Variant::clone_object` and owns two boxes.
     #[derive(Debug)]
@@ -201,6 +216,7 @@ mod tests {
 
     #[test]
     fn a_fast_copy_reads_as_the_clone_it_replaces() {
+        let _counting = counting();
         for value in every_variant() {
             assert_eq!(
                 reading(&clone_value(&value)),
@@ -238,6 +254,7 @@ mod tests {
     /// count of a type that counts itself is what says so.
     #[test]
     fn releasing_a_value_that_owns_something_still_drops_it() {
+        let _counting = counting();
         let before = CUSTOMS.load(Ordering::Relaxed);
         for value in every_variant() {
             release(value);
@@ -259,6 +276,7 @@ mod tests {
     /// variant the slot held.
     #[test]
     fn overwriting_a_slot_leaves_the_new_value() {
+        let _counting = counting();
         for value in every_variant() {
             let mut slot = value;
             overwrite(&mut slot, Dynamic::from(9 as crate::INT));

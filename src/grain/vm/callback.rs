@@ -22,11 +22,18 @@
 //!
 //! # What being a native costs
 //!
-//! A crossing is a boundary out of the VM and back into a second one whose
-//! resolution cache starts empty, which the walker does not pay — it stays
-//! inside itself and reaches the closure body directly. `native callbacks` in
-//! `examples/grain_bench.rs` measures 0.87x, the one case the VM loses, and a
-//! crossing costs 4 call levels against the walker's 2.
+//! A crossing is a boundary out of the VM and back into a second one, which the
+//! walker does not pay — it stays inside itself and reaches the closure body
+//! directly. `native callbacks` in `examples/grain_bench.rs` is the one case
+//! the VM loses, and a crossing costs 4 call levels against the walker's 2.
+//!
+//! The second `Vm` is per *element*, because that is how often a native calls
+//! back: `[..500 elements].map(|x| x * 2)` crosses five hundred times. Building
+//! one is not what that costs — what it costs is that everything a `Vm` exists
+//! to accumulate starts empty each time, above all the resolution cache. So the
+//! crossings of one run share a pool of the parts a finished crossing can hand
+//! to the next: see [`Crossings`] for where it lives and [`Warm`] for what may
+//! travel in it and what may not.
 //!
 //! None of this touches a pointer called directly from compiled code, which is
 //! `Op::CallFnPtr` and never comes through here.
@@ -39,11 +46,76 @@ use std::prelude::v1::*;
 use crate::types::fn_ptr::FnPtrType;
 use crate::{
     func::{FnCallArgs, RhaiFunc},
-    Dynamic, FnArgsVec, FuncRegistration, Module, NativeCallContext, Shared, SmartString,
+    Dynamic, FnArgsVec, FuncRegistration, Locked, Module, NativeCallContext, Shared, SmartString,
 };
 
-use super::{malformed, Vm, VmResult};
+use super::{malformed, Vm, VmResult, Warm};
 use crate::grain::program::SharedProgram;
+
+/// The parts finished crossings of one run left behind, for its next crossing.
+///
+/// A pool rather than a slot, for the reason [`Vm::take_scope`] is one: a
+/// crossing can be live while another begins. `a.map(|x| x.map(|y| y))` has two
+/// at once, and so does anything a callback calls that calls back again — so
+/// what is lent has to be taken out and given back rather than borrowed from a
+/// place both could reach. Nothing is ever lent twice, because a take removes
+/// it.
+///
+/// It grows to the deepest crossings have nested and no further, which is what
+/// `max_call_levels` bounds wherever `unchecked` is off.
+///
+/// # Where this lives
+///
+/// In the run's `GlobalRuntimeState`, beside `grain_faults` and for the same
+/// reason: that is the one thing a crossing is handed. `Vm::reentrant` clones
+/// it from the [`NativeCallContext`], so every crossing of a run — including
+/// one nested inside another, and one reached through a wrapper rather than
+/// through a pointer — finds the same pool, and a crossing arriving from a run
+/// that has none finds none.
+///
+/// The alternatives are worse in a way that is about correctness rather than
+/// taste. A pool captured by the [`pointer`] closure would outlive its run: a
+/// closure handed back to the host is called again later, and by then the
+/// engine may have been registered into — `Engine::register_fn` wants the
+/// engine by mutable reference, which only holds while no run is using it. A
+/// resolution cache that survived across that gap could answer "no such
+/// function" for one that now exists. Held by the run, a pool cannot span a
+/// registration, because the run holds the engine by shared reference for
+/// exactly as long as the pool exists. A thread-local has the same problem and
+/// adds one this crate does not otherwise have.
+pub(crate) struct Crossings {
+    warm: Vec<Warm>,
+}
+
+/// What a run hands its crossings, or [`None`] where a run pools nothing.
+pub(crate) type CrossingPool = Shared<Locked<Crossings>>;
+
+/// A pool for a run that is about to install the wrappers.
+#[must_use]
+pub(super) fn pool() -> CrossingPool {
+    Shared::new(Locked::new(Crossings { warm: Vec::new() }))
+}
+
+/// Whatever an earlier crossing of this run left, or nothing carried at all.
+///
+/// A pool that cannot be locked lends nothing rather than waiting: what is on
+/// the other side is another crossing of this run holding it open, and a cold
+/// `Warm` is the same answer a moment earlier would have given.
+#[must_use]
+fn take(pool: Option<&CrossingPool>) -> Warm {
+    pool.and_then(|pool| crate::func::native::locked_write(pool)?.warm.pop())
+        .unwrap_or_else(Warm::new)
+}
+
+/// Put a finished crossing's parts back for the next one.
+fn give(pool: Option<&CrossingPool>, warm: Warm) {
+    let Some(pool) = pool else {
+        return;
+    };
+    if let Some(mut pool) = crate::func::native::locked_write(pool) {
+        pool.warm.push(warm);
+    }
+}
 
 /// The most parameters a wrapper is registered for.
 ///
@@ -200,18 +272,27 @@ fn invoke(
     context: &NativeCallContext,
     values: FnArgsVec<Dynamic>,
 ) -> VmResult {
-    let mut vm = Vm::reentrant(context);
+    // Held across the call rather than looked up twice: the run this crossing
+    // came out of is what owns the pool, and it is still running underneath.
+    let pool = super::crossing_pool(context);
+    let mut vm = Vm::reentrant_from(context, take(pool));
     // The share this crossing came out of, so a pointer the chunk creates
     // carries its body too. See [`pointer`].
     vm.callbacks = Some(program.clone());
-    vm.call_function_at(
+    let result = vm.call_function_at(
         program,
         index,
         name,
         values,
         context.call_level(),
         context.call_position(),
-    )
+    );
+    // However the call ended. A crossing that raised leaves its parts as
+    // empty as one that returned — [`Vm::execute`] floors the three stacks on
+    // both paths and the frame truncates the operands — and the resolution
+    // work it did is worth no less for having been followed by an error.
+    give(pool, vm.cool());
+    result
 }
 
 #[cfg(test)]
@@ -219,7 +300,7 @@ fn invoke(
 mod tests {
     use super::*;
     use crate::grain::Compiler;
-    use crate::{Engine, FnPtr, Scope};
+    use crate::{Engine, FnPtr, Position, Scope};
 
     /// The value a source runs to, with the wrappers installed.
     fn value_of(source: &str) -> Dynamic {
@@ -252,6 +333,108 @@ mod tests {
     #[test]
     fn a_closure_is_handed_out_carrying_its_body() {
         assert!(carries_its_body(value_of("|x| x * 2")));
+    }
+
+    /// One chunk called the way a crossing calls it, over and over, with the
+    /// parts of each call handed to the next.
+    ///
+    /// Reaches [`invoke`]'s two halves without a native in between, which is
+    /// what lets a test ask what the parts *are* rather than only what the
+    /// script answered.
+    fn crossings(source: &str, name: &str, times: usize, carry: bool) -> (Vec<u64>, Warm) {
+        let engine = Engine::new();
+        let ast = engine.compile(source).unwrap();
+        let program = Compiler::new().compile(&ast).into_shared();
+        let index = program
+            .functions()
+            .iter()
+            .find(|function| program.name(function.name) == Some(name))
+            .expect("the source declares it")
+            .name;
+
+        let global = engine.new_global_runtime_state();
+        let context: NativeCallContext = (&engine, name, None, &global, Position::NONE).into();
+
+        let mut generations = Vec::new();
+        let mut warm = Warm::new();
+        for turn in 0..times {
+            let mut vm = Vm::reentrant_from(&context, warm);
+            vm.callbacks = Some(program.clone());
+            let mut values = FnArgsVec::new();
+            values.push(Dynamic::from(turn as crate::INT));
+            drop(
+                vm.call_function_at(&program, index, name, values, 0, Position::NONE)
+                    .expect("the chunk runs"),
+            );
+            generations.push(vm.last_generation);
+            warm = vm.cool();
+            if !carry {
+                warm = Warm::new();
+            }
+        }
+        (generations, warm)
+    }
+
+    /// The counter that names frames travels with the tables it stamps.
+    ///
+    /// This is what makes a lent memo unreadable rather than wrong: a crossing
+    /// that inherited the tables must not be handed a number an entry of the
+    /// crossing before it already carries. The cold column is the same run with
+    /// nothing carried, and its repetition is exactly what would be a hit.
+    #[test]
+    fn a_carried_memo_never_sees_a_generation_twice() {
+        let source = "fn f(x) { x * 2 }";
+        let (carried, ..) = crossings(source, "f", 4, true);
+        let (cold, ..) = crossings(source, "f", 4, false);
+
+        assert!(carried.windows(2).all(|pair| pair[0] < pair[1]), "{carried:?}");
+        assert_eq!(cold, vec![cold[0]; cold.len()], "{cold:?}");
+    }
+
+    /// And the resolution cache is what actually carries.
+    ///
+    /// A chunk that reaches Rhai's dispatch fills one layer; a crossing that
+    /// inherits it starts from that layer rather than from nothing, which is
+    /// the whole cost the module doc names.
+    #[test]
+    fn a_crossing_hands_on_the_resolution_cache_it_filled() {
+        assert_eq!(Warm::new().caches.fn_resolution_caches_len(), 0);
+        let (.., warm) = crossings("fn f(x) { abs(0 - x - 1) }", "f", 2, true);
+        assert_eq!(warm.caches.fn_resolution_caches_len(), 1);
+    }
+
+    /// A cache is refused to a crossing that does not search what filled it.
+    ///
+    /// Nothing a script can do reaches this — a pool belongs to one run and a
+    /// run holds one engine — so the guard is asserted where it is decided
+    /// rather than through a program.
+    #[test]
+    fn a_cache_filled_against_one_engine_is_not_lent_to_another() {
+        let (.., warm) = crossings("fn f(x) { abs(0 - x - 1) }", "f", 2, true);
+        assert_eq!(warm.caches.fn_resolution_caches_len(), 1);
+
+        let elsewhere = Engine::new();
+        let global = elsewhere.new_global_runtime_state();
+        let context: NativeCallContext = (&elsewhere, "f", None, &global, Position::NONE).into();
+        let vm = Vm::reentrant_from(&context, warm);
+        assert_eq!(vm.caches.fn_resolution_caches_len(), 0);
+    }
+
+    /// Nothing a crossing held is still in what it hands on.
+    ///
+    /// The operand stack keeps its allocation and gives up every slot, and the
+    /// four stacks beside it come back empty however the crossing ended. A
+    /// value left in any of them would reach the next crossing as its own.
+    #[test]
+    #[cfg(not(feature = "no_index"))]
+    fn a_crossing_hands_on_no_values() {
+        let source = "fn f(x) { let a = [x, x + 1]; let t = x; for i in a { t += i; } t }";
+        let (.., warm) = crossings(source, "f", 3, true);
+        assert!(warm.stack.iter().all(|slot| super::super::operand_ref(slot).is_unit()));
+        assert!(warm.iterators.is_empty());
+        assert!(warm.handlers.is_empty());
+        assert!(warm.sizes.is_empty());
+        assert!(warm.scopes.iter().all(Scope::is_empty));
     }
 
     /// Including one made inside a callback, which is a second `Vm` holding a

@@ -285,8 +285,14 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "closure_for_each_binds_this"
             | "closure_in_filter"
             | "closure_in_map"
+            | "closure_made_inside_a_callback"
             | "closure_map_binds_this"
+            | "closure_map_body_with_a_local"
+            | "closure_map_nested"
+            | "closure_map_raises_partway"
+            | "closure_map_repeated"
             | "closure_map_takes_an_argument"
+            | "closure_map_then_filter"
             | "closure_shared_chain_root"
             | "const_root_index_read"
             | "empty_literals_nested_in_computed_ones"
@@ -416,8 +422,14 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "closure_for_each_binds_this"
                 | "closure_in_filter"
                 | "closure_in_map"
+                | "closure_made_inside_a_callback"
                 | "closure_map_binds_this"
+                | "closure_map_body_with_a_local"
+                | "closure_map_nested"
+                | "closure_map_raises_partway"
+                | "closure_map_repeated"
                 | "closure_map_takes_an_argument"
+                | "closure_map_then_filter"
                 | "closure_outlives_later_calls_to_its_maker"
                 | "closure_shared_op_assign"
                 | "closure_shared_write"
@@ -1195,6 +1207,35 @@ pub const CASES: &[Case] = &[
     case("closure_for_each_binds_this", "let t = 0; [1, 2, 3].for_each(|| t += this); t"),
     // And the argument form, which takes the element as a parameter instead.
     case("closure_map_takes_an_argument", "[1, 2, 3].map(|x| x * 2)"),
+    // A crossing hands what it finished with to the next one, so what one
+    // leaves has to be invisible to the next. Each of these is a shape where
+    // something lent that should not have been would answer differently, and
+    // none of them can be told from a crossing that inherits nothing by
+    // anything but its answer. See `grain::vm::callback`.
+    //
+    // Nested first, because that is where two crossings are live at once and
+    // the inner one cannot be handed what the outer is still using.
+    case("closure_map_nested", "let a = [[1, 2], [3, 4]]; a.map(|r| r.map(|x| x * 2))"),
+    // Repeated further than a pool can be primed by, over a body whose answer
+    // depends on its own argument and nothing else.
+    case("closure_map_repeated", "let a = []; for i in 0..40 { a.push(i); } a.map(|x| x * x)"),
+    // Two crossings of one run through two different bodies, so what the
+    // second inherits was filled by a chunk that is not its own.
+    case("closure_map_then_filter", "let a = [1, 2, 3, 4, 5, 6]; let b = a.map(|x| x * 3); b.filter(|x| x % 2 == 0)"),
+    // A body with a local, so every crossing binds a scope the one before it
+    // gave back — and a longer array than the pool holds entries.
+    case("closure_map_body_with_a_local", "let a = [1, 2, 3, 4]; a.map(|x| { let t = x + 1; t * t })"),
+    // A crossing that raises. Its parts go back however it ended, and the
+    // crossings after it have to be as clean as the ones before it.
+    case("closure_map_raises_partway", "let a = [1, 2, 3]; let r = 0; try { a.map(|x| if x == 2 { throw x } else { x }); } catch (e) { r = e; } [r, a.map(|x| x + 1)]"),
+    // A closure made inside a crossing and called after every later crossing
+    // has had the parts: the cell it captured came out of a scope the pool
+    // lends on, which is where lending an entry rather than an array would be
+    // visible. The maker is a named function because an anonymous one declared
+    // inside a callback body is still a fragment, and a fragment would hand the
+    // whole thing back to the walker; the pointers are read out into locals
+    // because calling one through an index is a fragment too.
+    case("closure_made_inside_a_callback", "fn make(k) { let t = k * 10; || t } let a = [1, 2]; let r = 0; { let fs = a.map(|x| make(x)); let p = fs[0]; let q = fs[1]; r = p.call() + q.call(); } r"),
     // `type_of` has no registered implementation anywhere — Rhai answers it by
     // name — so it is reached through the same door every other call is.
     // A constant argument is folded by the optimizer and proves nothing.
