@@ -871,6 +871,22 @@ impl Scope<'_> {
                 AccessMode::ReadOnly => None,
             })
     }
+    /// Get a reference to the value of an entry in the [`Scope`] based on the index.
+    ///
+    /// Beside [`Scope::get_mut_by_index`] rather than a use of it: two entries
+    /// cannot be borrowed mutably at once, and an operator applied to the
+    /// values where they live holds a reference to both of its operands.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the index is out of bounds.
+    // Only the build without `grain-jit` reads a scope this way: with it, the
+    // reads go through `jit::scope_entry` so the tracer sees them.
+    #[inline(always)]
+    #[allow(dead_code)]
+    pub(crate) fn get_by_index(&self, index: usize) -> &Dynamic {
+        scope_ref(&self.values[index])
+    }
     /// Get a mutable reference to the value of an entry in the [`Scope`] based on the index.
     ///
     /// # Panics

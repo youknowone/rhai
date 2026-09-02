@@ -206,6 +206,8 @@ pub fn applies_to_this_build(name: &str) -> bool {
             | "error_index_read_float_index"
             | "op_assign_indexed_float"
             | "op_assign_indexed_int_by_float"
+            | "fused_operator_on_two_float_locals"
+            | "fused_compare_and_branch_on_floats"
     ) {
         return false;
     }
@@ -235,6 +237,9 @@ pub fn applies_to_this_build(name: &str) -> bool {
                 | "error_wrong_arity"
                 | "for_over_captured_array"
                 | "for_return_from_body"
+                | "fused_operator_on_a_constant_parameter"
+                | "fused_operator_on_a_constant_parameter_and_a_constant"
+                | "fused_operator_in_a_function_body"
                 | "fn_call_captures_parent_scope"
                 | "guard_operator_on_a_shared_operand"
                 | "is_def_fn"
@@ -628,6 +633,41 @@ pub const CASES: &[Case] = &[
     case("guard_operator_on_strings", r#"let a = "x"; let b = "y"; if a < b { 1 } else { 2 }"#),
     case("guard_operator_on_a_shared_operand", "let a = 1; let b = 2; let r = 0; { let f = || a; if a < b { r = 1; } } r"),
     case("guard_operator_two_comparisons", "let a = 1; let b = 2; if a < b && b < 3 { 1 } else { 2 }"),
+    // A fused operator names its operands, and the arm that answers for a pair
+    // of integers can read them where they are named rather than through a copy
+    // on the operand stack. What that path may not change: which pairs it
+    // answers for, what the result carries, and where the stack is left.
+    //
+    // The pairs it declines are the ones that have to reach the dispatch
+    // below it — a string, a float comparison — and each is spelled in both
+    // exits, the one that pushes a result and the one that is a branch.
+    case("fused_operator_on_two_string_locals", r#"let a = "x"; let b = "y"; let c = a + b; c"#),
+    case("fused_operator_on_a_string_local_and_a_constant", r#"let a = "x"; let c = a + "y"; c"#),
+    case("fused_operator_on_two_float_locals", "let a = 1.5; let b = 2.5; let c = a * b; c"),
+    case("fused_compare_and_branch_on_floats", "let a = 1.5; let b = 2.5; if a < b { 1 } else { 2 }"),
+    // A read-only operand. `p` is a parameter Rhai passes a constant to, so
+    // the slot the operator reads is marked read-only — and `let` keeps
+    // whatever access mode the value it is given carries
+    // (`types/scope.rs:353-355`), so a result that carried the operand's mode
+    // would make `r` a constant and the next line an error.
+    case("fused_operator_on_a_constant_parameter", "fn bump(p) { let d = 2; let r = p + d; r += 1; r } const K = 1; bump(K)"),
+    case("fused_operator_on_a_constant_parameter_and_a_constant", "fn bump(p) { let r = p + 2; r += 1; r } const K = 1; bump(K)"),
+    // The same operators where `base` is not zero, so a slot number is an
+    // offset into the frame rather than into the whole scope.
+    case("fused_operator_in_a_function_body", "fn tally(n) { let s = 0; let i = 0; while i < n { s = s + i; i = i + 1; } s } tally(50)"),
+    // Enough turns that a per-turn drift in the operand stack would be a
+    // different program rather than a slower one: the branch keeps nothing, so
+    // the depth after a turn has to be the depth before it.
+    case("fused_compare_and_branch_runs_many_turns", "let s = 0; let i = 0; while i < 400 { s += i; i += 1; } s"),
+    case("fused_compare_and_branch_against_a_local_runs_many_turns", "let n = 400; let s = 0; let i = 0; while i < n { s += i; i += 1; } s"),
+    // A shared cell is the one thing a by-reference read cannot see through:
+    // the copy reaches a local's value *through* the cell, and a reference
+    // reaches the cell. Both operand positions, and both spellings of the
+    // right-hand one.
+    case("closure_fused_operator_on_a_shared_left_operand", "let a = 1; let b = 2; { let f = || a; } let c = a + b; c"),
+    case("closure_fused_operator_on_a_shared_right_operand", "let a = 1; let b = 2; { let f = || b; } let c = a + b; c"),
+    case("closure_fused_operator_on_a_shared_operand_and_a_constant", "let a = 1; { let f = || a; } let c = a + 1; c"),
+    case("closure_fused_compare_and_branch_on_a_shared_operand", "let a = 1; let b = 2; let s = 0; { let f = || a; let i = 0; while i < 8 { s += a + b; i += 1; } } s"),
     case("error_guard_operator_result_is_not_a_bool", "let i = 1; if i + 1 { 1 } else { 2 }"),
     case("error_guard_operator_fails", "let i = 1; if i / 0 { 1 } else { 2 }"),
     case("error_and_operand_operator_result_is_not_a_bool", "let i = 1; if i + 1 && true { 1 } else { 2 }"),

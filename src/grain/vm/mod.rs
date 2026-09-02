@@ -598,7 +598,13 @@ fn call_site<'m>(
 /// The integer pair is tested first because it has to be: the float rules
 /// cover float/int and int/float but never int/int, and widening two integers
 /// would answer a question Rhai answers with integer arithmetic.
-#[inline]
+///
+/// `inline(always)`, because the dispatch loop asks this from two places — the
+/// operands where they are named and the operands on the stack — and two call
+/// sites are enough for the inliner to give up on a body this size and leave a
+/// call in the arm every operator runs through. The arm is issue-bound rather
+/// than fetch-bound, so the copy is cheaper than the call.
+#[inline(always)]
 fn apply_binary(kind: BinOpKind, lhs: &Dynamic, rhs: &Dynamic) -> RhaiResultOf<Option<Dynamic>> {
     if let (Union::Int(x, ..), Union::Int(y, ..)) = (&lhs.0, &rhs.0) {
         return arith::int_binary(kind, *x, *y);
@@ -5793,33 +5799,16 @@ impl<'e> Vm<'e> {
                     // compiler learns to emit.
                     let form = code::form(tag);
                     let named_is_local = form & code::form::NAMED_IS_LOCAL != 0;
-                    if form & code::form::NAMES_FROM != 0 {
-                        // A fused operator names its operands instead of
-                        // taking them off the stack; pushed here so that
-                        // everything below — the typed arms and the dispatch
-                        // they fall through to — finds them where it always
-                        // did. The two instructions this replaces did exactly
-                        // this and cost two more trips round the dispatch loop
-                        // for it. The left operand is a slot in both
-                        // spellings of this shape; only the right one is
-                        // spelled either way.
-                        let lhs = operand_value!(6, true);
-                        let rhs = operand_value!(8, named_is_local);
-                        self.push(lhs);
-                        self.push(rhs);
-                    } else if form & code::form::NAMES_RHS != 0 {
-                        // Only the right operand is named here; the left is
-                        // already on the stack, where the expression that
-                        // computed it left it.
-                        let rhs = operand_value!(6, named_is_local);
-                        self.push(rhs);
-                    }
                     let typed = form & code::form::TYPED != 0;
 
                     // Whether this instruction is also the branch that reads
                     // its result, and which result takes it. A fused form
                     // carries the target as its last operand, so it sits four
                     // bytes from the end and needs no offset of its own.
+                    //
+                    // Read before the operands are anywhere, because the exit
+                    // below is shared by the path that never puts them on the
+                    // stack at all.
                     let branching = form & code::form::BRANCHES != 0;
                     let taken_when = form & code::form::TAKEN_WHEN != 0;
                     // What the operator's result is for: pushed, or read by
@@ -5853,6 +5842,132 @@ impl<'e> Vm<'e> {
                         }};
                     }
 
+                    // Whether the typed arm below has already been asked about
+                    // this instruction's operands and declined. Set only by
+                    // the direct path, which asks the same question of the
+                    // same values: what it hands `apply_binary` is what the
+                    // copies below would have held, so a second ask has the
+                    // same answer and only the cost is new.
+                    #[allow(unused_mut)]
+                    let mut typed_asked = false;
+
+                    // The operator applied to its named operands where they
+                    // live. The instruction below this one names its operands
+                    // rather than taking them off the stack, and the arm that
+                    // can answer for them reads through a `&Dynamic` — so
+                    // between the two there is a copy onto the stack, a read
+                    // straight back off it, and a truncation that throws both
+                    // slots away. None of that is the operator.
+                    //
+                    // Compiled out under `grain-jit`: there each scope entry
+                    // is boxed behind a residual accessor that hands back
+                    // `&mut Dynamic`, and two of those cannot be alive at once
+                    // — so a named pair has no by-reference spelling there and
+                    // the copy below is the only path.
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        // A named operand where it lives. What `operand_value!`
+                        // reads, without the copy: the same slot, the same
+                        // constant, and the same two errors in the same order
+                        // for a slot that is out of scope and a constant that
+                        // is not there.
+                        macro_rules! named_ref {
+                            ($offset:expr, $is_local:expr) => {{
+                                if $is_local {
+                                    let slot = small!($offset);
+                                    let at = base + slot as usize;
+                                    if at >= scope_len!() {
+                                        return Err(malformed(format!(
+                                            "local slot {slot} is out of scope"
+                                        )));
+                                    }
+                                    scope.get_by_index(at)
+                                } else {
+                                    let index = u32::from(small!($offset));
+                                    or_raise!(
+                                        program.constant(index),
+                                        malformed(format!("no constant {index}"))
+                                    )
+                                }
+                            }};
+                        }
+
+                        let names_from = form & code::form::NAMES_FROM != 0;
+                        if typed
+                            && (names_from || form & code::form::NAMES_RHS != 0)
+                            && fast_operators!()
+                        {
+                            // Where the result belongs. A named pair leaves the
+                            // stack untouched, so the floor is the depth
+                            // itself and `deliver!` truncates nothing; a named
+                            // right-hand operand's left one is on the stack,
+                            // and the result takes its slot. The check is the
+                            // one the typed arm below makes after its pushes,
+                            // and reports the same corrupt artifact.
+                            let floor = if names_from {
+                                self.depth
+                            } else {
+                                or_raise!(self.depth.checked_sub(1), {
+                                    malformed("operator with too few operands".to_string())
+                                })
+                            };
+                            // The left operand of a `NAMES_FROM` instruction is
+                            // a slot in both spellings of that shape; only the
+                            // right one is spelled either way.
+                            let (lhs, rhs) = if names_from {
+                                (named_ref!(6, true), named_ref!(8, named_is_local))
+                            } else {
+                                (stack_ref(self, floor), named_ref!(6, named_is_local))
+                            };
+
+                            // A shared cell declines. The copy below reaches a
+                            // local *through* one — `flatten_clone` reads the
+                            // cell's value out (`types/dynamic.rs:1713-1723`)
+                            // — and a reference cannot flatten, so the value
+                            // this would apply the operator to is the cell and
+                            // not what the copy would have held. Leaving
+                            // `typed_asked` alone is what sends it to the copy
+                            // and to the typed arm below, which is where it was
+                            // answered before.
+                            if !is_shared!(lhs) && !is_shared!(rhs) {
+                                typed_asked = true;
+                                // An unknown kind byte is not an error here, as
+                                // in the typed arm below: the dispatch further
+                                // down reads the operator out of the pool and
+                                // answers whatever it answers.
+                                if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
+                                    if let Some(value) = apply_binary(kind, lhs, rhs)? {
+                                        deliver!(floor, value);
+                                        pc += width;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if form & code::form::NAMES_FROM != 0 {
+                        // A fused operator names its operands instead of
+                        // taking them off the stack; copied here so that
+                        // everything below — the typed arms and the dispatch
+                        // they fall through to — finds them where it always
+                        // did. The two instructions this replaces did exactly
+                        // this and cost two more trips round the dispatch loop
+                        // for it. The left operand is a slot in both
+                        // spellings of this shape; only the right one is
+                        // spelled either way.
+                        let lhs = operand_value!(6, true);
+                        let rhs = operand_value!(8, named_is_local);
+                        self.push(lhs);
+                        self.push(rhs);
+                    } else if form & code::form::NAMES_RHS != 0 {
+                        // Only the right operand is named here; the left is
+                        // already on the stack, where the expression that
+                        // computed it left it.
+                        let rhs = operand_value!(6, named_is_local);
+                        self.push(rhs);
+                    }
+
                     // The typed operator, ahead of every pool read: an
                     // instruction that runs here touches its own bytes, the top
                     // two operands and nothing else.
@@ -5866,7 +5981,7 @@ impl<'e> Vm<'e> {
                     // shared cell — falls through into the dispatch below and
                     // is answered by it. See
                     // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
-                    if typed && fast_operators!() {
+                    if typed && !typed_asked && fast_operators!() {
                         let top = self.depth;
                         let under = or_raise!(top.checked_sub(2), {
                             malformed("operator with too few operands".to_string())
@@ -5876,15 +5991,9 @@ impl<'e> Vm<'e> {
                         // and answers whatever it answers, which is what a
                         // verified program's byte can never make it do.
                         if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
-                            let applied = match apply_binary(
-                                kind,
-                                stack_ref(self, under),
-                                stack_ref(self, top - 1),
-                            ) {
-                                Ok(applied) => applied,
-                                Err(error) => return Err(error),
-                            };
-                            if let Some(value) = applied {
+                            if let Some(value) =
+                                apply_binary(kind, stack_ref(self, under), stack_ref(self, top - 1))?
+                            {
                                 // No position stamped on the way out: under
                                 // `fast_operators` Rhai returns a built-in's
                                 // error untouched, which is why `1 / 0` has
@@ -6893,6 +7002,48 @@ mod tests {
         let mut options = CallFnOptions::new().eval_ast(false);
         options.this_ptr = this;
         Vm::new(&engine).call_fn_with_options(options, &mut Scope::new(), program, "f", ())
+    }
+
+    /// A fused compare-and-branch keeps nothing: the operator's result goes to
+    /// the branch that swallowed it, so a turn of the loop has to leave the
+    /// operand stack at the depth it found it.
+    ///
+    /// Drifting *upwards* is invisible in what the script evaluates to — a
+    /// `Return` truncates to the frame's floor and every other reader is
+    /// relative to the depth — so what says so is the allocation: one slot
+    /// left behind per turn grows the stack past anything the chunk declares,
+    /// and four hundred turns put it two orders of magnitude out.
+    ///
+    #[test]
+    fn a_loop_turn_leaves_the_operand_stack_where_it_found_it() {
+        // Both guard shapes: `i < 400` names both of its operands and so
+        // arrives with the stack untouched, while `(i + 1) <= 400` names only
+        // the right one and finds the left where the operator before it left
+        // it — which is the slot the result has to take.
+        const LOOPS: [&str; 2] = [
+            "let s = 0; let i = 0; while i < 400 { s = s + i; i = i + 1; } s",
+            "let s = 0; let i = 0; while (i + 1) <= 400 { s = s + i; i = i + 1; } s",
+        ];
+
+        let engine = Engine::new();
+        for source in LOOPS {
+            let ast = engine.compile(source).expect("the source parses");
+            let program = crate::grain::Compiler::new().compile(&ast);
+            let ceiling = (program.max_stack() as usize).next_power_of_two().max(8);
+
+            let mut vm = Vm::new(&engine);
+            let value = vm
+                .eval_with_scope(&mut Scope::new(), &program)
+                .expect("the loop runs");
+            assert_eq!(value.as_int(), Ok(79800), "{source}");
+            assert!(
+                vm.stack.len() <= ceiling,
+                "four hundred turns of `{source}` grew the operand stack to {}, \
+                 against a chunk that declares {}",
+                vm.stack.len(),
+                program.max_stack(),
+            );
+        }
     }
 
     #[test]
