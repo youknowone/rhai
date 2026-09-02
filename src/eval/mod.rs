@@ -55,6 +55,17 @@ mod unchecked {
             Ok(())
         }
 
+        /// [`Engine::track_operation`], asking for the position only when one
+        /// is about to be reported — which here is never.
+        #[inline(always)]
+        pub(crate) fn track_operation_at(
+            &self,
+            _: &GlobalRuntimeState,
+            _: impl FnOnce() -> Position,
+        ) -> RhaiResultOf<()> {
+            Ok(())
+        }
+
         /// Check whether the size of a [`Dynamic`] is within limits.
         #[inline(always)]
         pub(crate) const fn check_data_size<T: Borrow<Dynamic>>(

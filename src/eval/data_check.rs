@@ -186,20 +186,39 @@ impl Engine {
         global: &mut GlobalRuntimeState,
         pos: Position,
     ) -> RhaiResultOf<()> {
+        self.track_operation_at(global, || pos)
+    }
+
+    /// [`Engine::track_operation`], asking for the position only when one is
+    /// about to be reported.
+    ///
+    /// Both uses of it are in an error, and neither is reached by the call
+    /// that merely counts. A caller whose position costs a lookup — one
+    /// holding a table keyed on an address rather than a value it already has
+    /// — therefore pays for it on the paths that report and on no other.
+    #[inline(always)]
+    pub(crate) fn track_operation_at(
+        &self,
+        global: &mut GlobalRuntimeState,
+        pos: impl FnOnce() -> Position,
+    ) -> RhaiResultOf<()> {
         global.num_operations += 1;
 
         // Guard against too many operations
         #[cfg(not(feature = "unchecked"))]
-        if self.max_operations() > 0 && global.num_operations > self.max_operations() {
-            return Err(ERR::ErrorTooManyOperations(pos).into());
+        {
+            let limit = self.max_operations();
+            if limit > 0 && global.num_operations > limit {
+                return Err(ERR::ErrorTooManyOperations(pos()).into());
+            }
         }
 
-        self.progress
-            .as_ref()
-            .and_then(|progress| {
-                progress(global.num_operations)
-                    .map(|token| Err(ERR::ErrorTerminated(token, pos).into()))
-            })
-            .unwrap_or(Ok(()))
+        match &self.progress {
+            Some(progress) => match progress(global.num_operations) {
+                Some(token) => Err(ERR::ErrorTerminated(token, pos()).into()),
+                None => Ok(()),
+            },
+            None => Ok(()),
+        }
     }
 }

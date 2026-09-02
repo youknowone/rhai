@@ -15,11 +15,11 @@ use std::prelude::v1::*;
 /// instructions that had one. What it buys is that they can now be removed.
 /// `tests/format.rs` measures how much that removes.
 ///
-/// In memory this is dense, because the lookup is not always cold. A loop
-/// back-edge passes a position to `track_operation` on every iteration, and the
-/// built-in operator path builds a `NativeCallContext` around one — both on the
-/// hot path, both needing it only if something goes wrong. Indexing an array is
-/// what makes that free. The compact delta form in [`pos`](crate::grain::pos)
+/// In memory this is dense, because the lookup is not always cold. The
+/// built-in operator path builds a `NativeCallContext` around a position on
+/// the hot path and needs it only if something goes wrong, and an error
+/// leaving a frame asks for one per level on the way out. Indexing an array is
+/// what makes that cheap enough not to be worth avoiding. The compact delta form in [`pos`](crate::grain::pos)
 /// is the wire form, expanded once at load.
 ///
 /// [`Positions::Stripped`] is not a degraded mode to apologize for: it is what

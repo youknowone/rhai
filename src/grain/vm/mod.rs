@@ -4938,8 +4938,13 @@ impl<'e> Vm<'e> {
                                 self,
                             );
                         }
+                        // The position is a table lookup keyed on the
+                        // address, and metering only reports one when it
+                        // stops the run — so it is asked for behind the
+                        // check rather than in front of it.
                         #[cfg(not(feature = "grain-jit"))]
-                        self.engine.track_operation(&mut self.global, pos!())?;
+                        self.engine
+                            .track_operation_at(&mut self.global, || pos!())?;
                     }
                     pc = target;
                 }};
