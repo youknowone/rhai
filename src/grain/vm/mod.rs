@@ -5462,12 +5462,6 @@ impl<'e> Vm<'e> {
                 | code::tag::BIN_OP_RHS_CONST_JF
                 | code::tag::UN_OP
                 | code::tag::UN_OP_JF => {
-                    // A fused operator names its operands instead of taking
-                    // them off the stack; pushed here so that everything below
-                    // — the typed arms and the dispatch they fall through to —
-                    // finds them where it always did. The two instructions this
-                    // replaces did exactly this and cost two more trips round
-                    // the dispatch loop for it.
                     // What this instruction names, what its result is for
                     // and where its operator comes from, in one table read.
                     // Every operator and every call a program runs arrives
