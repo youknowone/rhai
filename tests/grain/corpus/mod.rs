@@ -914,6 +914,11 @@ pub const CASES: &[Case] = &[
     // The `closure_` prefix is what keeps it out of a `no_closure` build, where
     // there is no such thing as a shared value to hand back.
     case("closure_shared_from_a_native", "let m = shared_cell(); m"),
+    // The left operand of this shape is on the stack rather than named, and a
+    // native handing back a cell is the only thing that puts one there.
+    case("closure_fused_operator_on_a_shared_value_from_a_native", "let c = shared_cell() + 1; c"),
+    case("closure_operator_on_two_shared_values_from_a_native", "shared_cell() + shared_cell()"),
+    case("closure_compare_on_a_shared_value_from_a_native", "if shared_cell() > 1 { 1 } else { 2 }"),
     // Rhai answers this syntactically and registers no function for it, so a
     // lowered call would fail to resolve where the walker returns a bool.
     case("is_shared_after_capture", "let x = 1; let r = false; { let f = || x; r = is_shared(f); } [is_shared(x), r]"),

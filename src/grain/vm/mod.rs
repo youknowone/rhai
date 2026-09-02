@@ -6072,6 +6072,26 @@ impl<'e> Vm<'e> {
                     // on a primitive, which Rhai's fast path also bypasses
                     // (`func/call.rs:1775-1799`).
                     if let (Some(token), 2, true) = (op, argc, fast_operators!()) {
+                        // Flattened first, as Rhai flattens both operands
+                        // before it looks for a built-in
+                        // (`func/call.rs:1890-1898`). A shared cell reaches
+                        // `get_builtin_binary_op_fn` as `Union::Shared`, which
+                        // its variant match has no arm for; the type-id
+                        // comparison after that match reads through the cell,
+                        // finds two equal numeric types and answers "same type
+                        // but no built-in" — so the operator resolves to
+                        // nothing and the dispatch reports a function that was
+                        // never missing. An operand the instruction named
+                        // arrives flattened already, because `operand_value!`
+                        // reads it out with `flatten_clone`; this is the one
+                        // that came off the stack, where a native's return
+                        // value is the only thing that puts a cell.
+                        for slot in first..self.depth {
+                            if is_shared!(*stack_ref(self, slot)) {
+                                let held = mem::replace(stack_mut(self, slot), Dynamic::UNIT);
+                                *stack_mut(self, slot) = held.flatten();
+                            }
+                        }
                         let memo = &mut self.operator_memo;
                         let top = self.depth;
                         let (lhs, rhs) = self.stack[..top].split_at_mut(first + 1);
