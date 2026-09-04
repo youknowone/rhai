@@ -3706,11 +3706,16 @@ mod tests {
                     });
                     let value = crate::grain::Vm::new(&engine)
                         .eval_with_scope(&mut crate::Scope::new(), &program)
-                        .unwrap_or_else(|err| panic!("rotated={rotated} failed: {err} for {source}"));
+                        .unwrap_or_else(|err| {
+                            panic!("rotated={rotated} failed: {err} for {source}")
+                        });
                     format!("{value:?}")
                 })
                 .collect();
-            assert_eq!(answers[0], answers[1], "the two lowerings disagree on {source}");
+            assert_eq!(
+                answers[0], answers[1],
+                "the two lowerings disagree on {source}"
+            );
 
             let expected = engine
                 .eval_ast_with_scope::<Dynamic>(&mut crate::Scope::new(), &ast)

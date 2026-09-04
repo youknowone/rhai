@@ -52,12 +52,30 @@ fn int_arithmetic(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<INT>> 
 
     #[cfg(not(feature = "unchecked"))]
     return match kind {
-        Add => add(x, y).map(Some),
-        Subtract => subtract(x, y).map(Some),
-        Multiply => multiply(x, y).map(Some),
-        Divide => divide(x, y).map(Some),
-        Modulo => modulo(x, y).map(Some),
-        Power => power(x, y).map(Some),
+        Add => match add(x, y) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(error),
+        },
+        Subtract => match subtract(x, y) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(error),
+        },
+        Multiply => match multiply(x, y) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(error),
+        },
+        Divide => match divide(x, y) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(error),
+        },
+        Modulo => match modulo(x, y) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(error),
+        },
+        Power => match power(x, y) {
+            Ok(value) => Ok(Some(value)),
+            Err(error) => Err(error),
+        },
         ShiftRight => Ok(Some(shift_right(x, y))),
         ShiftLeft => Ok(Some(shift_left(x, y))),
         And => Ok(Some(binary_and(x, y))),

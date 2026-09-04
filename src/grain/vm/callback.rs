@@ -387,7 +387,10 @@ mod tests {
         let (carried, ..) = crossings(source, "f", 4, true);
         let (cold, ..) = crossings(source, "f", 4, false);
 
-        assert!(carried.windows(2).all(|pair| pair[0] < pair[1]), "{carried:?}");
+        assert!(
+            carried.windows(2).all(|pair| pair[0] < pair[1]),
+            "{carried:?}"
+        );
         assert_eq!(cold, vec![cold[0]; cold.len()], "{cold:?}");
     }
 
@@ -430,7 +433,10 @@ mod tests {
     fn a_crossing_hands_on_no_values() {
         let source = "fn f(x) { let a = [x, x + 1]; let t = x; for i in a { t += i; } t }";
         let (.., warm) = crossings(source, "f", 3, true);
-        assert!(warm.stack.iter().all(|slot| super::super::operand_ref(slot).is_unit()));
+        assert!(warm
+            .stack
+            .iter()
+            .all(|slot| super::super::operand_ref(slot).is_unit()));
         assert!(warm.iterators.is_empty());
         assert!(warm.handlers.is_empty());
         assert!(warm.sizes.is_empty());

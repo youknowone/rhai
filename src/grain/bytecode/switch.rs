@@ -685,8 +685,14 @@ mod tests {
     fn a_repeated_hash_answers_with_the_first_entry() {
         for extra in [0, 16] {
             let mut cases = vec![
-                SwitchCase { hash: 5, target: 10 },
-                SwitchCase { hash: 5, target: 20 },
+                SwitchCase {
+                    hash: 5,
+                    target: 10,
+                },
+                SwitchCase {
+                    hash: 5,
+                    target: 20,
+                },
             ];
             cases.extend(spread(extra));
             cases.sort_by_key(|case| case.hash);

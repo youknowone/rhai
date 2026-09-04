@@ -848,16 +848,93 @@ fn chain_slot_base(program: &Program, index: u32) -> u32 {
         .sum()
 }
 
+/// [`chain_tail`] for a chain that pushes what it arrived at.
+const TAIL_READ: i64 = -1;
+
+/// [`chain_tail`] for a chain that assigns without an operator.
+const TAIL_ASSIGN: i64 = -2;
+
+/// A chain's tail as one scalar: [`TAIL_READ`], [`TAIL_ASSIGN`], or the index
+/// of its op-assignment in the pool.
+///
+/// The pool index is a `u32`, so no member of it collides with either
+/// sentinel. Nothing outside this pair of functions matches on `Tail`, which
+/// is what lets a lowering that cannot address an inline enum field still
+/// reach the answer.
+fn chain_tail_plain(chain: &Chain) -> i64 {
+    match chain.tail {
+        Tail::Read => TAIL_READ,
+        Tail::Assign { op: None } => TAIL_ASSIGN,
+        Tail::Assign { op: Some(op) } => i64::from(op),
+    }
+}
+
+/// [`chain_tail_plain`], through the JIT boundary where there is one.
+#[inline]
+fn chain_tail(chain: &Chain) -> i64 {
+    #[cfg(feature = "grain-jit")]
+    {
+        jit::chain_tail(chain)
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        chain_tail_plain(chain)
+    }
+}
+
+/// [`assign_op_kind`] for an op-assignment that names no built-in operator.
+const ASSIGN_KIND_NONE: i64 = -1;
+
+/// An op-assignment's operator as one scalar: [`ASSIGN_KIND_NONE`], or the
+/// byte [`BinOpKind::from_byte`] reads back.
+///
+/// Every discriminant is non-negative, so no kind collides with the sentinel.
+fn assign_op_kind_plain(op: &AssignOp) -> i64 {
+    match op.kind {
+        Some(kind) => kind as i64,
+        None => ASSIGN_KIND_NONE,
+    }
+}
+
+/// The operator an op-assignment carries, through the JIT boundary where
+/// there is one.
+///
+/// `Option<BinOpKind>` is an inline enum inside `AssignOp` — the whole value
+/// is its own tag, so reading the field is a byte at an offset rather than the
+/// pointer load the field's description names. The boundary [`chain_tail`]
+/// draws over `Tail` is drawn here for the same reason: what crosses is the
+/// scalar, and the match on it stays behind it.
+#[inline]
+fn assign_op_kind(op: &AssignOp) -> Option<BinOpKind> {
+    #[cfg(feature = "grain-jit")]
+    let kind = jit::assign_op_kind(op);
+    #[cfg(not(feature = "grain-jit"))]
+    let kind = assign_op_kind_plain(op);
+    // Spelled as integer operations rather than as `u8::try_from`: that
+    // conversion reaches the lowering as a callee with no host address, and
+    // one such callee anywhere the portal can reach refuses every trace, arm
+    // taken or not.
+    if kind < 0 || kind > BinOpKind::LAST as i64 {
+        return None;
+    }
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    BinOpKind::from_byte(kind as u8)
+}
+
 /// The op-assignment a chain ends with, resolved out of the pool.
 fn chain_op<'p>(
     program: &'p Program,
     chain: &Chain,
 ) -> Result<Option<&'p AssignOp>, Box<EvalAltResult>> {
-    let Tail::Assign { op: Some(op) } = &chain.tail else {
+    let tail = chain_tail(chain);
+    // The same spelling as [`assign_op_kind`], and for the same reason.
+    if tail < 0 || tail > u32::MAX as i64 {
         return Ok(None);
-    };
+    }
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let op = tail as u32;
     Ok(Some(or_raise!(
-        program.assign_op(*op),
+        program.assign_op(op),
         malformed(format!("no op-assignment {op}"))
     )))
 }
@@ -951,10 +1028,10 @@ fn place<'a>(
 fn store_shared(
     entry: &mut Dynamic,
     value: Dynamic,
-    pos: impl Fn() -> Position,
+    pos: Position,
 ) -> Result<(), Box<EvalAltResult>> {
     if is_shared!(entry) {
-        *place(entry, "", pos())? = value;
+        *place(entry, "", pos)? = value;
     } else {
         overwrite(entry, value);
     }
@@ -1088,15 +1165,50 @@ fn stack_mut<'a>(vm: &'a mut Vm<'_>, index: usize) -> &'a mut Dynamic {
     }
 }
 
+/// Move a whole value through an already-resolved destination.
+///
+/// Under the JIT this crosses one concrete residual ABI instead of exposing a
+/// synthetic `__deref_write`; the plain interpreter keeps [`overwrite`]'s
+/// explicit release policy.
+#[inline(always)]
+#[allow(unused_mut)]
+fn store_value(target: &mut Dynamic, mut value: Dynamic) {
+    #[cfg(feature = "grain-jit")]
+    {
+        jit::dynamic_store(target, &mut value);
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        overwrite(target, value);
+    }
+}
+
+/// A unit [`Dynamic`].
+///
+/// Spelled as the aggregate under `grain-jit` rather than read from
+/// [`Dynamic::UNIT`]: an associated const reaches the lowering as a nullary
+/// call naming the const itself, which the build has no executable address
+/// for, and one residual call whose target the build left unbound anywhere
+/// the portal can reach refuses every trace. The construction is ordinary
+/// translated allocation plus field stores, which is what [`stack_take`]
+/// below already relies on.
+#[inline(always)]
+fn unit_value() -> Dynamic {
+    #[cfg(feature = "grain-jit")]
+    {
+        Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+    }
+    #[cfg(not(feature = "grain-jit"))]
+    {
+        Dynamic::UNIT
+    }
+}
+
 #[inline(always)]
 fn stack_take(vm: &mut Vm<'_>, index: usize) -> Dynamic {
     #[cfg(feature = "grain-jit")]
     {
-        // Spell the aggregate here instead of loading `Dynamic::UNIT` through
-        // its associated-const shim. The latter has no executable address in
-        // Charon's symbolic call table; the enum construction is ordinary
-        // translated allocation plus field stores.
-        let mut value = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
+        let mut value = unit_value();
         jit::operand_stack_take(vm, index, &mut value);
         value
     }
@@ -1133,6 +1245,24 @@ pub(super) struct GrainFrame<'a, 'scope> {
 
 #[cfg(feature = "grain-jit")]
 impl GrainFrame<'_, '_> {
+    /// This frame's own fields, in the order the virtualizable declaration
+    /// names them (`jit_state`'s `__build_virtualizable_info`).
+    ///
+    /// A warm entry passes them as scalar inputargs beside the reds, and the
+    /// declaration gives each one a byte offset for the tracer. Reading them
+    /// here instead of through those offsets keeps this module free of
+    /// `unsafe`; what pairs the two is the order, which the export asserts the
+    /// length of.
+    pub(super) fn jit_vable_words(&self) -> [i64; 5] {
+        [
+            &*self.scope as *const Scope<'_> as usize as i64,
+            self.base as i64,
+            self.reached as i64,
+            self.stack_base as i64,
+            self.jit_resume_pc_plus_one as i64,
+        ]
+    }
+
     /// Apply the canonical compiled-loop image while the merge point still
     /// owns the safe mutable borrow of this stack-resident frame.
     fn restore_from_jit(&mut self, values: &[i64], vm: &Vm<'_>) {
@@ -1998,7 +2128,7 @@ impl<'e> Vm<'e> {
                     this,
                 )
             } else {
-                (Ok(Dynamic::UNIT), this)
+                (Ok(unit_value()), this)
             };
 
             // However it went, and whether the call happened at all: Rhai
@@ -2219,7 +2349,7 @@ impl<'e> Vm<'e> {
     #[inline(never)]
     fn grow_stack(&mut self, extra: usize) {
         let want = (self.depth + extra.max(1)).next_power_of_two();
-        self.stack.resize_with(want, || operand_slot(Dynamic::UNIT));
+        self.stack.resize_with(want, || operand_slot(unit_value()));
     }
 
     #[inline]
@@ -2297,7 +2427,7 @@ impl<'e> Vm<'e> {
         }
         let mut slot = depth;
         while slot < self.depth {
-            overwrite(stack_mut(self, slot), Dynamic::UNIT);
+            overwrite(stack_mut(self, slot), unit_value());
             slot += 1;
         }
         self.depth = depth;
@@ -2345,7 +2475,7 @@ impl<'e> Vm<'e> {
                 self.depth = depth;
                 stack_take(self, depth)
             }
-            None => Dynamic::UNIT,
+            None => unit_value(),
         }
     }
 
@@ -2658,7 +2788,7 @@ impl<'e> Vm<'e> {
             | Step::Method { flags, .. } => flags.contains(StepFlags::SKIP_IF_UNIT),
         };
         if coalescing && target.is_unit() {
-            return Ok((Dynamic::UNIT, false));
+            return Ok((unit_value(), false));
         }
 
         // Which step a failure gets blamed on. The walk only descends, so the
@@ -2703,7 +2833,7 @@ impl<'e> Vm<'e> {
                         self.assign_through_indexer(
                             program, chain, target, &mut idx, value, bracket,
                         )?;
-                        Ok((Dynamic::UNIT, true))
+                        Ok((unit_value(), true))
                     }
                 }
             }
@@ -2890,7 +3020,7 @@ impl<'e> Vm<'e> {
                 value,
                 pos,
             )?;
-            (Dynamic::UNIT, true)
+            (unit_value(), true)
         } else {
             // Straight through the borrow: for an array, a map or a blob this
             // *is* the container's element, so a mutation below lands where
@@ -2931,7 +3061,7 @@ impl<'e> Vm<'e> {
     ) -> Result<(), Box<EvalAltResult>> {
         let mut new_val = value;
 
-        if matches!(chain.tail, Tail::Assign { op: Some(_) }) {
+        if chain_tail(chain) >= 0 {
             let mut probe = clone_value(index);
             if let Ok(mut current) = self.engine.call_indexer_get(
                 &mut self.global,
@@ -3050,10 +3180,10 @@ impl<'e> Vm<'e> {
                     )
                     .map(|_| ())
                 {
-                    Ok(()) => Ok(Dynamic::UNIT),
+                    Ok(()) => Ok(unit_value()),
                     Err(err2) if matches!(*err2, EvalAltResult::ErrorIndexingType(..)) => {
                         if fail_silently {
-                            Ok(Dynamic::UNIT)
+                            Ok(unit_value())
                         } else {
                             Err(err)
                         }
@@ -3116,9 +3246,9 @@ impl<'e> Vm<'e> {
             // holding the map sees a key nobody wrote.
             if last {
                 if let Some(value) = value {
-                    let entry = map.entry(key.into()).or_insert(Dynamic::UNIT);
+                    let entry = map.entry(key.into()).or_insert(unit_value());
                     self.store(program, chain_op(program, chain)?, entry, value, pos)?;
-                    return Ok((Dynamic::UNIT, true));
+                    return Ok((unit_value(), true));
                 }
                 return match map.get(key) {
                     Some(entry) => Ok((clone_value(entry), false)),
@@ -3162,7 +3292,7 @@ impl<'e> Vm<'e> {
             if let Some(value) = value {
                 // `x.p += 1` has to read `p` back through the getter before it
                 // can add to it — the setter takes a finished value.
-                let mut new_val = if matches!(chain.tail, Tail::Assign { op: Some(_) }) {
+                let mut new_val = if chain_tail(chain) >= 0 {
                     let mut current = call(self, getter, &mut [target])
                         .or_else(|err| self.try_index_get(target, key, err, step_pos))?;
                     self.store(program, chain_op(program, chain)?, &mut current, value, pos)?;
@@ -3174,7 +3304,7 @@ impl<'e> Vm<'e> {
                 let _ = call(self, setter, &mut [target, &mut new_val]).or_else(|err| {
                     self.try_index_set(target, key, &mut new_val, false, err, step_pos)
                 })?;
-                return Ok((Dynamic::UNIT, true));
+                return Ok((unit_value(), true));
             }
             let out = call(self, getter, &mut [target])
                 .or_else(|err| self.try_index_get(target, key, err, step_pos))?;
@@ -3213,7 +3343,7 @@ impl<'e> Vm<'e> {
         op: &AssignOp,
         target: &mut Dynamic,
         rhs: &mut Dynamic,
-        pos: impl Fn() -> Position,
+        pos: Position,
     ) -> StoreBuiltinOutcome {
         #[cfg(feature = "grain-jit")]
         let fast_operators = jit::fast_operators(self) != 0;
@@ -3236,7 +3366,7 @@ impl<'e> Vm<'e> {
         // resolution below, which answers what it always did. The set of pairs
         // is the op-assignment table's, not the operator table's — see
         // `apply_assign`.
-        if let Some(kind) = op.kind {
+        if let Some(kind) = assign_op_kind(op) {
             match apply_assign(kind, target, rhs) {
                 Ok(Some(())) => {
                     return StoreBuiltinOutcome {
@@ -3247,7 +3377,7 @@ impl<'e> Vm<'e> {
                 Ok(None) => {}
                 Err(mut err) => {
                     if err.position().is_none() {
-                        err.set_position(pos());
+                        err.set_position(pos);
                     }
                     return StoreBuiltinOutcome {
                         handled: true,
@@ -3257,6 +3387,44 @@ impl<'e> Vm<'e> {
             }
         }
 
+        // The resolution below picks its callee out of a chain of closures,
+        // none of which the build can name an address for, and one residual
+        // call whose target the build left unbound anywhere the portal can
+        // reach refuses every trace. Behind this boundary the resolution and
+        // the call it answers are opaque, the way the operation-limit hook
+        // already is. It takes two crossings because a residual call returns
+        // one word and this answers three states.
+        #[cfg(feature = "grain-jit")]
+        {
+            if jit::store_builtin_available(op, target, rhs) == 0 {
+                return StoreBuiltinOutcome {
+                    handled: false,
+                    error: None,
+                };
+            }
+            return StoreBuiltinOutcome {
+                handled: true,
+                error: jit::store_builtin_apply(self, op, target, rhs, jit::position_bits(pos)),
+            };
+        }
+
+        #[cfg(not(feature = "grain-jit"))]
+        self.store_builtin_resolved(op, target, rhs, pos)
+    }
+
+    /// Resolve `target op= rhs` against the built-in op-assignment table and
+    /// call whatever it answers.
+    ///
+    /// Split out of [`Self::store_builtin`] so that the body behind the
+    /// `grain-jit` boundary and the body the plain build runs are the same
+    /// one.
+    fn store_builtin_resolved(
+        &mut self,
+        op: &AssignOp,
+        target: &mut Dynamic,
+        rhs: &mut Dynamic,
+        pos: Position,
+    ) -> StoreBuiltinOutcome {
         let Some((func, need_context)) = get_builtin_op_assignment_fn(&op.op_assign, target, rhs)
         else {
             return StoreBuiltinOutcome {
@@ -3264,7 +3432,7 @@ impl<'e> Vm<'e> {
                 error: None,
             };
         };
-        let context = need_context.then(|| (self.engine, "", None, &self.global, pos()).into());
+        let context = need_context.then(|| (self.engine, "", None, &self.global, pos).into());
         match func(context, &mut [target, rhs]) {
             Ok(_) => StoreBuiltinOutcome {
                 handled: true,
@@ -3272,7 +3440,7 @@ impl<'e> Vm<'e> {
             },
             Err(mut err) => {
                 if err.position().is_none() {
-                    err.set_position(pos());
+                    err.set_position(pos);
                 }
                 StoreBuiltinOutcome {
                     handled: true,
@@ -3295,7 +3463,7 @@ impl<'e> Vm<'e> {
             return Ok(());
         };
 
-        let done = self.store_builtin(op, target, &mut rhs, || pos);
+        let done = self.store_builtin(op, target, &mut rhs, pos);
         if done.handled {
             return match done.error {
                 Some(error) => Err(error),
@@ -4758,14 +4926,16 @@ impl<'e> Vm<'e> {
     /// [`Engine::track_operation_at`](crate::Engine) takes one: it is a table
     /// lookup keyed on the address, and a guard that holds — which is every
     /// turn of every loop but the last — never reports one.
-    fn guard_holds(
-        &self,
-        value: &Dynamic,
-        pos: impl FnOnce() -> Position,
-    ) -> Result<bool, Box<EvalAltResult>> {
-        value
-            .as_bool()
-            .map_err(|actual| self.mismatch::<bool>(actual, pos()))
+    fn guard_holds(&self, value: &Dynamic, pos: Position) -> Result<bool, Box<EvalAltResult>> {
+        // Spelled as a match rather than as `map_err`: that combinator and the
+        // closure it takes are both callees the build cannot name an address
+        // for, and one residual call with no address anywhere the portal can
+        // reach refuses every trace, arm taken or not. Same reason `pos`
+        // arrives as a value.
+        match value.as_bool() {
+            Ok(held) => Ok(held),
+            Err(actual) => Err(self.mismatch::<bool>(actual, pos)),
+        }
     }
 
     /// What reading a key a map does not have produces.
@@ -4781,7 +4951,7 @@ impl<'e> Vm<'e> {
                 pos,
             )))
         } else {
-            Ok(Dynamic::UNIT)
+            Ok(unit_value())
         }
     }
 
@@ -4979,7 +5149,7 @@ impl<'e> Vm<'e> {
     /// message alone (`eval/stmt.rs:815`).
     fn catch_value(&self, err: &mut Box<EvalAltResult>, wanted: bool) -> Dynamic {
         if !wanted {
-            return Dynamic::UNIT;
+            return unit_value();
         }
         if let EvalAltResult::ErrorRuntime(value, ..) = err.unwrap_inner() {
             return value.clone();
@@ -5104,6 +5274,61 @@ impl<'e> Vm<'e> {
                     #[cfg(not(feature = "grain-jit"))]
                     {
                         scope.get_mut_by_index($index)
+                    }
+                }};
+            }
+            // One array element, by an index the caller has already tested
+            // against the length.
+            //
+            // `Vec`'s indexing reaches the lowering as a callee with no host
+            // address, and one of those anywhere the portal can reach refuses
+            // every trace. `Vec::len` is not such a callee, so the bound test
+            // is left in ordinary Rust where the tracer can see it and only
+            // the element read crosses a boundary.
+            // One entry of a frozen program table, by index.
+            //
+            // Each of these accessors is a `slice::get` over a table the artifact
+            // froze, and `get` reaches the lowering as a callee with no host address;
+            // one of those anywhere the portal can reach refuses every trace. Behind
+            // the boundary the read is invisible, the way the constant pool's already
+            // is.
+            macro_rules! program_entry {
+                ($jit:ident, $plain:ident, $program:expr, $index:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::$jit($program, $index)
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        $program.$plain($index)
+                    }
+                }};
+            }
+
+            // The write side of [`array_entry`], by an index the caller has already
+            // tested against the length.
+            macro_rules! array_entry_mut {
+                ($array:expr, $index:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::array_entry_mut($array, $index)
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        &mut $array[$index]
+                    }
+                }};
+            }
+
+            macro_rules! array_entry {
+                ($array:expr, $index:expr) => {{
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::array_entry($array, $index)
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        &$array[$index]
                     }
                 }};
             }
@@ -5419,7 +5644,7 @@ impl<'e> Vm<'e> {
                     self.push(clone_value(value));
                 }
 
-                code::tag::UNIT => self.push(Dynamic::UNIT),
+                code::tag::UNIT => self.push(unit_value()),
                 code::tag::FALSE => self.push(Dynamic::from(false)),
                 code::tag::TRUE => self.push(Dynamic::from(true)),
 
@@ -5448,7 +5673,8 @@ impl<'e> Vm<'e> {
                         AccessMode::ReadWrite
                     });
                     // Through the cell, not over it — see `place`.
-                    *place(scope_entry!(index), "", pos!())? = value;
+                    let mut target = place(scope_entry!(index), "", pos!())?;
+                    store_value(&mut target, value);
                 }
 
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
@@ -5619,8 +5845,7 @@ impl<'e> Vm<'e> {
                     if !is_shared!(entry) {
                         let mut rhs = rhs;
                         let done = match op {
-                            Some(op) => self
-                                .store_builtin(op, entry, &mut rhs, move || program.position(pc)),
+                            Some(op) => self.store_builtin(op, entry, &mut rhs, pos!()),
                             None => StoreBuiltinOutcome {
                                 handled: false,
                                 error: None,
@@ -5733,7 +5958,7 @@ impl<'e> Vm<'e> {
                 code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
                     let index = u32::from(small!(1));
                     let expr = or_raise!(
-                        program.residual(index),
+                        program_entry!(program_residual, residual, program, index),
                         malformed(format!("no residual {index}"))
                     );
                     let rewind_scope = tag == code::tag::EVAL_AST;
@@ -5825,6 +6050,9 @@ impl<'e> Vm<'e> {
                     // here and asks all three, so asking by comparison walks
                     // a tag list that lengthens with each fused spelling the
                     // compiler learns to emit.
+                    #[cfg(feature = "grain-jit")]
+                    let form = jit::code_form(tag) as u16;
+                    #[cfg(not(feature = "grain-jit"))]
                     let form = code::form(tag);
                     let named_is_local = form & code::form::NAMED_IS_LOCAL != 0;
                     let typed = form & code::form::TYPED != 0;
@@ -5860,7 +6088,7 @@ impl<'e> Vm<'e> {
                                 // to fall out of scope: a swallowed branch is
                                 // the one exit that keeps nothing, and it runs
                                 // once per turn of every loop with a condition.
-                                let holds = self.guard_holds(&value, || pos!())?;
+                                let holds = self.guard_holds(&value, pos!())?;
                                 release(value);
                                 if holds == taken_when {
                                     transfer!(wide!(width - 4) as usize);
@@ -6019,9 +6247,11 @@ impl<'e> Vm<'e> {
                         // and answers whatever it answers, which is what a
                         // verified program's byte can never make it do.
                         if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
-                            if let Some(value) =
-                                apply_binary(kind, stack_ref(self, under), stack_ref(self, top - 1))?
-                            {
+                            if let Some(value) = apply_binary(
+                                kind,
+                                stack_ref(self, under),
+                                stack_ref(self, top - 1),
+                            )? {
                                 // No position stamped on the way out: under
                                 // `fast_operators` Rhai returns a built-in's
                                 // error untouched, which is why `1 / 0` has
@@ -6080,7 +6310,7 @@ impl<'e> Vm<'e> {
                     let op = if form & code::form::POOLED_OP != 0 {
                         let index = u32::from(small!(4));
                         Some(or_raise!(
-                            program.token(index),
+                            program_entry!(program_token, token, program, index),
                             malformed(format!("no operator {index}"))
                         ))
                     } else {
@@ -6116,8 +6346,8 @@ impl<'e> Vm<'e> {
                         // value is the only thing that puts a cell.
                         for slot in first..self.depth {
                             if is_shared!(*stack_ref(self, slot)) {
-                                let held = mem::replace(stack_mut(self, slot), Dynamic::UNIT);
-                                *stack_mut(self, slot) = held.flatten();
+                                let held = mem::replace(stack_mut(self, slot), unit_value());
+                                store_value(stack_mut(self, slot), held.flatten());
                             }
                         }
                         let memo = &mut self.operator_memo;
@@ -6268,9 +6498,14 @@ impl<'e> Vm<'e> {
                     );
                     while let Some(key) = parts.next() {
                         let value = parts.next().expect("pairs, checked above");
-                        let key = key.into_immutable_string().map_err(|actual| {
-                            malformed(format!("map key is a {actual}, not a string"))
-                        })?;
+                        let key = match key.into_immutable_string() {
+                            Ok(key) => key,
+                            Err(actual) => {
+                                return Err(malformed(format!(
+                                    "map key is a {actual}, not a string"
+                                )));
+                            }
+                        };
                         // Flattened as Rhai does, so a shared cell is copied
                         // in rather than aliased.
                         map.insert(key.as_str().into(), value.flatten());
@@ -6288,7 +6523,7 @@ impl<'e> Vm<'e> {
                 code::tag::SWITCH => {
                     let index = u32::from(small!(1));
                     let table = or_raise!(
-                        program.switch(index),
+                        program_entry!(program_switch, switch, program, index),
                         malformed(format!("no switch {index}"))
                     );
                     let subject = self.pop()?;
@@ -6352,7 +6587,8 @@ impl<'e> Vm<'e> {
                     if let Some(index) = entry {
                         let value = scope_entry!(index);
                         if !value.is_shared() {
-                            *value = value.take().into_shared();
+                            let shared = value.take().into_shared();
+                            store_value(value, shared);
                         }
                     }
                 }
@@ -6400,17 +6636,23 @@ impl<'e> Vm<'e> {
 
                 code::tag::MAKE_FN_PTR => {
                     let name = self.pop()?;
-                    let name = name
-                        .into_immutable_string()
-                        .map_err(|actual| self.mismatch::<ImmutableString>(actual, pos!()))?;
+                    let name = match name.into_immutable_string() {
+                        Ok(name) => name,
+                        Err(actual) => {
+                            return Err(self.mismatch::<ImmutableString>(actual, pos!()));
+                        }
+                    };
                     // Validates that the name is an identifier, as Rhai's own
                     // `Fn(..)` does (`func/call.rs:1215`).
-                    let pointer = FnPtr::new(name).map_err(|mut err| {
-                        if err.position().is_none() {
-                            err.set_position(pos!());
+                    let pointer = match FnPtr::new(name) {
+                        Ok(pointer) => pointer,
+                        Err(mut err) => {
+                            if err.position().is_none() {
+                                err.set_position(pos!());
+                            }
+                            return Err(err);
                         }
-                        err
-                    })?;
+                    };
                     self.push(pointer.into());
                 }
 
@@ -6462,9 +6704,9 @@ impl<'e> Vm<'e> {
 
                 code::tag::INTERPOLATE_END => {
                     let buffer = self.pop()?;
-                    let text = buffer
-                        .into_immutable_string()
-                        .map_err(|_| malformed("interpolation lost its buffer".into()))?;
+                    let Ok(text) = buffer.into_immutable_string() else {
+                        return Err(malformed("interpolation lost its buffer".into()));
+                    };
                     // Interned, as Rhai does: the same rendered string in ten
                     // places is one allocation, which is the whole reason the
                     // engine keeps an interner.
@@ -6474,15 +6716,17 @@ impl<'e> Vm<'e> {
 
                 code::tag::CHAIN | code::tag::CHAIN_DISCARD => {
                     let index = u32::from(small!(1));
-                    let chain =
-                        or_raise!(program.chain(index), malformed(format!("no chain {index}")));
+                    let chain = or_raise!(
+                        program_entry!(program_chain, chain, program, index),
+                        malformed(format!("no chain {index}"))
+                    );
                     // An assignment is not an expression here: what it
                     // evaluates to is the `Op::Unit` beside it, emitted only
                     // where something reads it. A read in statement position
                     // has nothing behind it to take its value off again, and
                     // says so in its tag; the walk itself is the same either
                     // way, so a chain that raises raises identically.
-                    let keeps = matches!(chain.tail, Tail::Read) && tag != code::tag::CHAIN_DISCARD;
+                    let keeps = chain_tail(chain) == TAIL_READ && tag != code::tag::CHAIN_DISCARD;
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
                     if keeps {
                         self.push(value);
@@ -6536,9 +6780,25 @@ impl<'e> Vm<'e> {
                         };
                         // A negative index counts from the end, which is
                         // `get_indexed_mut`'s rule and not worth restating.
-                        let Ok(i) = usize::try_from(i) else {
+                        //
+                        // Spelled as integer operations rather than as
+                        // `usize::try_from`: that conversion reaches the
+                        // lowering as a callee with no host address, and one
+                        // such callee anywhere the portal can reach refuses
+                        // every trace, arm taken or not.
+                        if i < 0 {
                             break 'fast;
-                        };
+                        }
+                        #[allow(clippy::cast_sign_loss)]
+                        let index = i as usize;
+                        // The cast loses information only where `usize` is
+                        // narrower than `INT`; re-widening rejects that case
+                        // and no other.
+                        #[allow(clippy::cast_possible_wrap)]
+                        if index as INT != i {
+                            break 'fast;
+                        }
+                        let i = index;
                         let at = base + small!(3) as usize;
                         if at >= scope_len!() {
                             break 'fast;
@@ -6580,9 +6840,13 @@ impl<'e> Vm<'e> {
                         else {
                             break 'fast;
                         };
-                        let Some(cell) = array.get_mut(i) else {
+                        // The bound is tested here rather than left to the
+                        // element read, so what crosses the boundary below is
+                        // an index already known to name an element.
+                        if i >= array.len() {
                             break 'fast;
-                        };
+                        }
+                        let cell = array_entry_mut!(array, i);
                         match kind {
                             // The operator applied to the element where it
                             // lies, which is the whole of what this spelling
@@ -6650,8 +6914,10 @@ impl<'e> Vm<'e> {
                     }
 
                     let index = u32::from(small!(1));
-                    let chain =
-                        or_raise!(program.chain(index), malformed(format!("no chain {index}")));
+                    let chain = or_raise!(
+                        program_entry!(program_chain, chain, program, index),
+                        malformed(format!("no chain {index}"))
+                    );
                     // Always an assigning tail — that is what `indexed_slot`
                     // selects on — so the walk leaves nothing here either.
                     drop(self.run_chain(program, chain, index, scope, base, pos!())?);
@@ -6684,9 +6950,17 @@ impl<'e> Vm<'e> {
                         };
                         // A negative index counts from the end, which is
                         // `get_indexed_mut`'s rule and not worth restating.
-                        let Ok(i) = usize::try_from(i) else {
+                        // See the write side above for why this is spelled in
+                        // integer operations.
+                        if i < 0 {
                             break 'fast;
-                        };
+                        }
+                        #[allow(clippy::cast_sign_loss)]
+                        let index = i as usize;
+                        #[allow(clippy::cast_possible_wrap)]
+                        if index as INT != i {
+                            break 'fast;
+                        }
                         let at = base + small!(3) as usize;
                         if at >= scope_len!() {
                             break 'fast;
@@ -6694,9 +6968,13 @@ impl<'e> Vm<'e> {
                         let Union::Array(array, ..) = &scope_entry!(at).0 else {
                             break 'fast;
                         };
-                        let Some(cell) = array.get(i) else {
+                        // The bound is tested here rather than left to the
+                        // element read, so what crosses the boundary below is
+                        // an index already known to name an element.
+                        if index >= array.len() {
                             break 'fast;
-                        };
+                        }
+                        let cell = array_entry!(array, index);
                         if is_shared!(*cell) {
                             break 'fast;
                         }
@@ -6704,7 +6982,7 @@ impl<'e> Vm<'e> {
                         if named {
                             self.push(value);
                         } else {
-                            *stack_mut(self, self.depth - 1) = value;
+                            store_value(stack_mut(self, self.depth - 1), value);
                         }
                         read = true;
                     }
@@ -6722,8 +7000,10 @@ impl<'e> Vm<'e> {
                     }
 
                     let index = u32::from(small!(1));
-                    let chain =
-                        or_raise!(program.chain(index), malformed(format!("no chain {index}")));
+                    let chain = or_raise!(
+                        program_entry!(program_chain, chain, program, index),
+                        malformed(format!("no chain {index}"))
+                    );
                     let value = self.run_chain(program, chain, index, scope, base, pos!())?;
                     self.push(value);
                 }
@@ -6813,23 +7093,33 @@ impl<'e> Vm<'e> {
                     // Counted before the item is unwrapped, as Rhai does, so a
                     // loop long enough to wrap the counter is an error rather
                     // than a wrap.
-                    iteration.count = or_raise!(iteration.count.checked_add(1), {
-                        Box::new(EvalAltResult::ErrorArithmetic(
+                    // Spelled as the equality rather than as `checked_add`:
+                    // adding one overflows exactly at the maximum, and the
+                    // `Option` that spelling returns is consumed by an arm
+                    // that returns rather than rejoining — a shape the signed
+                    // overflow lowering declines, leaving a residual call
+                    // whose `core` target the build cannot address.
+                    if iteration.count == INT::MAX {
+                        return Err(Box::new(EvalAltResult::ErrorArithmetic(
                             format!("for-loop counter overflow: {}", iteration.count),
                             pos!(),
-                        ))
-                    });
+                        )));
+                    }
+                    iteration.count += 1;
                     let count = iteration.count;
 
                     // A fallible iterator's error is positioned at the
                     // iterable, and only if it brought none of its own
                     // (`eval/stmt.rs:749`).
-                    let value = item.map_err(|mut err| {
-                        if err.position().is_none() {
-                            err.set_position(pos!());
+                    let value = match item {
+                        Ok(value) => value,
+                        Err(mut err) => {
+                            if err.position().is_none() {
+                                err.set_position(pos!());
+                            }
+                            return Err(err);
                         }
-                        err
-                    })?;
+                    };
 
                     if tag == code::tag::ITER_NEXT_STORE {
                         // The `Op::StoreShared` this swallowed, which is where
@@ -6839,9 +7129,7 @@ impl<'e> Vm<'e> {
                         if index >= scope_len!() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
-                        store_shared(scope_entry!(index), value.flatten(), move || {
-                            program.position(pc)
-                        })?;
+                        store_shared(scope_entry!(index), value.flatten(), pos!())?;
                     } else {
                         if tag == code::tag::ITER_NEXT_INDEXED {
                             self.push(Dynamic::from(count));
@@ -6862,7 +7150,7 @@ impl<'e> Vm<'e> {
                         return Err(malformed(format!("local slot {slot} is out of scope")));
                     }
                     let value = self.pop()?;
-                    store_shared(scope_entry!(index), value, move || program.position(pc))?;
+                    store_shared(scope_entry!(index), value, pos!())?;
                 }
 
                 code::tag::THROW => {

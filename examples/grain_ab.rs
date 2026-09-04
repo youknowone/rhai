@@ -141,7 +141,11 @@ fn once(run: &mut impl FnMut()) -> Duration {
 
 /// The least contaminated sample: noise on a duration is one-sided.
 fn best(samples: &[Duration]) -> f64 {
-    samples.iter().min().expect("a leg takes a sample").as_secs_f64()
+    samples
+        .iter()
+        .min()
+        .expect("a leg takes a sample")
+        .as_secs_f64()
 }
 
 fn median(samples: &[Duration]) -> f64 {
@@ -151,7 +155,11 @@ fn median(samples: &[Duration]) -> f64 {
 }
 
 /// Alternate the two legs one script run at a time, swapping which leads.
-fn paired(samples: usize, mut a: impl FnMut(), mut b: impl FnMut()) -> (Vec<Duration>, Vec<Duration>) {
+fn paired(
+    samples: usize,
+    mut a: impl FnMut(),
+    mut b: impl FnMut(),
+) -> (Vec<Duration>, Vec<Duration>) {
     let mut left = Vec::with_capacity(samples);
     let mut right = Vec::with_capacity(samples);
     for sample in 0..samples {
@@ -171,7 +179,11 @@ fn load_average() -> String {
         .output()
         .ok()
         .and_then(|out| String::from_utf8(out.stdout).ok())
-        .and_then(|line| line.split("load average").nth(1).map(|rest| rest.trim_start_matches([':', 's', ' ']).trim().to_string()))
+        .and_then(|line| {
+            line.split("load average")
+                .nth(1)
+                .map(|rest| rest.trim_start_matches([':', 's', ' ']).trim().to_string())
+        })
         .unwrap_or_else(|| "unknown".into())
 }
 
@@ -209,7 +221,11 @@ fn main() {
         println!(
             "{:<24} {}",
             case.name,
-            if case.gated { "reaches the gate" } else { "control" }
+            if case.gated {
+                "reaches the gate"
+            } else {
+                "control"
+            }
         );
         cases.push((case, leg));
     }

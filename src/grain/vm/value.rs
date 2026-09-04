@@ -286,10 +286,7 @@ mod tests {
                 "overwrite left the wrong value",
             );
             overwrite(&mut slot, Dynamic::UNIT);
-            assert!(
-                slot.is_unit(),
-                "overwrite left the wrong value",
-            );
+            assert!(slot.is_unit(), "overwrite left the wrong value",);
         }
     }
 }

@@ -35,18 +35,6 @@ static INSNS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/insns.bin"));
 /// prefix would shift every one of those offsets by its own width.
 static ALL_LIVENESS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/all_liveness.bin"));
 
-fn insns() -> &'static std::collections::BTreeMap<String, u8> {
-    static TABLE: once_cell::race::OnceBox<std::collections::BTreeMap<String, u8>> =
-        once_cell::race::OnceBox::new();
-    TABLE.get_or_init(|| Box::new(bincode::deserialize(INSNS).expect("the opcode table decodes")))
-}
-
-pub(super) fn insn_name(opcode: u8) -> Option<&'static str> {
-    insns()
-        .iter()
-        .find_map(|(name, value)| (*value == opcode).then_some(name.as_str()))
-}
-
 /// One table's entries, as byte ranges over its concatenated bodies.
 ///
 /// `offsets` has one more entry than there are records, so a record's bounds
@@ -66,7 +54,8 @@ fn symbolic_fnaddrs() -> &'static Vec<(i64, String)> {
     })
 }
 
-fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
+/// The path the build recorded for a symbolic call target, if it recorded one.
+pub fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
     symbolic_fnaddrs()
         .iter()
         .find_map(|(symbolic, path)| (*symbolic == fnaddr).then_some(path.as_str()))
@@ -97,6 +86,10 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::code_u32 as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::code_form",
+            super::jit::code_form as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::code_position_bits",
             super::jit::code_position_bits as *const () as usize as i64,
         ),
@@ -111,6 +104,42 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
         (
             "rhai::grain::vm::jit::track_operation_abi",
             super::jit::track_operation_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_token",
+            super::jit::program_token as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::chain_tail",
+            super::jit::chain_tail as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::assign_op_kind",
+            super::jit::assign_op_kind as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_chain",
+            super::jit::program_chain as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_switch",
+            super::jit::program_switch as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_residual",
+            super::jit::program_residual as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::array_entry_mut",
+            super::jit::array_entry_mut as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::store_builtin_available",
+            super::jit::store_builtin_available as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::store_builtin_apply",
+            super::jit::store_builtin_apply as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::fast_operators",
@@ -133,12 +162,20 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::operand_stack_entry_mut as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::array_entry",
+            super::jit::array_entry as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::operand_stack_take",
             super::jit::operand_stack_take as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::operand_stack_store",
             super::jit::operand_stack_store as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::dynamic_store",
+            super::jit::dynamic_store as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::truncate_stack",

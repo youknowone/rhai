@@ -11,11 +11,11 @@
 //! declaration against the portal graph's own operands; a second declaration
 //! here would agree with that one only until one of the two was edited.
 //!
-//! Compiled entry is deliberately disabled while the embedded jitcodes still
-//! carry unbound symbolic function addresses. Recording such a call would be
-//! safe, but majit's current walker also invokes it to obtain a concrete
-//! shadow. The trace path stops before that instruction, and the state refuses
-//! the driver's compatibility check before any backend body can run.
+//! The embedded jitcodes still carry function addresses the build could not
+//! bind, and majit's walker invokes a residual call to obtain a concrete
+//! shadow rather than only recording it. What keeps those out of compiled code
+//! is the walk itself: it refuses such a call before making it and abandons
+//! the trace, so no body that reaches one is ever compiled.
 
 use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
@@ -187,16 +187,49 @@ impl JitCodeSym for GrainSym {
 pub struct GrainJitState {
     /// What the last [`JitState::restore`] was handed.
     ///
-    /// Kept rather than dropped: compiled entry is disabled in this slice, so
-    /// no deoptimization path calls `restore` yet. The later binding/entry work
-    /// must define how these raw words are written back into the live `Vm` and
-    /// `Scope`; silently discarding them here would conceal that missing step.
+    /// The merge point drains this and applies it to the live frame while it
+    /// still holds the frame's mutable borrow, which is the only place the
+    /// borrow exists; a deoptimization path reaches `restore` with no way to
+    /// reach the frame itself.
     pub last_restored: Vec<i64>,
+    /// The red image of the consultation now in progress.
+    ///
+    /// A `Meta` describes the SHAPE a compiled artifact was built against and
+    /// is stored with that artifact, so its own copy of the reds is as old as
+    /// the compile. The values an entry passes have to be this consultation's,
+    /// and [`JitState::extract_live`] is handed only `&self` and that stored
+    /// meta -- so the live image lives here, republished by the merge point
+    /// before it consults the door.
+    reds: Vec<i64>,
+    /// The live frame's own fields, in the order the virtualizable
+    /// declaration below names them.
+    ///
+    /// Published beside the reds for the same reason, and read off the frame
+    /// itself rather than through the declared byte offsets: this module
+    /// forbids `unsafe`, and the frame is in hand where the merge point
+    /// publishes.
+    vable_statics: Vec<i64>,
 }
 
 impl GrainJitState {
     pub(super) fn take_restored(&mut self) -> Vec<i64> {
         core::mem::take(&mut self.last_restored)
+    }
+
+    /// Publish the red image and the frame fields the merge point was handed.
+    ///
+    /// Overwrites in place: this runs on every consultation, and both lengths
+    /// are fixed by the driver declaration, which does not change.
+    pub(super) fn publish_live(&mut self, env: &[i64], vable_statics: &[i64]) {
+        self.reds.clear();
+        self.reds.extend_from_slice(env);
+        self.vable_statics.clear();
+        self.vable_statics.extend_from_slice(vable_statics);
+    }
+
+    /// The live frame, as the virtualizable identity red names it.
+    fn live_frame_ptr(&self) -> Option<*mut u8> {
+        self.reds.first().map(|frame| *frame as usize as *mut u8)
     }
 }
 
@@ -219,7 +252,8 @@ impl JitState for GrainJitState {
     }
 
     fn extract_live(&self, meta: &Self::Meta) -> Vec<i64> {
-        meta.reds.clone()
+        let _ = meta;
+        self.reds.clone()
     }
 
     fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
@@ -238,15 +272,58 @@ impl JitState for GrainJitState {
         }
     }
 
+    /// Rebuild the guard's frame sections through the same resume-numbering
+    /// decoder as generated `#[jit_interp]` states. Each section is split by
+    /// its owning jitcode's liveness rather than treating the remainder of the
+    /// stream as one frame.
+    fn rebuild_from_resumedata(
+        _meta: &mut Self::Meta,
+        fail_arg_types: &[Type],
+        storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
+    ) -> Option<majit_metainterp::ResumeDataResult> {
+        let storage = storage?;
+        let frame_value_count = majit_ir::resumedata::get_frame_value_count_fn();
+        let frame_value_count_ref: Option<&dyn Fn(i32, i32) -> usize> = frame_value_count
+            .as_ref()
+            .map(|callback| callback as &dyn Fn(i32, i32) -> usize);
+        let (num_failargs, virtualizable_values, virtualref_values, frames) =
+            majit_ir::resumedata::rebuild_from_numbering(
+                storage.rd_numb.as_ref(),
+                storage.rd_consts(),
+                fail_arg_types,
+                frame_value_count_ref,
+                storage.rd_virtuals.len(),
+            );
+        if frames.is_empty() {
+            return None;
+        }
+        Some(majit_metainterp::ResumeDataResult {
+            frames,
+            virtualizable_values,
+            virtualref_values,
+            storage: Some(storage.clone()),
+            num_failargs,
+            fail_arg_types: fail_arg_types.to_vec(),
+        })
+    }
+
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        // This is the last state-owned gate before each compiled-entry path
-        // calls the backend. Every symbolic residual target in the embedded
-        // table is still unbound, so refuse here until the host supplies real
-        // ABI shims. Returning false does not disable recording or compilation;
-        // it invalidates/declines the artifact before execute_assembler.
-        let _ = meta;
-        super::jit::record_compiled_entry_refusal();
-        false
+        // The reds are the live frame and VM, and the merge point passes both
+        // afresh on every consultation, so no property of them can go stale
+        // between the compile and an entry. What the artifact does fix is how
+        // many live values its entry expects, and a build whose driver
+        // declaration changed under an artifact compiled against the previous
+        // one would enter it with the wrong count.
+        //
+        // A symbolic residual target the build left unbound cannot appear in a
+        // compiled body: the walk that recorded it refuses such a call before
+        // making it, which abandons the trace, so a trace that closed and
+        // compiled reached none.
+        let compatible = meta.reds.len() == red_kinds().len();
+        if !compatible {
+            super::jit::record_compiled_entry_refusal();
+        }
+        compatible
     }
 
     fn virtualizable_heap_ptr(
@@ -255,10 +332,40 @@ impl JitState for GrainJitState {
         virtualizable: &str,
         _info: &majit_metainterp::virtualizable::VirtualizableInfo,
     ) -> Option<*mut u8> {
+        let _ = meta;
         (virtualizable == "frame")
-            .then(|| meta.reds.first().copied())
+            .then(|| self.live_frame_ptr())
             .flatten()
-            .map(|frame| frame as usize as *mut u8)
+    }
+
+    /// The frame's own fields, read out of the live frame for a warm entry.
+    ///
+    /// `warmstate.py:482-511` hands the assembler the virtualizable itself and
+    /// lets the compiled code read through it; majit's entry passes the fields
+    /// as scalar inputargs instead, so the compiled loop's arity is the reds
+    /// plus these. The trace carries them across its back edge
+    /// ([`JitState::collect_jump_args_with_boxes`]), so an entry that could not
+    /// supply them would be entering with fewer arguments than the artifact
+    /// declares -- which is what the driver declines on.
+    ///
+    /// No array fields are declared, so `arrays` is emptied rather than
+    /// resized.
+    fn export_virtualizable_boxes_into(
+        &self,
+        meta: &Self::Meta,
+        virtualizable: &str,
+        info: &majit_metainterp::virtualizable::VirtualizableInfo,
+        statics: &mut Vec<i64>,
+        arrays: &mut Vec<Vec<i64>>,
+    ) -> bool {
+        let _ = meta;
+        if virtualizable != "frame" || self.vable_statics.len() != info.static_fields.len() {
+            return false;
+        }
+        statics.clear();
+        statics.extend_from_slice(&self.vable_statics);
+        arrays.clear();
+        true
     }
 
     #[allow(non_snake_case)]
@@ -325,6 +432,19 @@ impl JitState for GrainJitState {
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
         sym.reds.clone()
+    }
+
+    fn collect_jump_args_with_boxes(sym: &Self::Sym, boxes: &[(OpRef, Type)]) -> Vec<OpRef> {
+        // `pyjitpl.py reached_loop_header`: `live_arg_boxes +=
+        // self.virtualizable_boxes` then `.pop()`. The frame's own fields are
+        // carried across the back edge like any other loop-carried value; the
+        // identity the list ends with is not, because the frame red already
+        // names it.
+        let mut args = Self::collect_jump_args(sym);
+        if let Some((_identity, fields)) = boxes.split_last() {
+            args.extend(fields.iter().map(|(opref, _)| *opref));
+        }
+        args
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {

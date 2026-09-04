@@ -150,8 +150,8 @@ mod vm;
 pub use compile::Compiler;
 pub use format::{Sidecar, Stripped};
 pub use program::Program;
-pub use vm::{ab_gate, Fault, Vm};
 pub(crate) use vm::CrossingPool;
+pub use vm::{ab_gate, Fault, Vm};
 // The lowered tables are build output, so what can be asserted about them is
 // only observable from outside the crate.
 #[cfg(feature = "grain-jit")]

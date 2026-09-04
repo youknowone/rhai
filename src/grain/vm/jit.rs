@@ -24,7 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{GreenKey, GreenType};
-use majit_metainterp::{JitDriver, JitState, TraceAction};
+use majit_metainterp::{JitDriver, JitState};
 
 use super::{jit_state, jitcodes};
 use super::{GrainFrame, Vm};
@@ -56,7 +56,7 @@ pub(super) fn dynamic_store_float(target: &mut Dynamic, value: crate::FLOAT) {
     **held = value;
 }
 
-fn position_bits(position: Position) -> i64 {
+pub(super) fn position_bits(position: Position) -> i64 {
     let line = position.line().unwrap_or(0) as u16;
     let column = position.position().unwrap_or(0) as u16;
     i64::from((u32::from(line) << 16) | u32::from(column))
@@ -89,6 +89,20 @@ pub(super) extern "C" fn code_byte(program: &Program<'_>, at: usize) -> i64 {
 #[majit_macros::elidable_cannot_raise]
 pub(super) extern "C" fn code_width(program: &Program<'_>, at: usize) -> i64 {
     crate::grain::bytecode::code::width(program.code(), at).map_or(-1, |n| n as i64)
+}
+
+/// Return what the operator-and-call arm does with the instruction tagged
+/// `tag`.
+///
+/// The `FORMS` table this reads is a `static`, and a static read the lowering
+/// walks has no host address to bind: it falls through the whole global
+/// folding chain to a nullary residual call naming the table itself.  Behind
+/// this boundary the read is invisible, the way `WIDTHS` already is behind
+/// [`code_width`].  The result is a bit set that no caller compares against a
+/// sentinel, so widening it loses nothing and needs no `-1`.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn code_form(tag: u8) -> i64 {
+    i64::from(crate::grain::bytecode::code::form(tag))
 }
 
 /// Read a little-endian `u16` operand, or `-1` when it is truncated.
@@ -156,6 +170,149 @@ pub(super) extern "C" fn track_operation_abi(
         .err()
 }
 
+/// Resolve an immutable program-table entry without exposing the backing
+/// container.
+///
+/// Each of these is `slice::get` over a table the artifact froze, and `get` is
+/// a callee the lowering leaves as an unbound symbolic residual -- one of those
+/// anywhere the portal can reach refuses every trace.  `Option<&T>` is the
+/// nullable pointer word the Ref result bank already carries, so the caller
+/// keeps the exact value the interpreter had.  Elidable, as the sibling
+/// [`program_constant`] is: the table does not change for the life of the
+/// program.
+#[majit_macros::elidable_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn program_token<'a>(
+    program: &'a Program<'_>,
+    index: u32,
+) -> Option<&'a crate::tokenizer::Token> {
+    program.token(index)
+}
+
+/// [`program_token`]'s sibling over the chain table.
+#[majit_macros::elidable_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn program_chain<'a>(
+    program: &'a Program<'_>,
+    index: u32,
+) -> Option<&'a crate::grain::bytecode::Chain> {
+    program.chain(index)
+}
+
+/// A chain's tail, as the one scalar [`super::chain_tail`] defines.
+///
+/// `Tail` is an inline enum inside `Chain`, so reading the field is an
+/// address-of rather than a load. A lowering that has no opcode for
+/// `base + offset` cannot say that, and this boundary is what keeps the
+/// distinction out of the trace: what crosses is the scalar, and the match
+/// stays behind it the way `WIDTHS` stays behind [`code_width`].
+///
+/// Opaque rather than elidable: an elidable body whose every operation the
+/// lowering can spell is inlined, and inlining this one puts the field read
+/// back in the caller.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn chain_tail(chain: &crate::grain::bytecode::Chain) -> i64 {
+    super::chain_tail_plain(chain)
+}
+
+/// An op-assignment's operator, as the one scalar [`super::assign_op_kind`]
+/// defines.
+///
+/// `Option<BinOpKind>` is an inline enum inside `AssignOp`, and the same
+/// address-of-rather-than-load distinction [`chain_tail`] crosses applies to
+/// it. Opaque rather than elidable for the reason given there.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn assign_op_kind(op: &crate::grain::bytecode::AssignOp) -> i64 {
+    super::assign_op_kind_plain(op)
+}
+
+/// [`program_token`]'s sibling over the switch table.
+#[majit_macros::elidable_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn program_switch<'a>(
+    program: &'a Program<'_>,
+    index: u32,
+) -> Option<&'a crate::grain::bytecode::Switch> {
+    program.switch(index)
+}
+
+/// [`program_token`]'s sibling over the residual-expression table.
+#[majit_macros::elidable_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn program_residual<'a>(
+    program: &'a Program<'_>,
+    index: u32,
+) -> Option<&'a crate::ast::Expr> {
+    program.residual(index)
+}
+
+/// [`array_entry`]'s write-side sibling.
+///
+/// The caller has already tested the index against the length, so this panics
+/// for the same inputs the bare index expression would.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn array_entry_mut<'a>(
+    array: &'a mut crate::Array,
+    index: usize,
+) -> &'a mut Dynamic {
+    &mut array[index]
+}
+
+/// Whether the built-in op-assignment table answers for this operand pair.
+///
+/// The table picks its callee out of a chain of closures, and the build can
+/// name an address for none of them, so each reaches the lowering as a residual
+/// call whose target stays unbound.  One such target anywhere the portal can
+/// reach refuses every trace, arm taken or not, which is what puts the
+/// resolution behind this boundary at all.
+///
+/// Asked separately from [`store_builtin_apply`] because the answer is a third
+/// state, and a residual call returns one word.  Spelling it as an out
+/// parameter does not work: the argument banks carry ABI words, and the address
+/// of a lowered local is not one, so the callee is handed a null to write
+/// through.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn store_builtin_available(
+    op: &AssignOp,
+    target: &Dynamic,
+    rhs: &Dynamic,
+) -> i64 {
+    i64::from(
+        crate::func::builtin::get_builtin_op_assignment_fn(&op.op_assign, target, rhs).is_some(),
+    )
+}
+
+/// Run the built-in op-assignment the table answers for this operand pair.
+///
+/// Total, because [`store_builtin_available`] has already answered `Some` for
+/// the same triple and the table it reads is pure — nothing between the two
+/// calls touches the operator token or either operand's type.  The result is
+/// the same nullable exception pointer [`track_operation_abi`] returns.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn store_builtin_apply(
+    vm: &mut Vm<'_>,
+    op: &AssignOp,
+    target: &mut Dynamic,
+    rhs: &mut Dynamic,
+    position: i64,
+) -> Option<Box<crate::EvalAltResult>> {
+    let position = position_from_bits(position);
+    let outcome = vm.store_builtin_resolved(op, target, rhs, position);
+    if outcome.handled {
+        return outcome.error;
+    }
+    // Unreachable while the two reads agree. Raised rather than passed over in
+    // silence, so that a table which stopped being pure loses the assignment
+    // loudly instead of leaving the target at its old value.
+    Some(Box::new(crate::EvalAltResult::ErrorRuntime(
+        "the built-in op-assignment table answered twice and disagreed".into(),
+        position,
+    )))
+}
+
 /// Read the engine's immutable fast-operator option without tracing through
 /// the `bitflags` implementation used by `LangOptions`.
 #[majit_macros::dont_look_inside_cannot_raise]
@@ -219,6 +376,18 @@ pub(super) extern "C" fn operand_stack_entry_mut<'a>(
     super::operand_mut(&mut vm.stack[index])
 }
 
+/// Resolve one array element across the residual ABI.
+///
+/// `Vec`'s indexing is a callee the lowering leaves as an unbound symbolic
+/// residual, and one of those anywhere the portal reaches refuses every
+/// trace. The caller has already tested the index against the length, so this
+/// panics for the same inputs the bare index expression would.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn array_entry<'a>(array: &'a crate::Array, index: usize) -> &'a Dynamic {
+    &array[index]
+}
+
 /// Move one value out of a pointer-stable operand slot.
 ///
 /// Keep `mem::take::<Dynamic>` behind this named ABI just as stores are kept
@@ -241,7 +410,22 @@ pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, index: usize, value
 /// mutable source makes this a move (`mem::take`), not an observable clone.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn operand_stack_store(vm: &mut Vm<'_>, index: usize, value: &mut Dynamic) {
-    *super::operand_mut(&mut vm.stack[index]) = core::mem::take(value);
+    dynamic_store(super::operand_mut(&mut vm.stack[index]), value);
+}
+
+/// Move one whole [`Dynamic`] through an already-resolved mutable place.
+///
+/// Scope cells and operand slots resolve to the same final `&mut Dynamic`, but
+/// the MIR frontend otherwise represents their assignments with the shared
+/// synthetic `__deref_write` marker.  Its single annotator stub cannot retain
+/// the distinct pointer owners, and it has no executable host address after
+/// residualization.  This concrete ABI keeps the aggregate move and the old
+/// value's drop together while allowing each caller to preserve how it found
+/// the destination (including a shared cell's write guard).
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn dynamic_store(target: &mut Dynamic, value: &mut Dynamic) {
+    *target = core::mem::take(value);
 }
 
 /// Drop every operand above `depth` and update the red VM's stack depth.
@@ -538,37 +722,68 @@ impl GrainJitDriver {
             // feeds is already the allocating part. `green_key_hash_typed`
             // takes a slice, and the owned `GreenKey` is built only inside the
             // factory below, which the door calls only when it needs one.
+            //
+            // The key is the JUMP TARGET's position followed by the declared
+            // greens, with the declared position green reading the target
+            // rather than the back edge — the shape `jit_interp`'s
+            // `green_key_expr` / `subst_target_for_pc` build for a marker
+            // interpreter, and the shape `TraceCtx::merge_point_green_key`
+            // reconstructs when `compile_loop` files the loop. A key that
+            // omits the leading target is a key the close never derives, and
+            // the loop is then stored where no back edge looks for it.
             let green_values = [
+                pc as i64,
                 pc as i64,
                 program_identity as i64,
                 program as *const Program as usize as i64,
             ];
+            let green_types: Vec<GreenType> = std::iter::once(GreenType::Int)
+                .chain(runtime.green_types.iter().copied())
+                .collect();
             assert_eq!(
                 green_values.len(),
-                runtime.green_types.len(),
-                "the merge point passes one value per declared green",
+                green_types.len(),
+                "the merge point passes the target and one value per declared green",
             );
-            let green_hash =
-                majit_metainterp::green_key_hash_typed(&green_values, &runtime.green_types);
+            let green_hash = majit_metainterp::green_key_hash_typed(&green_values, &green_types);
             let green_key = || GreenKey {
                 values: green_values.to_vec(),
-                types: runtime.green_types.clone(),
+                types: green_types.clone(),
             };
 
+            // The driver reads the live values off the state, and the state
+            // is the one object that outlives a single consultation, so the
+            // image this merge point was handed has to be published there
+            // before the door is asked anything.
+            runtime.state.publish_live(&env, &frame.jit_vable_words());
+
             let was_tracing = runtime.driver.is_tracing();
+            // The source pc, not the merge point's offset in the portal body.
+            // This is what `TraceCtx::header_pc` becomes, and the closing
+            // visit compares its own `pc` green against that field: handing it
+            // a jitcode offset makes the comparison one no source pc can
+            // satisfy, so the walk records the whole remaining loop instead of
+            // closing at the back edge. The offset is still what seeds the
+            // walk's first frame below, because that one names a position in
+            // the lowered body.
             let resume = runtime.driver.back_edge_structured(
                 green_hash,
                 green_key,
-                runtime.portal_merge_point,
+                pc,
                 &mut runtime.state,
                 &env,
                 || {},
             );
             let started = !was_tracing && runtime.driver.is_tracing();
             assert!(
-                resume.is_none() || started,
-                "a non-tracing resume would mean compiled code bypassed GrainJitState's refusal",
+                runtime.driver.take_back_edge_finish().is_none(),
+                "a compiled run reached `run_frame`'s own return; this loop has no path \
+                 that carries a `VmResult` back out of the portal",
             );
+            // A compiled run answers with the position the interpreter takes
+            // over at, and nothing else in this call produces one when the run
+            // happened -- tracing cannot have started in the same call.
+            resume_pc = resume;
             bump_stats(|stats| {
                 if started {
                     stats.traces_started += 1;
@@ -633,48 +848,22 @@ impl GrainJitDriver {
                     let mut stack = majit_metainterp::StandaloneFrameStack::new();
                     stack.frames.push(frame);
                     let trace_runtime = majit_metainterp::ClosureRuntime::new(|label| label);
-                    majit_metainterp::JitCodeSym::begin_portal_op(sym, header_pc);
 
-                    let action = loop {
-                        let step = {
-                            let mut machine = majit_metainterp::JitCodeMachine::<
-                                jit_state::GrainSym,
-                                _,
-                            >::with_framestack(
-                                &mut stack.frames, &[], &[]
-                            );
-                            machine.run_one_step(ctx, sym, &trace_runtime)
-                        };
-                        match step {
-                            TraceAction::Continue => {}
-                            other => {
-                                if std::env::var_os("RHAI_GRAIN_JIT_TRACE").is_some() {
-                                    let current = stack.frames.frames.last();
-                                    eprintln!(
-                                        "[grain-jit-trace] depth={} stack={:?} after={:?} action={other:?}",
-                                        stack.frames.len(),
-                                        stack
-                                            .frames
-                                            .frames
-                                            .iter()
-                                            .map(|frame| (frame.jitcode.name(), frame.code_cursor))
-                                            .collect::<Vec<_>>(),
-                                        current.map(|frame| (
-                                            frame.jitcode.name(),
-                                            frame.pc,
-                                            frame.code_cursor,
-                                            frame.jitcode.code.get(frame.last_opcode_position).copied(),
-                                            frame
-                                                .jitcode
-                                                .code
-                                                .get(frame.last_opcode_position)
-                                                .and_then(|opcode| jitcodes::insn_name(*opcode)),
-                                        )),
-                                    );
-                                }
-                                break other;
-                            }
-                        }
+                    // `run_to_end` is the walk every other majit entry point
+                    // uses: it opens and closes the portal op around the walk,
+                    // catches a panic raised inside one step, and stops a walk
+                    // that steps without recording. A hand-rolled step loop
+                    // has none of those and differs from the shared one only
+                    // by lacking them.
+                    let action = {
+                        let mut machine = majit_metainterp::JitCodeMachine::<
+                            jit_state::GrainSym,
+                            _,
+                        >::with_framestack(
+                            &mut stack.frames, &[], &[]
+                        );
+                        machine.set_outer_program_pc(pc);
+                        machine.run_to_end(ctx, sym, &trace_runtime)
                     };
                     let after = ctx.num_ops();
                     let recorded = after.saturating_sub(before);
@@ -704,6 +893,11 @@ impl GrainJitDriver {
             {
                 outcome = Some((pc, Vec::new()));
             }
+            assert!(
+                !runtime.driver.take_single_pass_finish(),
+                "the walk ran `run_frame` to its own return; this loop has no path that \
+                 carries a `VmResult` back out of the portal",
+            );
             if let Some((pc, reds)) = outcome {
                 runtime
                     .driver

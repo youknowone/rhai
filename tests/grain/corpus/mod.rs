@@ -1343,7 +1343,10 @@ pub const CASES: &[Case] = &[
     // inside a callback body is still a fragment, and a fragment would hand the
     // whole thing back to the walker; the pointers are read out into locals
     // because calling one through an index is a fragment too.
-    case("closure_made_inside_a_callback", "fn make(k) { let t = k * 10; || t } let a = [1, 2]; let r = 0; { let fs = a.map(|x| make(x)); let p = fs[0]; let q = fs[1]; r = p.call() + q.call(); } r"),
+    case(
+        "closure_made_inside_a_callback",
+        "fn make(k) { let t = k * 10; || t } let a = [1, 2]; let r = 0; { let fs = a.map(|x| make(x)); let p = fs[0]; let q = fs[1]; r = p.call() + q.call(); } r",
+    ),
     // `type_of` has no registered implementation anywhere — Rhai answers it by
     // name — so it is reached through the same door every other call is.
     // A constant argument is folded by the optimizer and proves nothing.
