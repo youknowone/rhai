@@ -16,13 +16,12 @@ processes corrected by the walker legs that bracket it.
 
     tax = (walker_plain / vm_plain) / (walker_jit / vm_jit)
 
-Above 1.00 the JIT build is slower. Today it always is: the tracer opens a
-trace, walks a few portal ops, hits an unbound symbolic residual and aborts,
-compiling nothing -- so what is gated here is a *ceiling on that tax*, not a
-floor under a speedup. The ceilings below are literals beside the cases, not a
-recorded file, so moving one is visible in the diff that moves it. When loops
-start compiling this file grows a second gate; until then a speedup would be a
-surprise, and the harness says so rather than quietly passing.
+Above 1.00 the JIT build is slower; its reciprocal is the measured gain over
+the plain VM. The existing cost ceilings remain unchanged. Independently of
+timing, the tight integer loop must now compile and enter machine code: a
+fast run with no compiled entry does not establish a working JIT. Other
+workloads can still abort at unsupported residuals, and this does not claim
+that compiling a loop by itself makes it faster.
 
 The LLBC extraction is not optional in practice. `MAJIT_MIR_FRONTEND_LLBC` is a
 `rerun-if-env-changed` input of the build script, so building `grain-jit`
@@ -44,13 +43,16 @@ Usage:
     ./grain-jit-check.py --check         # ... and exit non-zero over a ceiling
     ./grain-jit-check.py --no-build      # reuse the binaries already built
     ./grain-jit-check.py --llbc PATH     # the `--features grain-jit` extraction
+    ./grain-jit-check.py --case "tight integer loop"  # explicitly partial run
 
 `--llbc` is required unless `--no-build` reuses binaries that already have
 their tables: a build without it writes every table empty and the binary then
 panics before it measures anything.
 
-`--check` exits 1 when a case is over its ceiling or has vanished from the
-benchmark, and 2 when nothing breached but some case was too noisy to grade.
+`--check` exits 1 when a case is over its ceiling, has vanished, or fails its
+compiled-entry requirement, and 2 when nothing breached but some case was too
+noisy to grade. --case limits both execution and grading, and is not an
+all-workload pass.
 """
 
 import argparse
@@ -71,12 +73,10 @@ BIN = "release/examples/grain_bench"
 
 # The most the JIT build may cost, per case, as a multiple of the plain build.
 #
-# Still a tax and still no speedup: the tracer opens a trace, records five
-# portal ops, refuses an unbound symbolic residual and aborts, and after
-# `MAX_TRACE_ABORT_COUNT` aborts the green key is banned. What the door costs
-# now is the counter decision and nothing else -- majit stopped building a
-# state meta, a driver descriptor and a live-value vector ahead of it -- so a
-# case's tax tracks how many back edges it runs per unit of work.
+# These ceilings originated before any loop compiled. Keep them as regression
+# limits while also requiring actual compiled entry for the supported integer
+# loop below. Neither passing the ceiling nor compiling establishes a speedup;
+# the gain column reports that separately.
 #
 # Taken from the run that measured this tree, rounded up by about 20%. A
 # sample inflated further than that by a loaded machine is also spread further
@@ -85,8 +85,7 @@ BIN = "release/examples/grain_bench"
 # in that run, and the two cases differ only in arm count.
 #
 # These are ceilings on a cost, not floors under a benefit. They came down
-# once already, in the commit that earned it, and should come down again when
-# the trace stops dying at `__len`. Lowering one otherwise, or raising one to
+# once already, in the commit that earned it. Lowering one otherwise, or raising one to
 # make a run pass, defeats the point of having them.
 CEILINGS = {
     "tight integer loop": 2.25,
@@ -100,6 +99,11 @@ CEILINGS = {
     "native callbacks": 1.45,
     "primes": 1.80,
 }
+
+# Milestone, not a timing baseline: this workload must exercise generated
+# machine code. Keep unsupported workloads visible without pretending they
+# have reached this contract too.
+COMPILED_ENTRY_CASES = {"tight integer loop"}
 
 # Above this, the sample the number came from was contaminated enough that the
 # number is not worth reading. `grain_bench` reports it per case as the gap
@@ -118,8 +122,8 @@ ROW = re.compile(
 )
 JIT_ROW = re.compile(r"^\[jit\] (?P<name>.+?): (?P<fields>.*)$")
 # The metainterp names the callee it refused, once per distinct target, on
-# stderr and without being asked. It is the reason there is tax and no speedup,
-# so it is lifted out of the noise rather than left in the dump.
+# stderr and without being asked. Lift unsupported residuals out of the noise
+# rather than assuming that all workloads compile or all workloads abort.
 BLOCKER = re.compile(
     r"residual call target (?P<addr>0x[0-9a-f]+) is symbolic path "
     r"\"?(?P<path>[^\"]*)\"?, not a code address"
@@ -202,14 +206,32 @@ def build(target, features, env_extra, quiet):
         sys.exit(f"build failed: {features}")
 
 
-def measure(target, label):
+def compiled_entry_failures(run, cases):
+    failures = []
+    for name in cases:
+        if name not in COMPILED_ENTRY_CASES:
+            continue
+        fields = run.jit.get(name, {})
+        for field in ("compiled", "entries"):
+            try:
+                count = int(fields.get(field, ""))
+            except ValueError:
+                failures.append(f"{name}: missing or invalid JIT counter {field}")
+                continue
+            if count <= 0:
+                failures.append(f"{name}: {field}={count}, expected > 0")
+    return failures
+
+
+def measure(target, label, case=None):
     binary = ROOT / target / BIN
     if not binary.exists():
         sys.exit(f"{binary} does not exist; drop --no-build")
     print(f"running {label}", flush=True)
-    done = subprocess.run(
-        [str(binary)], cwd=ROOT, capture_output=True, text=True
-    )
+    command = [str(binary)]
+    if case is not None:
+        command.extend(["--case", case])
+    done = subprocess.run(command, cwd=ROOT, capture_output=True, text=True)
     # A case whose walker and VM disagree panics rather than reporting, and a
     # case below its own floor writes to stderr without failing. Neither is
     # this harness's gate, but both belong in its output.
@@ -226,9 +248,10 @@ def measure(target, label):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--check", action="store_true", help="exit non-zero over a ceiling")
+    ap.add_argument("--check", action="store_true", help="gate cost ceilings and required compiled entry")
     ap.add_argument("--no-build", action="store_true")
     ap.add_argument("--quiet-build", action="store_true", help="hide cargo output")
+    ap.add_argument("--case", choices=CEILINGS, help="run only this case, not the full benchmark")
     ap.add_argument(
         "--llbc",
         default=os.environ.get("MAJIT_MIR_FRONTEND_LLBC"),
@@ -252,10 +275,13 @@ def main():
         jit_env = {"MAJIT_MIR_FRONTEND_LLBC": args.llbc} if args.llbc else {}
         build(JIT_TARGET, "grain-jit", jit_env, args.quiet_build)
 
-    plain = measure(PLAIN_TARGET, "plain VM")
-    jit = measure(JIT_TARGET, "JIT-consulting VM")
+    cases = [args.case] if args.case else list(CEILINGS)
+    plain = measure(PLAIN_TARGET, "plain VM", args.case)
+    jit = measure(JIT_TARGET, "JIT VM", args.case)
 
     print()
+    if args.case:
+        print(f"selected case: {args.case} (not a full benchmark run)")
     # A ratio taken on a busy machine is not comparable with one taken on an
     # idle machine, and the two runs are two processes -- so both ends of both.
     print(f"plain: {plain.build}   load {' -> '.join(plain.load)}")
@@ -280,14 +306,14 @@ def main():
     # Three timings and three ratios: the tree-walking interpreter Rhai ships,
     # the VM without the merge point, and the VM with it. `vm/walk` and
     # `jit/walk` are each run's own in-process comparison; `tax` is what the
-    # merge point cost, and is the only column gated.
+    # merge point cost. Actual compilation/entry is a separate non-timing gate.
     print(
         f"{'':<22} {'walker':>9} {'vm':>9} {'vm+jit':>9} {'vm/walk':>8} "
-        f"{'jit/walk':>9} {'tax':>7} {'ceil':>7} {'spread':>7}"
+        f"{'jit/walk':>9} {'tax':>7} {'gain':>7} {'ceil':>7} {'spread':>7}"
     )
 
     over, unstable, missing = [], [], []
-    for name in CEILINGS:
+    for name in cases:
         if name not in plain.cases or name not in jit.cases:
             missing.append(name)
             continue
@@ -301,7 +327,7 @@ def main():
         ceil_text = "-" if ceiling is None else f"{ceiling:.2f}x"
         print(
             f"{name:<22} {p['walker']:>7.1f}ms {p['vm']:>7.1f}ms {j['vm']:>7.1f}ms "
-            f"{p['speedup']:>7.2f}x {j['speedup']:>8.2f}x {tax:>6.2f}x "
+            f"{p['speedup']:>7.2f}x {j['speedup']:>8.2f}x {tax:>6.2f}x {1 / tax:>6.2f}x "
             f"{ceil_text:>7} {spread * 100:>6.0f}%"
         )
         # `grain_bench` reports the worse of the two legs that make up its
@@ -312,12 +338,17 @@ def main():
         elif ceiling is not None and tax > ceiling:
             over.append(f"{name}: {tax:.2f}x, ceiling {ceiling:.2f}x")
 
+    entry_failures = compiled_entry_failures(jit, cases)
     if jit.jit:
         print()
         for name, fields in jit.jit.items():
             rendered = " ".join(f"{k}={v}" for k, v in fields.items())
             print(f"[jit] {name}: {rendered}")
-        compiled = sum(int(f.get("compiled", 0)) for f in jit.jit.values())
+        compiled = sum(
+            int(fields["compiled"])
+            for fields in jit.jit.values()
+            if fields.get("compiled", "").isdigit()
+        )
         print()
         print(
             f"loops compiled across all cases: {compiled}"
@@ -353,6 +384,8 @@ def main():
 
     if missing:
         print(f"\nnot measured: {', '.join(missing)}", file=sys.stderr)
+    if entry_failures:
+        print("\ncompiled-entry contract failed:\n  " + "\n  ".join(entry_failures), file=sys.stderr)
     if unstable:
         print(
             "\n%d case(s) too noisy to grade -- rerun on a quiet machine:\n  %s"
@@ -382,7 +415,7 @@ def main():
         # as a regression. `missing` is a failure of its own kind: a case in the
         # table above that the benchmark no longer runs has lost its gate
         # without anything saying so.
-        if over or missing:
+        if over or missing or entry_failures:
             sys.exit(1)
         if unstable:
             sys.exit(2)

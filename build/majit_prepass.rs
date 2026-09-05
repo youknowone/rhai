@@ -87,6 +87,7 @@ const OUTPUTS: &[&str] = &[
     "descrs.bin",
     "descrs_index.bin",
     "symbolic_fnaddrs.bin",
+    "effect_mints.bin",
 ];
 
 pub fn main() {
@@ -206,7 +207,7 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
         ..Default::default()
     };
 
-    let pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
+    let mut pipeline = majit_translate::analyze_multiple_pipeline_with_modules(
         &[],
         &config,
         None,
@@ -248,10 +249,51 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
          `#[cfg(feature = \"grain-jit\")]`: extract the LLBC with \
          `--features grain-jit`, or the call is not in the MIR at all."
     );
+    freeze_effects(&mut pipeline);
     pipeline
 }
 
+/// `effectinfo.py::compute_bitstrings` runs before the translated image is
+/// written. Persist both its call bitstrings and its descriptor mutations;
+/// preserving just the former makes every runtime field appear unwritten.
+fn freeze_effects(pipeline: &mut majit_translate::ProgramPipelineResult) {
+    use majit_ir::effectinfo::DescrSetMember;
+    let mut effects = Vec::new();
+    for descr in &mut pipeline.descrs {
+        if let majit_translate::jitcode::BhDescr::Call { calldescr }
+        | majit_translate::jitcode::BhDescr::JitCode { calldescr, .. } = descr
+        {
+            effects.push(&mut calldescr.extra_info);
+        }
+    }
+    for code in &mut pipeline.jitcodes {
+        effects.push(
+            &mut std::sync::Arc::make_mut(code)
+                .body_mut()
+                .calldescr
+                .extra_info,
+        );
+    }
+    let layout = majit_ir::effectinfo::compute_frozen_bitstrings(&mut effects);
+    for entry in &mut pipeline.ei_descr_mints {
+        let category = match entry.member {
+            DescrSetMember::Field { .. } => 0,
+            DescrSetMember::Array { .. } => 1,
+            DescrSetMember::InteriorField { .. } => 2,
+        };
+        entry.ei_index = layout.descr_indices[category]
+            .get(&entry.member)
+            .copied()
+            .unwrap_or(u32::MAX);
+    }
+}
+
 fn write_tables(out_dir: &str, pipeline: &majit_translate::ProgramPipelineResult) {
+    write(
+        out_dir,
+        "effect_mints.bin",
+        &bincode::serialize(&pipeline.ei_descr_mints).unwrap(),
+    );
     // Bodies concatenated, boundaries beside them: the runtime resolves one
     // jitcode without paying to decode the rest, which matters because the
     // portal is entered per back-edge and its callees are not.
@@ -321,6 +363,11 @@ fn write_tables(out_dir: &str, pipeline: &majit_translate::ProgramPipelineResult
 /// `majit-translate` into a build that asked for no JIT.
 fn write_empty_tables(out_dir: &str) {
     let empty: Vec<u8> = Vec::new();
+    write(
+        out_dir,
+        "effect_mints.bin",
+        &bincode::serialize(&empty).unwrap(),
+    );
     let names: Vec<String> = Vec::new();
     let offsets: Vec<u32> = vec![0];
     write(out_dir, "jitcodes.bin", &empty);

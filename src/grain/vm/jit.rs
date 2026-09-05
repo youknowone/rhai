@@ -359,6 +359,26 @@ pub(super) extern "C" fn operand_stack_len(vm: &Vm<'_>) -> i64 {
     vm.stack.len() as i64
 }
 
+/// Native entry for the original `Vm::grow_stack` jitcode.
+///
+/// `blackhole.py::BlackholeInterpreter.bhimpl_inline_call_ir_v` calls the
+/// callee's native `fnaddr` even if tracing inlined its body. The cold growth
+/// branch can be reached only after a guard fails, so binding just the calls
+/// observed while recording the hot path is insufficient. This adapter keeps
+/// the existing helper's allocation and initialization together and exposes
+/// its exact `(Vm reference, extra count) -> void` signature as a C ABI.
+#[inline(never)]
+pub(super) extern "C" fn grow_stack_abi(vm: &mut Vm<'_>, extra: usize) {
+    vm.grow_stack(extra);
+}
+
+/// `blackhole.py::bhimpl_inline_call_r_i` calls the original helper while
+/// finishing a guard exit up to the next merge point, including its greens.
+#[inline(never)]
+pub(super) extern "C" fn program_jit_identity_abi(program: &Program) -> u64 {
+    program.jit_identity()
+}
+
 /// Resolve one pointer-stable operand slot across the residual ABI.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
@@ -940,7 +960,13 @@ impl GrainJitDriver {
             frame.restore_from_jit(&restored, vm);
         }
         if let Some(pc) = resume_pc {
-            frame.jit_resume_pc_plus_one = pc + 1;
+            // usize::MAX is the driver's terminal/no-PC outcome, not a
+            // resumable source location. Until the VmResult/exception bridge
+            // can carry that outcome, fail explicitly: wrapping to zero would
+            // silently replay the native opcode after partial heap effects.
+            frame.jit_resume_pc_plus_one = pc.checked_add(1).expect(
+                "Grain blackhole did not reach a resumable merge point; refusing to replay its effects",
+            );
         }
 
         if let Some(event) = report_event {

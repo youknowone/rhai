@@ -95,7 +95,7 @@ fuzz = ["arbitrary", "rust_decimal?/rust-fuzz", "serde", "grain"]
 ## Enable the experimental [`grain`](grain/index.html) bytecode VM
 grain = []
 ## Emit and consult the tracing-JIT merge point in the `grain` dispatch loop.
-## Compiled entry remains disabled until residual function addresses are bound.
+## Supported traces compile and enter machine code; unbound residual paths still abort.
 grain-jit = ["grain", "dep:majit-translate", "dep:majit-metainterp", "dep:majit-ir", "dep:majit-macros", "dep:majit-charon-reader", "dep:bincode"]
 
 #! ### System Configuration Features

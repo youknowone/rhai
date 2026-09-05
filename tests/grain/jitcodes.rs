@@ -135,3 +135,20 @@ fn the_compiled_driver_describes_its_own_greens_and_reds() {
     assert_eq!(driver.virtualizables, ["frame"]);
     eprintln!("driver names portal {} with {} greens and {} reds", driver.main_jitcode_index, driver.greens.len(), driver.reds.len(),);
 }
+
+/// `blackhole.py::bhimpl_inline_call_ir_v` invokes the original helper's
+/// native address even when tracing normally inlines its body. A cold stack
+/// growth branch must therefore remain callable after a guard failure.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn blackhole_stack_growth_and_merge_point_greens_have_callable_native_entries() {
+    if no_tables() {
+        return;
+    }
+    let table = jitcodes::all();
+    for name in ["grow_stack", "jit_identity"] {
+        let code = table.iter().find(|code| code.name == name).unwrap_or_else(|| panic!("the lowered VM contains {name}"));
+        assert_ne!(code.fnaddr, 0);
+        assert!(!majit_translate::codewriter::call::is_symbolic_fnaddr(code.fnaddr), "the blackhole cannot finish a guard with symbolic {name} target {:#x}", code.fnaddr);
+    }
+}

@@ -281,7 +281,29 @@ fn load_average() -> String {
 }
 
 fn main() {
-    let check = std::env::args().any(|arg| arg == "--check");
+    let mut check = false;
+    let mut selected_case = None;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--check" => check = true,
+            "--case" => {
+                let Some(name) = args.next() else {
+                    eprintln!("--case needs an exact case name");
+                    std::process::exit(2);
+                };
+                if !CASES.iter().any(|case| case.name == name) {
+                    eprintln!("unknown benchmark case: {name}");
+                    std::process::exit(2);
+                }
+                selected_case = Some(name);
+            }
+            _ => {
+                eprintln!("unknown argument: {arg}; use --check and/or --case NAME");
+                std::process::exit(2);
+            }
+        }
+    }
     let engine = Engine::new();
 
     // Rhai's default options include FAST_OPS, which makes the walker
@@ -294,6 +316,9 @@ fn main() {
     slow_engine.set_fast_operators(false);
 
     println!("{}", build_line());
+    if let Some(name) = &selected_case {
+        println!("selected case: {name} (not a full benchmark run)");
+    }
     println!("load average before: {}", load_average());
     println!(
         "{:<22} {:>11} {:>11} {:>9} {:>7} {:>8} {:>11} {:>10}",
@@ -306,6 +331,12 @@ fn main() {
     let mut jit_rows: Vec<String> = Vec::new();
 
     for case in CASES {
+        if selected_case
+            .as_ref()
+            .map_or(false, |name| name != case.name)
+        {
+            continue;
+        }
         let ast = engine.compile(case.source).expect("must compile");
         let program: Program = Compiler::new().compile(&ast);
         // Owned and shared only where a pointer can escape to a native, so the

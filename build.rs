@@ -1,6 +1,6 @@
 use std::{
     env,
-    fs::File,
+    fs::{self, File},
     io::{Read, Write},
 };
 
@@ -28,10 +28,16 @@ fn main() {
 
     contents = contents.replace("{{HASHING_SEED}}", &seed);
 
-    File::create("src/config/hashing_env.rs")
-        .expect("cannot create `hashing_env.rs`")
-        .write_all(contents.as_bytes())
-        .expect("cannot write to `config/hashing_env.rs`");
+    // Charon fingerprints the source closure across extraction. Rewriting an
+    // unchanged generated source makes that window look dirty even when the
+    // hashing configuration has not changed (and concurrent feature builds
+    // needlessly invalidate one another's inputs).
+    if !fs::read_to_string("src/config/hashing_env.rs").is_ok_and(|old| old == contents) {
+        File::create("src/config/hashing_env.rs")
+            .expect("cannot create `hashing_env.rs`")
+            .write_all(contents.as_bytes())
+            .expect("cannot write to `config/hashing_env.rs`");
+    }
 
     #[cfg(feature = "grain-jit")]
     majit_prepass::main();

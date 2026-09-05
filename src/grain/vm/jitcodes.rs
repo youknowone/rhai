@@ -34,6 +34,7 @@ static INSNS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/insns.bin"));
 /// baked at build time, so it is stored and handed over unencoded — a length
 /// prefix would shift every one of those offsets by its own width.
 static ALL_LIVENESS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/all_liveness.bin"));
+static EFFECT_MINTS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/effect_mints.bin"));
 
 /// One table's entries, as byte ranges over its concatenated bodies.
 ///
@@ -65,10 +66,14 @@ pub fn resolve_symbolic_fnaddr_path(fnaddr: i64) -> Option<&'static str> {
 ///
 /// Build-time addresses are symbolic because build.rs runs in another
 /// process.  These are the matching final-process addresses; every signature
-/// is C ABI and returns one machine word, so no Rust enum or fat pointer
+/// is C ABI and returns at most one machine word, so no Rust enum or fat pointer
 /// crosses the compiled-code boundary.
 fn runtime_bindings() -> Vec<(&'static str, i64)> {
     vec![
+        (
+            "grain::program::Program::jit_identity",
+            super::jit::program_jit_identity_abi as *const () as usize as i64,
+        ),
         (
             "rhai::grain::vm::jit::code_byte",
             super::jit::code_byte as *const () as usize as i64,
@@ -154,6 +159,12 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::operand_stack_len as *const () as usize as i64,
         ),
         (
+            // The declaration-owned method path, not the adapter's path:
+            // this is the native entry of the already-lowered helper.
+            "grain::vm::Vm::grow_stack",
+            super::jit::grow_stack_abi as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::operand_stack_entry",
             super::jit::operand_stack_entry as *const () as usize as i64,
         ),
@@ -195,8 +206,9 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
 /// is addressed by index from inside jitcode bodies for the life of the
 /// process.
 fn table() -> &'static EmbeddedJitCodeTable {
-    static TABLE: once_cell::race::OnceBox<&'static EmbeddedJitCodeTable> =
-        once_cell::race::OnceBox::new();
+    // Descriptor setup mutates shared GcCache objects. A racing initializer
+    // may not run it twice while another thread already traces the image.
+    static TABLE: std::sync::OnceLock<&'static EmbeddedJitCodeTable> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let (_names, offsets): (Vec<String>, Vec<u32>) =
             bincode::deserialize(JITCODES_INDEX).expect("the jitcode index decodes");
@@ -227,12 +239,15 @@ fn table() -> &'static EmbeddedJitCodeTable {
                 eprintln!("[majit-binding] {address:#x} {name}");
             }
         }
-        Box::new(EmbeddedJitCodeTable::materialize_with_symbolic_fnaddrs(
+        let effect_mints: Vec<majit_ir::effectinfo::DescrMintEntry> =
+            bincode::deserialize(EFFECT_MINTS).expect("the effect descriptor image decodes");
+        EmbeddedJitCodeTable::materialize_with_frozen_effects(
             &jitcodes,
             descrs,
             symbolic_fnaddrs(),
             &bindings,
-        ))
+            &effect_mints,
+        )
     })
 }
 

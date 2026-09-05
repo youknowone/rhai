@@ -74,8 +74,10 @@ fn the_live_values_carry_the_kinds_the_descriptor_declares() {
     let env: Vec<i64> = vec![0x1000, 0x2000];
     let meta = state.build_meta(jitcodes::portal_merge_point_offset().expect("the portal names its merge point"), &env);
 
-    assert_eq!(state.extract_live(&meta), env);
-    let types: Vec<_> = state.extract_live_values(&meta).iter().map(majit_ir::Value::get_type).collect();
+    // This integration test has no live frame to publish. Actual red-value
+    // publication and typed extraction are tested inside jit_state; the
+    // stored meta must not supply stale values to a later compiled entry.
+    let types = state.live_value_types(&meta);
     let declared: Vec<_> = jd.reds().iter().map(|var| var.tp).collect();
     assert_eq!(types, declared, "a live value whose type differs from its red's makes the driver decline silently",);
 }
@@ -100,10 +102,11 @@ fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
     );
 }
 
-/// The state gate refuses an artifact before majit's backend-entry hook.
+/// The compatibility gate checks the compiled red schema, not whether some
+/// unrelated path in the build still has an unbound residual.
 #[test]
 #[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
-fn the_state_actively_refuses_compiled_entry() {
+fn the_state_accepts_matching_reds_and_refuses_a_mismatched_schema() {
     if no_tables() {
         return;
     }
@@ -112,9 +115,14 @@ fn the_state_actively_refuses_compiled_entry() {
     let header_pc = jitcodes::portal_merge_point_offset().expect("the portal names its merge point");
     let meta = state.build_meta(header_pc, &[0x1000, 0x2000][..]);
 
-    assert!(!state.is_compatible(&meta), "unbound residual targets make every compiled artifact incompatible",);
+    assert!(state.is_compatible(&meta));
+    assert_eq!(jit_state::stats().compiled_entries_refused, 0);
+    for reds in [&[][..], &[0x1000][..], &[0x1000, 0x2000, 0x3000][..]] {
+        let mismatched = jit_state::GrainMeta { header_pc, reds: reds.to_vec() };
+        assert!(!state.is_compatible(&mismatched), "the compiled entry requires exactly its declared red schema");
+    }
     let stats = jit_state::stats();
-    assert_eq!(stats.compiled_entries_refused, 1);
+    assert_eq!(stats.compiled_entries_refused, 3);
     assert_eq!(stats.compiled_entries, 0);
 }
 
@@ -179,30 +187,33 @@ fn the_driver_accepts_the_tables_this_crate_ships() {
     eprintln!("driver 0 accepted {} jitcodes, portal {portal}", table.len());
 }
 
-/// A real VM loop reaches warmstate, opens a trace and records portal ops.
-///
-/// Compiled entry is a separate assertion: the embedded table still has no
-/// symbolic fnaddr bindings, so `GrainJitState::is_compatible` must keep the
-/// backend-entry hook at zero even if this or a later portal walk compiles.
+/// A real VM loop must compile, enter machine code and finish with the same
+/// answer as the walker. Adjacent trip counts exercise different positions
+/// of the terminating condition relative to the compiled interval: the old
+/// incomplete guard handoff accidentally passed 20000 but added 4096 twice.
 #[test]
 #[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
-fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
+fn a_hot_grain_loop_compiles_enters_and_resumes_without_replaying_effects() {
     if no_tables() {
         return;
     }
 
+    for limit in [4095, 4096, 4097] {
+        check_hot_loop(limit);
+    }
+}
+
+fn check_hot_loop(limit: usize) {
     jit_state::reset_stats();
     let engine = Engine::new();
     let ast = engine
-        .compile(
-            "let i = 0; let total = 0; \
-             while i < 4096 { total += i; i += 1; } total",
-        )
+        .compile(format!("let i = 0; let total = 0; while i < {limit} {{ total += i; i += 1; }} total"))
         .expect("the hot loop parses");
     let program = Compiler::new().compile(&ast);
     let mut scope = Scope::new();
     let result = Vm::new(&engine).eval_with_scope(&mut scope, &program).expect("the hot loop runs");
-    assert_eq!(format!("{result:?}"), "8386560");
+    let expected = limit * (limit - 1) / 2;
+    assert_eq!(format!("{result:?}"), expected.to_string(), "limit {limit}");
 
     let stats = jit_state::stats();
     eprintln!("hot grain loop JIT stats: {stats:?}");
@@ -214,13 +225,15 @@ fn a_hot_grain_loop_consults_and_records_without_entering_compiled_code() {
     );
     assert!(stats.traces_started > 0, "a warm decision must start tracing: {stats:?}",);
     assert!(stats.ops_recorded > 0, "the portal walk must append trace operations: {stats:?}",);
-    assert_eq!(stats.loops_compiled, 0, "the unbound residual boundary is reached before loop compilation: {stats:?}",);
-    assert_eq!(stats.traces_aborted, stats.traces_started, "every trace attempt must end at the observed abort boundary: {stats:?}",);
-    assert_eq!(stats.symbolic_residual_aborts, stats.traces_started, "the abort reason must be the actively refused symbolic residual: {stats:?}",);
-    assert_eq!(stats.max_trace_ops, 236, "the trace must pass comparison/value construction and both assignment setup paths before the next unbound residual: {stats:?}",);
-    assert_eq!(stats.ops_recorded, stats.max_trace_ops * stats.traces_started, "each attempt records the same prefix through the first built-in assignment: {stats:?}",);
-    assert_eq!(stats.compiled_entries, 0, "the immediately-before-backend-entry hook must remain unreachable: {stats:?}",);
+    assert!(stats.loops_compiled > 0, "the integer loop must close and compile: {stats:?}");
+    assert_eq!(stats.symbolic_residual_aborts, 0, "the integer path must not stop at an unbound residual: {stats:?}");
+    assert!(stats.compiled_entries > 0, "compilation alone does not prove machine code ran: {stats:?}");
     assert_eq!(stats.non_owner_consultations_declined, 0, "the observation run must own its driver: {stats:?}",);
     assert_eq!(stats.reentrant_consultations_declined, 0, "the observation run must not hide nested consultations: {stats:?}",);
-    assert!(stats.abort_reasons.contains("unbound_symbolic_residual="), "the report must name the abort boundary: {stats:?}",);
+
+    // The same compiled artifact must accept a fresh VM/frame and scope,
+    // rather than carrying the first run's live object identities with it.
+    let again = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the compiled loop runs again");
+    assert_eq!(format!("{again:?}"), expected.to_string(), "reused artifact, limit {limit}");
+    assert!(jit_state::stats().compiled_entries > stats.compiled_entries);
 }

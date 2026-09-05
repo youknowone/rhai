@@ -143,8 +143,9 @@ pub fn grain_driver_descriptor() -> JitDriverStaticData {
 
 /// The shape of the code being traced, captured when tracing starts.
 ///
-/// Carries the red image itself because [`JitState::extract_live`] is handed
-/// only the meta -- the live values have to survive from `build_meta` to there.
+/// Records the compile-time red shape. Live values are republished on
+/// [`GrainJitState`] for every consultation; a reused artifact must not read
+/// the frame/VM addresses captured when its meta was built.
 #[derive(Clone)]
 pub struct GrainMeta {
     /// The merge point's own offset in the portal body.
@@ -230,6 +231,33 @@ impl GrainJitState {
     /// The live frame, as the virtualizable identity red names it.
     fn live_frame_ptr(&self) -> Option<*mut u8> {
         self.reds.first().map(|frame| *frame as usize as *mut u8)
+    }
+}
+
+#[cfg(all(test, rhai_grain_jit_tables))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_values_come_from_this_entry_not_the_compiled_artifacts_meta() {
+        let mut state = GrainJitState::default();
+        let first = [0x1000, 0x2000];
+        state.publish_live(&first, &[]);
+        let meta = state.build_meta(
+            jitcodes::portal_merge_point_offset().expect("the lowered portal has a merge point"),
+            &first,
+        );
+        assert_eq!(state.extract_live(&meta), first);
+
+        let next = [0x3000, 0x4000];
+        state.publish_live(&next, &[]);
+        assert_eq!(state.extract_live(&meta), next);
+        assert_eq!(meta.reds, first);
+        let values = state.extract_live_values(&meta);
+        assert_eq!(
+            values.iter().map(Value::get_type).collect::<Vec<_>>(),
+            red_kinds()
+        );
     }
 }
 
