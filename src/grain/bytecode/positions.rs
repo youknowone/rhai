@@ -1,5 +1,5 @@
-use crate::grain::pos::Site;
 use crate::Position;
+use crate::grain::pos::Site;
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -211,7 +211,7 @@ pub(crate) fn site_to_position(site: Site) -> Position {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grain::bytecode::{assemble, Op};
+    use crate::grain::bytecode::{Op, assemble};
 
     /// Four one-byte instructions, so each of `sample`'s addresses begins one.
     fn code() -> Vec<u8> {

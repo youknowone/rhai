@@ -14,10 +14,10 @@ mod verify;
 
 pub use chain::{Chain, Root, Step, StepFlags, Tail};
 pub use chunk::Chunk;
-pub use code::{assemble, disassemble, resolve_switch_targets, AssembleError, Code};
+pub use code::{AssembleError, Code, assemble, disassemble, resolve_switch_targets};
 pub use op::{AssignOp, BinOpKind, BinOperand, Branch, Op, Receiver, UnOpKind};
 pub(crate) use positions::site_to_position;
 pub use positions::{Positions, TableError};
 pub use strings::{BadTable, Strings};
-pub use switch::{probe, Switch, SwitchCase, SwitchRange};
-pub use verify::{verify, Pools, VerifyError};
+pub use switch::{Switch, SwitchCase, SwitchRange, probe};
+pub use verify::{Pools, VerifyError, verify};

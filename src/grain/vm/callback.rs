@@ -45,11 +45,11 @@ use std::prelude::v1::*;
 
 use crate::types::fn_ptr::FnPtrType;
 use crate::{
-    func::{FnCallArgs, RhaiFunc},
     Dynamic, FnArgsVec, FuncRegistration, Locked, Module, NativeCallContext, Shared, SmartString,
+    func::{FnCallArgs, RhaiFunc},
 };
 
-use super::{malformed, Vm, VmResult, Warm};
+use super::{Vm, VmResult, Warm, malformed};
 use crate::grain::program::SharedProgram;
 
 /// The parts finished crossings of one run left behind, for its next crossing.
@@ -433,10 +433,11 @@ mod tests {
     fn a_crossing_hands_on_no_values() {
         let source = "fn f(x) { let a = [x, x + 1]; let t = x; for i in a { t += i; } t }";
         let (.., warm) = crossings(source, "f", 3, true);
-        assert!(warm
-            .stack
-            .iter()
-            .all(|slot| super::super::operand_ref(slot).is_unit()));
+        assert!(
+            warm.stack
+                .iter()
+                .all(|slot| super::super::operand_ref(slot).is_unit())
+        );
         assert!(warm.iterators.is_empty());
         assert!(warm.handlers.is_empty());
         assert!(warm.sizes.is_empty());

@@ -4,11 +4,11 @@ use std::prelude::v1::*;
 use crate::ast::{ASTFlags, ASTNode};
 #[cfg(not(feature = "no_module"))]
 use crate::module_resolvers::StaticModuleResolver;
-use crate::{ast::Expr, ast::Stmt, tokenizer::Token, Dynamic, ImmutableString, Module, Shared};
+use crate::{Dynamic, ImmutableString, Module, Shared, ast::Expr, ast::Stmt, tokenizer::Token};
 
 use crate::grain::bytecode::{
-    site_to_position, sites, AssignOp, Chain, Chunk, Code, Op, Pools, Positions, Root, Strings,
-    Switch, TableError,
+    AssignOp, Chain, Chunk, Code, Op, Pools, Positions, Root, Strings, Switch, TableError,
+    site_to_position, sites,
 };
 use crate::grain::format::{Caps, Sidecar};
 
@@ -496,10 +496,9 @@ impl<'a> Program<'a> {
     /// Typed methods are invisible here. Rhai only ever tries a typed hash on a
     /// *method* call (`func/call.rs:614`), so `fn <int>.foo()` cannot be reached
     /// as `foo()` — see [`Program::method`], which is the other door.
+    #[cfg_attr(feature = "grain-jit", allow(dead_code))]
     pub(crate) fn function(&self, name: u32, argc: usize) -> Option<&Function> {
-        self.functions
-            .iter()
-            .find(|f| f.name == name && f.params.len() == argc && f.this_type.is_none())
+        self.function_plain(name, argc)
     }
 
     /// The compiled function a *method* call resolves to.
@@ -589,7 +588,20 @@ impl<'a> Program<'a> {
 
     /// A name, borrowed from the artifact. Never allocates.
     pub(crate) fn name(&self, index: u32) -> Option<&str> {
+        self.name_plain(index)
+    }
+
+    /// [`Self::name`] without the JIT residual boundary. The dispatch loop
+    /// reaches names through that boundary; every other reader can stay here.
+    pub(crate) fn name_plain(&self, index: u32) -> Option<&str> {
         self.names.get(index)
+    }
+
+    /// [`Self::function`] without the JIT residual boundary.
+    pub(crate) fn function_plain(&self, name: u32, argc: usize) -> Option<&Function> {
+        self.functions
+            .iter()
+            .find(|f| f.name == name && f.params.len() == argc && f.this_type.is_none())
     }
 
     pub(crate) fn token(&self, index: u32) -> Option<&Token> {
@@ -805,7 +817,7 @@ impl<'a> Program<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grain::bytecode::{assemble, Op, Positions, Strings};
+    use crate::grain::bytecode::{Op, Positions, Strings, assemble};
 
     /// Names: 0 `f`, 1 `i64`, 2 `string`.
     fn program_of(functions: &[(u32, Option<u32>, usize)]) -> Program<'static> {

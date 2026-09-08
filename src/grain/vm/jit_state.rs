@@ -17,8 +17,48 @@
 //! is the walk itself: it refuses such a call before making it and abandons
 //! the trace, so no body that reaches one is ever compiled.
 
-use majit_ir::{OpRef, Type, Value};
-use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
+use majit_ir::{GcRef, OpRef, Type, Value};
+use majit_metainterp::{
+    GuardResumeFrame, JitCodeRuntime, JitCodeSym, JitDriverStaticData, JitState, TraceAction,
+    TraceCtx, seed_bridge_virtualizable_boxes, trace_jitcode_at_resume_framestack,
+};
+
+/// The six register lists of a `jit_merge_point` op: green I/R/F then red I/R/F.
+///
+/// Same payload `setup_frame_from_merge_point` decodes. Grain's two reds are
+/// both Ref, so the live frame is red-R[0] and the live Vm is red-R[1].
+fn merge_point_slot_regs(
+    jitcode: &majit_metainterp::JitCode,
+    header_pc: usize,
+) -> Option<[Vec<usize>; 6]> {
+    let code = &jitcode.code;
+    let mut cur = header_pc.checked_add(2)?;
+    let mut slots: [Vec<usize>; 6] = std::array::from_fn(|_| Vec::new());
+    for regs in slots.iter_mut() {
+        let len = usize::from(*code.get(cur)?);
+        cur = cur.checked_add(1)?;
+        for _ in 0..len {
+            regs.push(usize::from(*code.get(cur)?));
+            cur = cur.checked_add(1)?;
+        }
+    }
+    Some(slots)
+}
+
+/// Replace every Ref register that still holds `stale` with `live`.
+#[cfg(test)]
+fn forward_ref_bits(frames: &mut [GuardResumeFrame], stale: i64, live: i64) {
+    if stale == live {
+        return;
+    }
+    for frame in frames {
+        for reg in &mut frame.regs {
+            if reg.bank == Type::Ref && reg.value == stale {
+                reg.value = live;
+            }
+        }
+    }
+}
 
 use super::jitcodes;
 
@@ -174,12 +214,14 @@ impl JitCodeSym for GrainSym {
         self.header_pc
     }
 
-    fn fail_args(&self) -> Option<Vec<OpRef>> {
-        Some(self.reds.clone())
-    }
-
-    fn fail_args_types(&self) -> Option<Vec<Type>> {
-        Some(red_kinds().to_vec())
+    fn loop_carried_boxes(&self, _vable_boxes: &[(OpRef, Type)]) -> Option<Vec<(OpRef, Type)>> {
+        Some(
+            self.reds
+                .iter()
+                .copied()
+                .zip(red_kinds().iter().copied())
+                .collect(),
+        )
     }
 }
 
@@ -210,6 +252,16 @@ pub struct GrainJitState {
     /// forbids `unsafe`, and the frame is in hand where the merge point
     /// publishes.
     vable_statics: Vec<i64>,
+}
+
+/// Bind vinfo so `GETFIELD_VABLE` has field descrs when the resume stream
+/// declined. Empty boxes: the getfield then loads through the live frame
+/// rather than aborting the walk for a missing descr.
+fn seed_grain_vable_info_only(
+    ctx: &mut TraceCtx,
+    info: &majit_metainterp::virtualizable::VirtualizableInfo,
+) {
+    ctx.set_virtualizable_boxes_with_info(Vec::new(), Vec::new(), info, &[]);
 }
 
 impl GrainJitState {
@@ -257,6 +309,159 @@ mod tests {
         assert_eq!(
             values.iter().map(Value::get_type).collect::<Vec<_>>(),
             red_kinds()
+        );
+    }
+
+    #[test]
+    fn merge_point_red_r_names_two_ref_reds() {
+        let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
+            return;
+        };
+        let Some(portal_index) = jitcodes::portal_index() else {
+            return;
+        };
+        let Some(portal) = jitcodes::all().into_iter().nth(portal_index) else {
+            return;
+        };
+        let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
+            panic!("the portal merge point must decode");
+        };
+        assert!(
+            slots[4].len() >= 2,
+            "grain's two reds are both Ref: {:?}",
+            slots[4]
+        );
+    }
+
+    #[test]
+    fn forward_ref_bits_replaces_only_matching_shadows() {
+        use majit_metainterp::GuardResumeReg;
+
+        let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
+            return;
+        };
+        let Some(portal_index) = jitcodes::portal_index() else {
+            return;
+        };
+        let Some(portal) = jitcodes::all().into_iter().nth(portal_index) else {
+            return;
+        };
+        let mk = |index, value| GuardResumeReg {
+            bank: Type::Ref,
+            index,
+            opref: OpRef::input_arg_typed(index, Type::Ref),
+            value,
+        };
+        let stale = 0xDEAD_0000;
+        let live = 0x2222_0000;
+        let unrelated = 0xBEEF_0000;
+        let mut frames = vec![GuardResumeFrame {
+            jitcode: portal,
+            pc: header_pc,
+            regs: vec![mk(0, stale), mk(1, unrelated)],
+            result_slot: None,
+            sub_idx: None,
+        }];
+        forward_ref_bits(&mut frames, stale, live);
+        assert_eq!(frames[0].regs[0].value, live);
+        assert_eq!(frames[0].regs[1].value, unrelated);
+    }
+
+    #[test]
+    fn rebind_bridge_reds_rewrites_only_the_reserved_vm_slot() {
+        use majit_metainterp::GuardResumeReg;
+
+        let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
+            return;
+        };
+        let Some(portal_index) = jitcodes::portal_index() else {
+            return;
+        };
+        let Some(portal) = jitcodes::all().into_iter().nth(portal_index) else {
+            return;
+        };
+        let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
+            panic!("the portal merge point must decode");
+        };
+        let vm_reg = slots[4][1] as u32;
+        let mut state = GrainJitState::default();
+        state.publish_live(&[0x1111_0000, 0x2222_0000], &[]);
+        let stale = 0xDEAD_0000;
+        let other = 0xBEEF_0000;
+        let mk = |index, value| GuardResumeReg {
+            bank: Type::Ref,
+            index,
+            opref: OpRef::input_arg_typed(index, Type::Ref),
+            value,
+        };
+        let mut frames = vec![GuardResumeFrame {
+            jitcode: portal,
+            pc: header_pc,
+            regs: vec![
+                mk(vm_reg, stale),
+                mk(vm_reg.wrapping_add(3), stale),
+                mk(7, other),
+            ],
+            result_slot: None,
+            sub_idx: None,
+        }];
+        state.rebind_bridge_reds(&mut frames);
+        assert_eq!(frames[0].regs[0].value, 0x2222_0000);
+        assert_eq!(
+            frames[0].regs[0].opref,
+            OpRef::ConstPtr(GcRef(0x2222_0000)),
+            "without a live-Vm failarg the reserved slot is a Const of the live bits",
+        );
+        assert_eq!(
+            frames[0].regs[1].value, stale,
+            "only the reserved vm index is rewritten, not every copy of its bits",
+        );
+        assert_eq!(frames[0].regs[2].value, other);
+    }
+
+    #[test]
+    fn rebind_bridge_reds_keeps_the_live_vm_inputarg() {
+        use majit_metainterp::GuardResumeReg;
+
+        let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
+            return;
+        };
+        let Some(portal_index) = jitcodes::portal_index() else {
+            return;
+        };
+        let Some(portal) = jitcodes::all().into_iter().nth(portal_index) else {
+            return;
+        };
+        let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
+            panic!("the portal merge point must decode");
+        };
+        let vm_reg = slots[4][1] as u32;
+        let mut state = GrainJitState::default();
+        let live = 0x2222_0000;
+        state.publish_live(&[0x1111_0000, live], &[]);
+        let stale = 0xDEAD_0000;
+        let vm_box = OpRef::input_arg_typed(3, Type::Ref);
+        let mk = |index, opref, value| GuardResumeReg {
+            bank: Type::Ref,
+            index,
+            opref,
+            value,
+        };
+        let mut frames = vec![GuardResumeFrame {
+            jitcode: portal,
+            pc: header_pc,
+            regs: vec![
+                mk(vm_reg, OpRef::input_arg_typed(vm_reg, Type::Ref), stale),
+                mk(4, vm_box, live),
+            ],
+            result_slot: None,
+            sub_idx: None,
+        }];
+        state.rebind_bridge_reds(&mut frames);
+        assert_eq!(frames[0].regs[0].value, live);
+        assert_eq!(
+            frames[0].regs[0].opref, vm_box,
+            "the reserved slot takes the failarg that already names the live Vm",
         );
     }
 }
@@ -397,8 +602,8 @@ impl JitState for GrainJitState {
     }
 
     #[allow(non_snake_case)]
-    fn __build_virtualizable_info(
-    ) -> Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
+    fn __build_virtualizable_info()
+    -> Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
         use super::GrainFrame;
         use majit_metainterp::virtualizable::VirtualizableInfo;
 
@@ -458,6 +663,160 @@ impl JitState for GrainJitState {
             .collect();
     }
 
+    /// Grain has no exception object to re-raise. Returning `None` makes
+    /// the driver set `single_pass_finish` and treat the portal as done.
+    /// `usize::MAX` is the same LeaveFrame sentinel the exhaust path
+    /// already handles: no replay of aborted tails, and later merge
+    /// points can still enter compiled code.
+    fn deliver_blackhole_exception(&mut self, _exc: GcRef) -> Option<usize> {
+        Some(usize::MAX)
+    }
+
+    /// Bind the frame virtualizable onto a guard-resume bridge.
+    ///
+    /// The generated `#[jit_interp]` `setup_bridge_sym` only calls
+    /// `seed_bridge_virtualizable_boxes` when the state declares a virt
+    /// array. Grain's vable is five static fields and no arrays, so that
+    /// arm is empty and `GETFIELD_VABLE` aborts with no `VirtualizableInfo`
+    /// on the bridge ctx. The main loop already ran
+    /// `initialize_virtualizable`; a bridge has to re-bind the same
+    /// shape or every mid-loop branch deopts.
+    fn setup_bridge_sym(
+        _sym: &mut Self::Sym,
+        ctx: &mut TraceCtx,
+        resume_data: &majit_metainterp::ResumeDataResult,
+        rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
+        fail_values: &[i64],
+        fail_types: &[Type],
+        executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
+    ) {
+        let Some(info) = Self::__build_virtualizable_info() else {
+            return;
+        };
+        let bridge_virtual_count = rd_virtuals.map_or(0, |v| v.len());
+        let mut cache = match executing {
+            Some(allocator) => majit_metainterp::BridgeVirtualCache::executing(
+                bridge_virtual_count,
+                majit_metainterp::default_bridge_array_descr,
+                allocator,
+                fail_values,
+                fail_types,
+            ),
+            None => majit_metainterp::BridgeVirtualCache::new(
+                bridge_virtual_count,
+                majit_metainterp::default_bridge_array_descr,
+            ),
+        };
+        if !majit_metainterp::replay_pending_fields(ctx, resume_data, rd_virtuals, &mut cache) {
+            ctx.mark_bridge_replay_incomplete();
+        }
+        let seeded = seed_bridge_virtualizable_boxes(
+            ctx,
+            &info,
+            rd_virtuals,
+            resume_data,
+            &mut cache,
+            fail_values,
+        );
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] grain vable seed={seeded} stream={}",
+                resume_data.virtualizable_values.len(),
+            );
+        }
+        if seeded {
+            return;
+        }
+        seed_grain_vable_info_only(ctx, &info);
+    }
+
+    /// Generated `setup_bridge_sym` rebinds a missing identity register
+    /// from the live state. The LLBC portal now reserves merge-point
+    /// reds the way `ref_identity_base` reserves `#[jit_interp]`
+    /// identity slots, so red-R[1] is the Vm at every guard. Rewrite
+    /// only that reserved index — not every copy of its bits, which
+    /// is what SIGSEGV'd when the slot was still reusable.
+    fn rebind_bridge_reds(&self, frames: &mut [GuardResumeFrame]) {
+        let Some(live_vm) = self
+            .reds
+            .iter()
+            .zip(red_kinds())
+            .filter(|(_, kind)| **kind == Type::Ref)
+            .map(|(bits, _)| *bits)
+            .nth(1)
+        else {
+            return;
+        };
+        let Some(root) = frames.first() else {
+            return;
+        };
+        let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
+            return;
+        };
+        let Some(slots) = merge_point_slot_regs(&root.jitcode, header_pc) else {
+            return;
+        };
+        let Some(&vm_reg) = slots[4].get(1) else {
+            return;
+        };
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] merge slots gI={:?} gR={:?} gF={:?} rI={:?} rR={:?} rF={:?} \
+                 live_reds={:x?} vm_reg={vm_reg}",
+                slots[0], slots[1], slots[2], slots[3], slots[4], slots[5], self.reds,
+            );
+        }
+        let Some(slot) = root
+            .regs
+            .iter()
+            .find(|resume| resume.bank == Type::Ref && resume.index as usize == vm_reg)
+        else {
+            return;
+        };
+        let stale = slot.value;
+        if stale == live_vm && !slot.opref.is_constant() {
+            return;
+        }
+        if self.reds.first() == Some(&stale) {
+            return;
+        }
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprint!("[bridgeB] grain rebind vm reg={vm_reg} {stale:#x} -> {live_vm:#x} regs");
+            for resume in &root.regs {
+                eprint!(" {:?}[{}]={:#x}", resume.bank, resume.index, resume.value);
+            }
+            eprintln!();
+        }
+        // The reserved slot may hold a reused colour (a Scope failarg
+        // at PC 6103) whose bits are not the Vm. Folding the live
+        // address to `ConstPtr` compiles `Call*(this_eval's stack)` —
+        // dead on the next `Vm::new`. Prefer a failarg that already
+        // names the live Vm (the loop's red-R[1] InputArg).
+        let vm_opref = root
+            .regs
+            .iter()
+            .find_map(|resume| {
+                (resume.bank == Type::Ref && resume.value == live_vm && !resume.opref.is_constant())
+                    .then_some(resume.opref)
+            })
+            .unwrap_or(OpRef::ConstPtr(GcRef(live_vm as usize)));
+        if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
+            eprintln!(
+                "[bridgeB] rebind-opref vm_reg={vm_reg} stale={stale:#x} live={live_vm:#x} \
+                 opref={vm_opref:?} const={}",
+                vm_opref.is_constant(),
+            );
+        }
+        for frame in frames {
+            for reg in &mut frame.regs {
+                if reg.bank == Type::Ref && reg.index as usize == vm_reg {
+                    reg.value = live_vm;
+                    reg.opref = vm_opref;
+                }
+            }
+        }
+    }
+
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
         sym.reds.clone()
     }
@@ -478,5 +837,23 @@ impl JitState for GrainJitState {
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
         let _ = meta;
         sym.reds.len() == red_kinds().len()
+    }
+
+    /// `pyjitpl.py handle_guard_failure` → `rebuild_state_after_failure`
+    /// → `setup_resume_at_op` then `interpret()`. Walk from the failed
+    /// guard so the other arm is recorded. The default `None` makes the
+    /// driver abort and resume at the loop header.
+    fn trace_from_guard_resume_position<R: JitCodeRuntime>(
+        ctx: &mut TraceCtx,
+        sym: &mut Self::Sym,
+        frames: &[GuardResumeFrame],
+        outer_program_pc: usize,
+        runtime: &R,
+    ) -> Option<TraceAction> {
+        majit_metainterp::set_bridge_walking(true);
+        let action =
+            trace_jitcode_at_resume_framestack(ctx, sym, frames, outer_program_pc, runtime);
+        majit_metainterp::set_bridge_walking(false);
+        Some(action)
     }
 }

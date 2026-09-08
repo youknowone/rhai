@@ -270,7 +270,7 @@ fn verify_chunk(
                     at,
                     expected: seen.operands,
                     found: state.operands,
-                })
+                });
             }
             None => depth_at[at] = Some(state),
         }

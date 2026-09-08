@@ -64,6 +64,12 @@ const RHAI_SCALAR_FIELD_STORES: &[majit_translate::ScalarFieldStore<'static>] = 
         field: "__pos_0",
         bank: majit_translate::ScalarBank::Float,
     },
+    majit_translate::ScalarFieldStore {
+        function_path: "rhai::grain::vm::jit::store_iteration_count",
+        owner_root: "grain::vm::Iteration",
+        field: "count",
+        bank: majit_translate::ScalarBank::Int,
+    },
 ];
 
 /// Where the extracted MIR is read from. Named by `majit-translate`'s front
@@ -93,6 +99,7 @@ const OUTPUTS: &[&str] = &[
 pub fn main() {
     println!("cargo:rerun-if-env-changed={LLBC_ENV}");
     println!("cargo:rerun-if-env-changed={REQUIRE_TABLES_ENV}");
+    println!("cargo:rerun-if-env-changed=MAJIT_REGALLOC_DEBUG");
     println!("cargo:rustc-check-cfg=cfg(rhai_grain_jit_tables)");
     println!("cargo:rustc-check-cfg=cfg(rhai_grain_jit_require_tables)");
     if std::env::var(REQUIRE_TABLES_ENV).as_deref() == Ok("1") {

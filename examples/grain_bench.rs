@@ -20,9 +20,9 @@
 
 use std::time::{Duration, Instant};
 
+use rhai::grain::{Compiler, Program, Vm};
 #[cfg(feature = "grain-jit")]
 use rhai::grain::{jit_state, jitcodes};
-use rhai::grain::{Compiler, Program, Vm};
 use rhai::{Dynamic, Engine, Scope};
 
 const RUNS: usize = 9;

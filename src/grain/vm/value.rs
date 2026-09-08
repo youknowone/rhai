@@ -27,8 +27,8 @@
 
 use core::mem;
 
-use crate::types::dynamic::{AccessMode, Union};
 use crate::Dynamic;
+use crate::types::dynamic::{AccessMode, Union};
 
 /// A copy of a value whose variant owns neither an allocation nor a reference
 /// count, or `None` for one that does.

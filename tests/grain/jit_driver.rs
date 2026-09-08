@@ -12,7 +12,7 @@
 //! default types every red Int.
 
 use majit_metainterp::{JitDriver, JitState};
-use rhai::grain::{jit_state, jitcodes, Compiler, Vm};
+use rhai::grain::{Compiler, Vm, jit_state, jitcodes};
 use rhai::{Engine, Scope};
 
 /// The unchanged majit/RPython warm-loop threshold used by the Grain runtime.
@@ -236,4 +236,108 @@ fn check_hot_loop(limit: usize) {
     let again = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the compiled loop runs again");
     assert_eq!(format!("{again:?}"), expected.to_string(), "reused artifact, limit {limit}");
     assert!(jit_state::stats().compiled_entries > stats.compiled_entries);
+}
+
+/// A hot loop whose body takes more than one arm must still compile, match
+/// the walker, and survive the non-hot arm. `handle_guard_failure` traces
+/// from the failed guard; the blackhole finishes a half-opcode rather than
+/// panicking on `usize::MAX`.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn a_multi_arm_loop_compiles_and_agrees_on_the_cold_arm() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const SOURCE: &str = "let s = 0; let i = 0; \
+         while i < 1500 { \
+             if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } \
+             i += 1; \
+         } s";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the multi-arm loop parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let vm = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the vm runs the non-hot arm without panicking");
+    assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "walker and vm must agree after the non-hot arm");
+    let stats = jit_state::stats();
+    eprintln!("multi-arm grain JIT stats: {stats:?}");
+    eprintln!("multi-arm majit: {}", jit_state::majit_diag_summary());
+    assert!(stats.loops_compiled > 0, "the multi-arm loop must compile: {stats:?}");
+    assert_eq!(format!("{walker:?}"), "1000", "1500 iterations of +1/+2/-1 cycle to 1000");
+
+    // Same arms through `for` / `ITER_NEXT_STORE`. The other-arm walk used
+    // to drop a walk-local `Union` at a small integer address. Keep this
+    // in the same test so it shares the process-owned driver.
+    jit_state::reset_stats();
+    const FOR_SOURCE: &str = "let s = 0; for i in 0..1500 { \
+         if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } \
+     } s";
+    let ast = engine.compile(FOR_SOURCE).expect("the multi-arm for-loop parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let vm = Vm::new(&engine)
+        .eval_with_scope(&mut Scope::new(), &program)
+        .expect("the vm runs the for-loop non-hot arm without panicking");
+    assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "for-loop walker and vm must agree after the non-hot arm");
+    let stats = jit_state::stats();
+    eprintln!("for-loop multi-arm grain JIT stats: {stats:?}");
+    eprintln!("for-loop multi-arm majit: {}", jit_state::majit_diag_summary());
+    assert!(stats.loops_compiled > 0, "the for-loop multi-arm loop must compile: {stats:?}");
+    assert_eq!(format!("{walker:?}"), "1000", "1500 for-loop iterations of +1/+2/-1 cycle to 1000");
+
+    // Long enough that `must_compile` fires on the cold arms. Those arms
+    // used to residual-call `operand_stack_store` with a walk-local
+    // `Dynamic` (`rir`) and abort the bridge.
+    jit_state::reset_stats();
+    const LONG_FOR: &str = "let s = 0; for i in 0..8000 { \
+         if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } \
+     } s";
+    let ast = engine.compile(LONG_FOR).expect("the long for-loop parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let vm = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the vm runs the long for-loop without panicking");
+    assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "long for-loop walker and vm must agree");
+    let stats = jit_state::stats();
+    eprintln!("long for-loop multi-arm grain JIT stats: {stats:?}");
+    eprintln!("long for-loop multi-arm majit: {}", jit_state::majit_diag_summary());
+    assert!(stats.loops_compiled > 0, "the long for-loop must compile: {stats:?}");
+}
+
+/// Script-function calls must match the walker even after the merge point
+/// warms. A residual abort mid-assignment used to skip remaining additions
+/// or underflow the operand stack.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn script_function_calls_match_the_walker() {
+    if no_tables() {
+        return;
+    }
+
+    for limit in [16, 1039, 2000, 5000] {
+        jit_state::reset_stats();
+        let source = format!("fn add(a, b) {{ a + b }} let s = 0; for i in 0..{limit} {{ s = add(s, i); }} s");
+        let engine = Engine::new();
+        let ast = engine.compile(&source).expect("the script parses");
+        let program = Compiler::new().compile(&ast);
+        let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the script runs");
+        let expected = limit * (limit - 1) / 2;
+        assert_eq!(format!("{result:?}"), expected.to_string(), "limit {limit}, stats={:?}", jit_state::stats());
+    }
+}
+
+/// A recursive script function that returns from the portal must not panic.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn recursive_fibonacci_returns_from_the_portal() {
+    if no_tables() {
+        return;
+    }
+
+    jit_state::reset_stats();
+    let engine = Engine::new();
+    let ast = engine.compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(12)").expect("fib parses");
+    let program = Compiler::new().compile(&ast);
+    let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("fib runs");
+    assert_eq!(format!("{result:?}"), "144", "stats={:?}", jit_state::stats());
 }

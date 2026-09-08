@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use majit_metainterp::{init_global_build_descr_pool, EmbeddedJitCodeTable};
+use majit_metainterp::{EmbeddedJitCodeTable, init_global_build_descr_pool};
 use majit_translate::jitcode::{BhDescr, JitCode};
 
 /// Concatenated jitcode bodies, in allocation order.
@@ -135,6 +135,236 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::program_residual as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::program_name",
+            super::jit::program_name as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::program_name",
+            super::jit::program_name as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_function",
+            super::jit::program_function as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::run_chain_abi",
+            super::jit::run_chain_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::call_syntactic_or_stacked_abi",
+            super::jit::call_syntactic_or_stacked_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::call_by_reference_abi",
+            super::jit::call_by_reference_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::store_scope_slot",
+            super::jit::store_scope_slot as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::assign_local_abi",
+            super::jit::assign_local_abi as *const () as usize as i64,
+        ),
+        (
+            "majit_metainterp::request_walk_abort",
+            super::jit::request_walk_abort_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::request_walk_abort_abi",
+            super::jit::request_walk_abort_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::load_named_abi",
+            super::jit::load_named_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::assign_named_abi",
+            super::jit::assign_named_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::declare_local_abi",
+            super::jit::declare_local_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::catch_bind_abi",
+            super::jit::catch_bind_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operator_builtin_abi",
+            super::jit::operator_builtin_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operator_builtin_handled",
+            super::jit::operator_builtin_handled as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::name_is_abs",
+            super::jit::name_is_abs as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::unary_builtin_abi",
+            super::jit::unary_builtin_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::unary_builtin_handled",
+            super::jit::unary_builtin_handled as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::make_closure_abi",
+            super::jit::make_closure_abi as *const () as usize as i64,
+        ),
+        #[cfg(not(feature = "no_closure"))]
+        (
+            "rhai::grain::vm::jit::share_named_abi",
+            super::jit::share_named_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::int_modulo",
+            super::jit::int_modulo as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::int_modulo_result",
+            super::jit::int_modulo_result as *const () as usize as i64,
+        ),
+        (
+            "core::cmp::impls::<Impl>::max",
+            super::jit::int_max as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::vm_depth",
+            super::jit::vm_depth as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_dispatch",
+            super::jit::switch_dispatch as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_pop_subject",
+            super::jit::switch_pop_subject as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_target",
+            super::jit::switch_target as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_subject_kind",
+            super::jit::switch_subject_kind as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_subject_hash",
+            super::jit::switch_subject_hash as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_case_count",
+            super::jit::switch_case_count as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_case_hash",
+            super::jit::switch_case_hash as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_case_has_int",
+            super::jit::switch_case_has_int as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_case_int_key",
+            super::jit::switch_case_int_key as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_case_target",
+            super::jit::switch_case_target as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_default",
+            super::jit::switch_default as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_range_count",
+            super::jit::switch_range_count as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_range_from",
+            super::jit::switch_range_from as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_range_to",
+            super::jit::switch_range_to as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_range_inclusive",
+            super::jit::switch_range_inclusive as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::switch_range_target",
+            super::jit::switch_range_target as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::dynamic_as_fast",
+            super::jit::dynamic_as_fast as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::fast_int",
+            super::jit::fast_int as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::fast_bool",
+            super::jit::fast_bool as *const () as usize as i64,
+        ),
+        #[cfg(not(feature = "no_float"))]
+        (
+            "rhai::grain::vm::jit::fast_float",
+            super::jit::fast_float as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::array_len",
+            super::jit::array_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iterator_last_mut",
+            super::jit::iterator_last_mut as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iter_next_store",
+            super::jit::iter_next_store as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iter_next_produced",
+            super::jit::iter_next_produced as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::store_scope_int",
+            super::jit::store_scope_int as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::store_int_range_next",
+            super::jit::store_int_range_next as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::store_shared_from_stack",
+            super::jit::store_shared_from_stack as *const () as usize as i64,
+        ),
+        (
+            "__len",
+            super::jit::refuse_synthetic_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::refuse_synthetic_len",
+            super::jit::refuse_synthetic_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::refuse_deref_write",
+            super::jit::refuse_deref_write as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::stash_ok_result",
+            super::jit::stash_ok_result as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::take_finished_result",
+            super::jit::take_finished_result as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::array_entry_mut",
             super::jit::array_entry_mut as *const () as usize as i64,
         ),
@@ -151,6 +381,14 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::fast_operators as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::scope_from_frame",
+            super::jit::scope_from_frame as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::pin_scope_with_vm",
+            super::jit::pin_scope_with_vm as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::scope_len",
             super::jit::scope_len as *const () as usize as i64,
         ),
@@ -165,12 +403,33 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::grow_stack_abi as *const () as usize as i64,
         ),
         (
-            "rhai::grain::vm::jit::operand_stack_entry",
-            super::jit::operand_stack_entry as *const () as usize as i64,
+            "rhai::grain::vm::jit::grow_stack_abi",
+            super::jit::grow_stack_abi as *const () as usize as i64,
         ),
         (
-            "rhai::grain::vm::jit::operand_stack_entry_mut",
-            super::jit::operand_stack_entry_mut as *const () as usize as i64,
+            "rhai::grain::vm::jit::push_fast_int",
+            super::jit::push_fast_int as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::push_fast_bool",
+            super::jit::push_fast_bool as *const () as usize as i64,
+        ),
+        #[cfg(not(feature = "no_float"))]
+        (
+            "rhai::grain::vm::jit::push_fast_float",
+            super::jit::push_fast_float as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::push_fast_unit",
+            super::jit::push_fast_unit as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::push_from_cell",
+            super::jit::push_from_cell as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_entry",
+            super::jit::operand_stack_entry as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::array_entry",
@@ -185,12 +444,49 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::operand_stack_store as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::operand_stack_store_int",
+            super::jit::operand_stack_store_int as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_store_bool",
+            super::jit::operand_stack_store_bool as *const () as usize as i64,
+        ),
+        #[cfg(not(feature = "no_float"))]
+        (
+            "rhai::grain::vm::jit::operand_stack_store_float",
+            super::jit::operand_stack_store_float as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_store_unit",
+            super::jit::operand_stack_store_unit as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::dynamic_store",
             super::jit::dynamic_store as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::truncate_stack",
             super::jit::truncate_stack as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iterators_len",
+            super::jit::iterators_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iterators_pop",
+            super::jit::iterators_pop as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iterators_truncate",
+            super::jit::iterators_truncate as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::handlers_len",
+            super::jit::handlers_len as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::sizes_len",
+            super::jit::sizes_len as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::scope_entry",

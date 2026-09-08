@@ -19,7 +19,7 @@
 use std::prelude::v1::*;
 
 use crate::grain::bytecode::chain::Chain;
-use crate::grain::pos::{varint, Site};
+use crate::grain::pos::{Site, varint};
 
 /// Encode every chain's positions, in pool order.
 #[must_use]
@@ -149,8 +149,8 @@ impl core::fmt::Display for StreamError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grain::bytecode::chain::{Root, Step, Tail};
     use crate::Position;
+    use crate::grain::bytecode::chain::{Root, Step, Tail};
 
     fn chain(root: Root, steps: Vec<Step>) -> Chain {
         Chain {

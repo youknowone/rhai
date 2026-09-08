@@ -21,8 +21,9 @@
 //! [`get_builtin_op_assignment_fn`]: crate::func::get_builtin_op_assignment_fn
 
 use crate::grain::bytecode::BinOpKind;
-use crate::types::dynamic::{AccessMode, Union};
-use crate::{Dynamic, RhaiResultOf, INT};
+use crate::types::dynamic::AccessMode;
+use crate::types::dynamic::Union;
+use crate::{Dynamic, INT, RhaiResultOf};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -68,10 +69,20 @@ fn int_arithmetic(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<INT>> 
             Ok(value) => Ok(Some(value)),
             Err(error) => Err(error),
         },
-        Modulo => match modulo(x, y) {
-            Ok(value) => Ok(Some(value)),
-            Err(error) => Err(error),
-        },
+        Modulo => {
+            #[cfg(feature = "grain-jit")]
+            {
+                if let Some(error) = super::jit::int_modulo(x, y) {
+                    return Err(error);
+                }
+                Ok(Some(super::jit::int_modulo_result()))
+            }
+            #[cfg(not(feature = "grain-jit"))]
+            match modulo(x, y) {
+                Ok(value) => Ok(Some(value)),
+                Err(error) => Err(error),
+            }
+        }
         Power => match power(x, y) {
             Ok(value) => Ok(Some(value)),
             Err(error) => Err(error),
@@ -130,19 +141,68 @@ fn int_comparison(kind: BinOpKind, x: INT, y: INT) -> Option<bool> {
     })
 }
 
+/// A typed operator result that is still a scalar, not a `Dynamic`.
+///
+/// The portal must not build a `Dynamic` local just to push or test it: a
+/// walk local's address is not an ABI word, so a later residual that takes
+/// `&mut Dynamic` stores through null.
+#[derive(Clone, Copy)]
+pub enum FastValue {
+    Int(INT),
+    Bool(bool),
+    #[cfg(not(feature = "no_float"))]
+    Float(FLOAT),
+    Unit,
+}
+
+impl FastValue {
+    /// Copy a scalar out of an already-resident `Dynamic`.
+    ///
+    /// The source must be a real heap (or program) cell, not a walk local:
+    /// matching through a lowered local's address is a null load.
+    pub fn from_cell(value: &Dynamic) -> Option<Self> {
+        #[cfg(feature = "grain-jit")]
+        {
+            return match super::jit::dynamic_as_fast(value) {
+                1 => Some(FastValue::Int(super::jit::fast_int())),
+                2 => Some(FastValue::Bool(super::jit::fast_bool() != 0)),
+                #[cfg(not(feature = "no_float"))]
+                3 => Some(FastValue::Float(super::jit::fast_float())),
+                4 => Some(FastValue::Unit),
+                _ => None,
+            };
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        match &value.0 {
+            Union::Int(held, ..) => Some(FastValue::Int(*held)),
+            Union::Bool(held, ..) => Some(FastValue::Bool(*held)),
+            #[cfg(not(feature = "no_float"))]
+            Union::Float(held, ..) => Some(FastValue::Float(**held)),
+            Union::Unit(..) => Some(FastValue::Unit),
+            _ => None,
+        }
+    }
+
+    pub fn into_dynamic(self) -> Dynamic {
+        match self {
+            FastValue::Int(value) => Dynamic(Union::Int(value, 0, AccessMode::ReadWrite)),
+            FastValue::Bool(value) => Dynamic(Union::Bool(value, 0, AccessMode::ReadWrite)),
+            #[cfg(not(feature = "no_float"))]
+            FastValue::Float(value) => Dynamic::from(value),
+            FastValue::Unit => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+        }
+    }
+}
+
 /// `x op y` for two integers, or `None` if the arm has no entry for the
 /// operator — in which case the caller dispatches.
 #[inline]
-pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<Dynamic>> {
+pub fn int_binary(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<FastValue>> {
     if let Some(value) = int_arithmetic(kind, x, y)? {
-        // `Dynamic::from(INT)` is exactly this variant construction. Spell it
-        // here so the generated interpreter graph keeps the concrete value
-        // construction instead of routing two distinct `From::from`
-        // monomorphizations through one leaf-named jitcode.
-        return Ok(Some(Dynamic(Union::Int(value, 0, AccessMode::ReadWrite))));
+        return Ok(Some(FastValue::Int(value)));
     }
     Ok(match int_comparison(kind, x, y) {
-        Some(value) => Some(Dynamic(Union::Bool(value, 0, AccessMode::ReadWrite))),
+        Some(value) => Some(FastValue::Bool(value)),
         None => None,
     })
 }
@@ -185,8 +245,11 @@ pub fn int_assign(kind: BinOpKind, x: INT, y: INT) -> RhaiResultOf<Option<INT>> 
 /// function: every one of them converts to [`FLOAT`] before operating.
 #[cfg(not(feature = "no_float"))]
 #[inline]
-pub fn float_binary(kind: BinOpKind, x: FLOAT, y: FLOAT) -> Option<Dynamic> {
-    float_arithmetic(kind, x, y).map(Into::into)
+pub fn float_binary(kind: BinOpKind, x: FLOAT, y: FLOAT) -> Option<FastValue> {
+    match float_arithmetic(kind, x, y) {
+        Some(value) => Some(FastValue::Float(value)),
+        None => None,
+    }
 }
 
 /// The operator itself, shared by the value form and the in-place one.

@@ -1,4 +1,4 @@
-use crate::{ast::RangeCase, Dynamic, INT};
+use crate::{Dynamic, INT, ast::RangeCase};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 
@@ -59,6 +59,11 @@ pub struct Switch {
     /// index nobody can supply is an index that cannot arrive disagreeing with
     /// the cases it describes.
     index: Box<[Bucket]>,
+    /// Integer recovered from each case hash, when the hash is one a small
+    /// script integer produces. Derived at construction, not stored: the
+    /// artifact still carries only hashes, and a process whose hasher seed
+    /// matches the probe recovers the same keys.
+    int_keys: Vec<Option<INT>>,
 }
 
 /// One slot of a [`Switch`]'s case index.
@@ -205,12 +210,24 @@ impl Switch {
     #[must_use]
     pub fn new(cases: Vec<SwitchCase>, ranges: Vec<SwitchRange>, default: u32) -> Self {
         let index = Bucket::index(&cases);
+        let int_keys = cases
+            .iter()
+            .map(|case| int_key_for_hash(case.hash))
+            .collect();
         Self {
             cases,
             ranges,
             default,
             index,
+            int_keys,
         }
+    }
+
+    /// The integer a case hash names, when that hash is a small script integer.
+    #[must_use]
+    #[inline]
+    pub fn int_key(&self, index: usize) -> Option<INT> {
+        self.int_keys.get(index).copied().flatten()
     }
 
     /// The hashed arms, ascending by hash.
@@ -372,7 +389,32 @@ pub fn probe() -> u64 {
     hash_of(&Dynamic::from("rhaigrain switch probe"))
 }
 
-fn hash_of(value: &Dynamic) -> u64 {
+/// Recover the small integer whose hash is `hash`, if one exists.
+///
+/// The parser keeps only hashes, so an integer `switch` would otherwise have
+/// to hash the subject on every turn. Scanning a fixed window at table
+/// construction is enough for the literal keys scripts actually write, and
+/// a miss leaves the case hash-only.
+fn int_key_for_hash(hash: u64) -> Option<INT> {
+    const LO: INT = -256;
+    const HI: INT = 256;
+    let mut k = LO;
+    loop {
+        if hash_of(&Dynamic::from(k)) == hash {
+            return Some(k);
+        }
+        if k == HI {
+            return None;
+        }
+        k += 1;
+    }
+}
+
+/// Hash a switch subject the same way [`Switch::dispatch`] does.
+///
+/// The hasher's seed is a process static, so this stays behind a residual
+/// when the dispatch loop is traced.
+pub(crate) fn hash_of(value: &Dynamic) -> u64 {
     use core::hash::{Hash, Hasher};
 
     let mut hasher = crate::func::get_hasher();
@@ -446,6 +488,16 @@ mod tests {
         assert_eq!(table.dispatch(&one), 10);
         assert_eq!(table.dispatch(&two), 20);
         assert_eq!(table.dispatch(&int(3)), 99);
+    }
+
+    #[test]
+    fn a_small_integer_case_recovers_its_key() {
+        let (zero, two) = (int(0), int(2));
+        let table = table(&[(&zero, 10), (&two, 20)], Vec::new(), 99);
+        let keys: Vec<Option<INT>> = (0..table.cases().len()).map(|i| table.int_key(i)).collect();
+        assert!(keys.contains(&Some(0)), "{keys:?}");
+        assert!(keys.contains(&Some(2)), "{keys:?}");
+        assert!(!keys.contains(&Some(1)), "{keys:?}");
     }
 
     /// The distinction that makes this hashing rather than `==`: Rhai does not

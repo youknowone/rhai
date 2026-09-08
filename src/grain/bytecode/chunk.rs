@@ -1,5 +1,5 @@
-use crate::grain::bytecode::code::disassemble;
 use crate::grain::bytecode::Op;
+use crate::grain::bytecode::code::disassemble;
 
 /// One body of code: the top-level program, or one script function.
 ///
