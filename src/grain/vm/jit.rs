@@ -192,19 +192,19 @@ pub(super) fn code_position(program: &Program<'_>, at: usize) -> crate::Position
 /// Execute Rhai's operation-limit/progress hook outside the trace.
 ///
 /// `Engine` owns callbacks and nested containers whose concrete Rust layout is
-/// not a translated GC object.  `Option<Box<_>>` is the same nullable pointer
-/// word the Ref result bank carries; the wrapper restores the exact
-/// `RhaiResultOf<()>` seen by the interpreter without raw-pointer ownership
-/// tricks.
+/// not a translated GC object.  A void residual is required: an `Option<Box<_>>`
+/// or `i64` result was guarded after the call, and a later `setfield` reused
+/// that result register, so the compiled loop deopted onto the error arm
+/// with a leftover value.
 #[majit_macros::dont_look_inside_cannot_raise]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn track_operation_abi(
-    vm: &mut Vm<'_>,
-    position: i64,
-) -> Option<Box<crate::EvalAltResult>> {
-    vm.engine
-        .track_operation(&mut vm.global, position_from_bits(position))
-        .err()
+pub(super) extern "C" fn track_operation_abi(vm: &mut Vm<'_>, position: i64) {
+    if !live_vm_ptr(vm) {
+        majit_metainterp::request_walk_abort();
+        return;
+    }
+    let _ = vm
+        .engine
+        .track_operation(&mut vm.global, position_from_bits(position));
 }
 
 /// Resolve an immutable program-table entry without exposing the backing
@@ -1266,7 +1266,7 @@ pub(super) extern "C" fn store_builtin_available(
 /// Total, because [`store_builtin_available`] has already answered `Some` for
 /// the same triple and the table it reads is pure — nothing between the two
 /// calls touches the operator token or either operand's type.  The result is
-/// the same nullable exception pointer [`track_operation_abi`] returns.
+/// the same nullable exception pointer the builtin-apply residual returns.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn store_builtin_apply(
@@ -1367,7 +1367,8 @@ pub(super) fn track_operation_error(
     program: &Program<'_>,
     at: usize,
 ) -> Option<Box<crate::EvalAltResult>> {
-    track_operation_abi(vm, code_position_bits(program, at))
+    track_operation_abi(vm, code_position_bits(program, at));
+    None
 }
 
 /// The frame's scope, with the Vm red kept live at the load.
