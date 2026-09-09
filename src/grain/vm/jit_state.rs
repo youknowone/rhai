@@ -464,6 +464,49 @@ mod tests {
             "the reserved slot takes the failarg that already names the live Vm",
         );
     }
+
+    #[test]
+    fn rebind_bridge_reds_uses_a_failarg_not_in_the_portal_regs() {
+        use majit_metainterp::GuardResumeReg;
+
+        let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
+            return;
+        };
+        let Some(portal_index) = jitcodes::portal_index() else {
+            return;
+        };
+        let Some(portal) = jitcodes::all().into_iter().nth(portal_index) else {
+            return;
+        };
+        let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
+            panic!("the portal merge point must decode");
+        };
+        let vm_reg = slots[4][1] as u32;
+        let mut state = GrainJitState::default();
+        let live = 0x2222_0000;
+        state.publish_live(&[0x1111_0000, live], &[]);
+        let stale = 0xDEAD_0000;
+        let mk = |index, value| GuardResumeReg {
+            bank: Type::Ref,
+            index,
+            opref: OpRef::input_arg_typed(6, Type::Ref),
+            value,
+        };
+        let mut frames = vec![GuardResumeFrame {
+            jitcode: portal,
+            pc: header_pc,
+            regs: vec![mk(vm_reg, stale)],
+            result_slot: None,
+            sub_idx: None,
+        }];
+        state.rebind_bridge_reds_from_fail(&mut frames, &[0x1111_0000, live, stale]);
+        assert_eq!(frames[0].regs[0].value, live);
+        assert_eq!(
+            frames[0].regs[0].opref,
+            OpRef::input_arg_typed(1, Type::Ref),
+            "a live-Vm failarg that is not a portal register still names an InputArg",
+        );
+    }
 }
 
 impl JitState for GrainJitState {
@@ -737,6 +780,10 @@ impl JitState for GrainJitState {
     /// only that reserved index — not every copy of its bits, which
     /// is what SIGSEGV'd when the slot was still reusable.
     fn rebind_bridge_reds(&self, frames: &mut [GuardResumeFrame]) {
+        self.rebind_bridge_reds_from_fail(frames, &[]);
+    }
+
+    fn rebind_bridge_reds_from_fail(&self, frames: &mut [GuardResumeFrame], fail_values: &[i64]) {
         let Some(live_vm) = self
             .reds
             .iter()
@@ -797,13 +844,22 @@ impl JitState for GrainJitState {
         // at PC 6103) whose bits are not the Vm. Folding the live
         // address to `ConstPtr` compiles `Call*(this_eval's stack)` —
         // dead on the next `Vm::new`. Prefer a failarg that already
-        // names the live Vm (the loop's red-R[1] InputArg).
+        // names the live Vm: first a reconstructed portal register,
+        // then a compiled-loop failarg that is a livebox but not a
+        // portal-register occupant (`rd_numb` only describes the
+        // latter). `bridge_decode_red` numbers that slot as
+        // `InputArgRef(n)`.
         let vm_opref = root
             .regs
             .iter()
             .find_map(|resume| {
                 (resume.bank == Type::Ref && resume.value == live_vm && !resume.opref.is_constant())
                     .then_some(resume.opref)
+            })
+            .or_else(|| {
+                fail_values.iter().enumerate().find_map(|(n, &bits)| {
+                    (bits == live_vm).then_some(OpRef::input_arg_typed(n as u32, Type::Ref))
+                })
             })
             .unwrap_or(OpRef::ConstPtr(GcRef(live_vm as usize)));
         if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
