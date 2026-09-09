@@ -750,6 +750,12 @@ impl JitState for GrainJitState {
         let Some(root) = frames.first() else {
             return;
         };
+        let Some(portal) = jitcodes::portal_index() else {
+            return;
+        };
+        if root.jitcode.try_index() != Some(portal) {
+            return;
+        }
         let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
             return;
         };
@@ -850,10 +856,16 @@ impl JitState for GrainJitState {
         outer_program_pc: usize,
         runtime: &R,
     ) -> Option<TraceAction> {
+        struct BridgeWalkingGuard;
+        impl Drop for BridgeWalkingGuard {
+            fn drop(&mut self) {
+                majit_metainterp::set_bridge_walking(false);
+            }
+        }
         majit_metainterp::set_bridge_walking(true);
+        let _guard = BridgeWalkingGuard;
         let action =
             trace_jitcode_at_resume_framestack(ctx, sym, frames, outer_program_pc, runtime);
-        majit_metainterp::set_bridge_walking(false);
         Some(action)
     }
 }

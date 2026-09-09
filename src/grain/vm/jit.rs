@@ -455,6 +455,7 @@ pub(super) extern "C" fn store_scope_int(
     position: i64,
 ) {
     if !live_scope_ptr(scope) || !live_count(index) {
+        majit_metainterp::request_walk_abort();
         return;
     }
     majit_metainterp::note_residual_committed();
@@ -553,6 +554,10 @@ pub(super) extern "C" fn switch_dispatch(
     vm: &mut Vm<'_>,
     table: &Switch,
 ) -> Option<Box<crate::EvalAltResult>> {
+    if !live_vm_ptr(vm) {
+        majit_metainterp::request_walk_abort();
+        return None;
+    }
     match vm.pop() {
         Ok(subject) => {
             SWITCH_TARGET.with(|cell| cell.set(i64::from(table.dispatch(&subject))));
@@ -1569,6 +1574,7 @@ pub(super) extern "C" fn array_entry<'a>(array: &'a crate::Array, index: usize) 
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, index: usize, value: &mut Dynamic) {
     if index >= vm.stack.len() || !live_dynamic_ptr(value) {
+        majit_metainterp::request_walk_abort();
         return;
     }
     *value = core::mem::take(super::operand_mut(&mut vm.stack[index]));
@@ -1656,6 +1662,7 @@ pub(super) extern "C" fn operand_stack_store_unit(vm: &mut Vm<'_>, index: usize)
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn dynamic_store(target: &mut Dynamic, value: &mut Dynamic) {
     if !live_dynamic_ptr(target) || !live_dynamic_ptr(value) {
+        majit_metainterp::request_walk_abort();
         return;
     }
     *target = core::mem::take(value);
