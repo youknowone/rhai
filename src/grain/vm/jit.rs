@@ -1362,13 +1362,8 @@ fn dummy_unit() -> &'static Dynamic {
 }
 
 #[inline]
-pub(super) fn track_operation_error(
-    vm: &mut Vm<'_>,
-    program: &Program<'_>,
-    at: usize,
-) -> Option<Box<crate::EvalAltResult>> {
+pub(super) fn track_operation_error(vm: &mut Vm<'_>, program: &Program<'_>, at: usize) {
     track_operation_abi(vm, code_position_bits(program, at));
-    None
 }
 
 /// The frame's scope, with the Vm red kept live at the load.

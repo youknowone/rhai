@@ -6272,9 +6272,7 @@ impl<'e> Vm<'e> {
                     if target <= pc {
                         #[cfg(feature = "grain-jit")]
                         {
-                            if let Some(error) = jit::track_operation_error(self, program, pc) {
-                                return Err(error);
-                            }
+                            jit::track_operation_error(self, program, pc);
                             jit_driver.can_enter_jit(
                                 target,
                                 program.jit_identity(),
@@ -8070,9 +8068,7 @@ impl<'e> Vm<'e> {
 
                 code::tag::TICK => {
                     #[cfg(feature = "grain-jit")]
-                    if let Some(error) = jit::track_operation_error(self, program, pc) {
-                        return Err(error);
-                    }
+                    jit::track_operation_error(self, program, pc);
                     #[cfg(not(feature = "grain-jit"))]
                     self.engine.track_operation(&mut self.global, pos!())?;
                 }
