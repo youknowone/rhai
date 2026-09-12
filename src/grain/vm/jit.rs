@@ -1058,7 +1058,11 @@ pub(super) extern "C" fn call_by_reference_abi(
                 }
             }
         }
-        if argc == 0 && program.name_plain(name_index) == Some("abs") {
+        // CallRef `abs(a)` reports argc=1 (arity) with the receiver in a
+        // local/name and nothing on the stack.
+        if (argc == 0 || (argc == 1 && vm.depth == 0))
+            && program.name_plain(name_index) == Some("abs")
+        {
             let hit = match receiver_kind {
                 0 => try_plain_abs_ref(vm, scope, base, receiver_payload as u16, position),
                 1 => match program.name_plain(receiver_payload) {
