@@ -304,6 +304,46 @@ fn a_multi_arm_loop_compiles_and_agrees_on_the_cold_arm() {
     assert!(stats.loops_compiled > 0, "the long for-loop must compile: {stats:?}");
 }
 
+/// A later `Vm::new` must run the already-compiled 4-arm switch. The first
+/// Vm stays on the stack so the second lands at a different address; a
+/// ConstPtr-baked this-eval Vm would SIGSEGV or storm `compiled_entries`.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn a_second_vm_runs_the_compiled_switch_loop() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const SOURCE: &str = "let s = 0; for i in 0..20000 { \
+         switch i % 4 { 0 => s += 1, 1 => s += 2, 2 => s += 3, _ => s += 4 } \
+         } s";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the switch loop parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let mut first_vm = Vm::new(&engine);
+    let first = first_vm.eval_with_scope(&mut Scope::new(), &program).expect("the first vm compiles the switch loop");
+    let after_first = jit_state::stats();
+    eprintln!("switch first-vm grain JIT stats: {after_first:?}");
+    eprintln!("switch first-vm majit: {}", jit_state::majit_diag_summary());
+    assert_eq!(format!("{walker:?}"), format!("{first:?}"), "walker and first vm must agree");
+    assert!(after_first.loops_compiled > 0, "the switch loop must compile: {after_first:?}");
+    assert!(after_first.compiled_entries > 0, "the first vm must enter compiled code: {after_first:?}");
+    let entries_after_first = after_first.compiled_entries;
+
+    let second = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("a later vm must run the already-compiled switch");
+    let _keep_first_on_stack = &first_vm;
+    let after_second = jit_state::stats();
+    eprintln!("switch second-vm grain JIT stats: {after_second:?}");
+    eprintln!("switch second-vm majit: {}", jit_state::majit_diag_summary());
+    assert_eq!(format!("{walker:?}"), format!("{second:?}"), "walker and second vm must agree");
+    assert!(
+        after_second.compiled_entries < entries_after_first.saturating_add(64),
+        "a second vm must reuse the compiled loop, not storm entries: first={entries_after_first} after={:?}",
+        after_second.compiled_entries,
+    );
+}
+
 /// Script-function calls must match the walker even after the merge point
 /// warms. A residual abort mid-assignment used to skip remaining additions
 /// or underflow the operand stack.
@@ -322,7 +362,14 @@ fn script_function_calls_match_the_walker() {
         let program = Compiler::new().compile(&ast);
         let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the script runs");
         let expected = limit * (limit - 1) / 2;
-        assert_eq!(format!("{result:?}"), expected.to_string(), "limit {limit}, stats={:?}", jit_state::stats());
+        let stats = jit_state::stats();
+        assert_eq!(format!("{result:?}"), expected.to_string(), "limit {limit}, stats={stats:?}");
+        if limit >= 2000 {
+            assert!(
+                stats.loops_compiled > 0,
+                "the script-fn loop must still compile at limit {limit}: {stats:?}"
+            );
+        }
     }
 }
 

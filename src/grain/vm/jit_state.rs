@@ -409,8 +409,8 @@ mod tests {
         assert_eq!(frames[0].regs[0].value, 0x2222_0000);
         assert_eq!(
             frames[0].regs[0].opref,
-            OpRef::ConstPtr(GcRef(0x2222_0000)),
-            "without a live-Vm failarg the reserved slot is a Const of the live bits",
+            OpRef::input_arg_typed(vm_reg, Type::Ref),
+            "without a live-Vm failarg the reserved slot keeps its InputArg",
         );
         assert_eq!(
             frames[0].regs[1].value, stale,
@@ -841,14 +841,12 @@ impl JitState for GrainJitState {
             eprintln!();
         }
         // The reserved slot may hold a reused colour (a Scope failarg
-        // at PC 6103) whose bits are not the Vm. Folding the live
-        // address to `ConstPtr` compiles `Call*(this_eval's stack)` —
-        // dead on the next `Vm::new`. Prefer a failarg that already
-        // names the live Vm: first a reconstructed portal register,
-        // then a compiled-loop failarg that is a livebox but not a
-        // portal-register occupant (`rd_numb` only describes the
-        // latter). `bridge_decode_red` numbers that slot as
-        // `InputArgRef(n)`.
+        // at PC 6103) whose bits are not the Vm. Prefer a failarg that
+        // already names the live Vm: first a reconstructed portal
+        // register, then a compiled-loop failarg that is a livebox but
+        // not a portal-register occupant. If neither names it, keep
+        // the existing InputArg — do not bake this eval's stack
+        // pointer as ConstPtr.
         let vm_opref = root
             .regs
             .iter()
@@ -861,7 +859,7 @@ impl JitState for GrainJitState {
                     (bits == live_vm).then_some(OpRef::input_arg_typed(n as u32, Type::Ref))
                 })
             })
-            .unwrap_or(OpRef::ConstPtr(GcRef(live_vm as usize)));
+            .unwrap_or(slot.opref);
         if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
             eprintln!(
                 "[bridgeB] rebind-opref vm_reg={vm_reg} stale={stale:#x} live={live_vm:#x} \

@@ -151,6 +151,38 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::run_chain_abi as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::compiled_fn_is_plain_add",
+            super::jit::compiled_fn_is_plain_add as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::plain_add_handled",
+            super::jit::plain_add_handled as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::call_plain_add_abi",
+            super::jit::call_plain_add_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::call_plain_add_ref_abi",
+            super::jit::call_plain_add_ref_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::call_plain_abs_ref_abi",
+            super::jit::call_plain_abs_ref_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::prepare_compiled_call_abi",
+            super::jit::prepare_compiled_call_abi as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::prepared_chunk_entry",
+            super::jit::prepared_chunk_entry as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::finish_compiled_call_abi",
+            super::jit::finish_compiled_call_abi as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::call_syntactic_or_stacked_abi",
             super::jit::call_syntactic_or_stacked_abi as *const () as usize as i64,
         ),

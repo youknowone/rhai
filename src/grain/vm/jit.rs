@@ -47,6 +47,178 @@ thread_local! {
     static PROGRAM_NAME: Cell<Option<&'static str>> = const { Cell::new(None) };
     static OPERATOR_BUILTIN_HANDLED: Cell<i64> = const { Cell::new(0) };
     static UNARY_BUILTIN_HANDLED: Cell<i64> = const { Cell::new(0) };
+    static PLAIN_ADD_HANDLED: Cell<i64> = const { Cell::new(0) };
+    static PREPARED_CHUNK_ENTRY: Cell<i64> = const { Cell::new(0) };
+    static RESIDUAL_NEST: Cell<u32> = const { Cell::new(0) };
+    static PLAIN_ADD_CACHE: RefCell<Vec<(usize, u32, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Compiled code holds `RUNTIME` for the residual it called. Nested
+/// `run_frame` merge points cannot consult, so skip them before `STEP`.
+struct ResidualNest;
+
+impl ResidualNest {
+    fn enter() -> Option<Self> {
+        let compiled = RUNTIME
+            .try_with(|cell| cell.try_borrow().is_err())
+            .unwrap_or(false);
+        if !compiled {
+            return None;
+        }
+        RESIDUAL_NEST.with(|nest| nest.set(nest.get().saturating_add(1)));
+        bump_stats(|stats| stats.reentrant_consultations_declined += 1);
+        Some(Self)
+    }
+}
+
+impl Drop for ResidualNest {
+    fn drop(&mut self) {
+        RESIDUAL_NEST.with(|nest| nest.set(nest.get().saturating_sub(1)));
+    }
+}
+
+enum PlainFast {
+    Did(Option<Box<crate::EvalAltResult>>),
+    Miss,
+}
+
+fn try_plain_add_ref(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    base: usize,
+    slot: u16,
+    first: usize,
+) -> PlainFast {
+    let at = base.saturating_add(slot as usize);
+    if at >= scope.len() || first >= vm.depth {
+        return PlainFast::Miss;
+    }
+    match super::apply_binary(
+        crate::grain::bytecode::BinOpKind::Add,
+        scope.get_mut_by_index(at),
+        super::stack_ref(vm, first),
+    ) {
+        Ok(Some(value)) => {
+            vm.truncate_stack(first);
+            vm.push_fast(value);
+            PlainFast::Did(None)
+        }
+        Ok(None) => PlainFast::Miss,
+        Err(err) => PlainFast::Did(Some(err)),
+    }
+}
+
+fn try_plain_add_stack(vm: &mut Vm<'_>, first: usize) -> PlainFast {
+    if first + 1 >= vm.depth {
+        return PlainFast::Miss;
+    }
+    for slot in first..first + 2 {
+        #[cfg(not(feature = "no_closure"))]
+        if super::stack_ref(vm, slot).is_shared() {
+            let held = core::mem::replace(super::stack_mut(vm, slot), super::unit_value());
+            super::store_value(super::stack_mut(vm, slot), held.flatten());
+        }
+    }
+    match super::apply_binary(
+        crate::grain::bytecode::BinOpKind::Add,
+        super::stack_ref(vm, first),
+        super::stack_ref(vm, first + 1),
+    ) {
+        Ok(Some(value)) => {
+            vm.truncate_stack(first);
+            vm.push_fast(value);
+            PlainFast::Did(None)
+        }
+        Ok(None) => PlainFast::Miss,
+        Err(err) => PlainFast::Did(Some(err)),
+    }
+}
+
+fn try_plain_abs_ref(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    base: usize,
+    slot: u16,
+    position: i64,
+) -> PlainFast {
+    let at = base.saturating_add(slot as usize);
+    if at >= scope.len() {
+        return PlainFast::Miss;
+    }
+    let Ok(x) = scope.get_mut_by_index(at).as_int() else {
+        return PlainFast::Miss;
+    };
+    let value = if cfg!(not(feature = "unchecked")) {
+        match x.checked_abs() {
+            Some(abs) => Dynamic::from(abs),
+            None => {
+                return PlainFast::Did(Some(Box::new(crate::EvalAltResult::ErrorArithmetic(
+                    format!("Negation overflow: -{x}"),
+                    position_from_bits(position),
+                ))));
+            }
+        }
+    } else {
+        Dynamic::from(x.abs())
+    };
+    vm.push(value);
+    PlainFast::Did(None)
+}
+
+fn try_plain_add_named(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    name: &str,
+    first: usize,
+) -> PlainFast {
+    if first >= vm.depth {
+        return PlainFast::Miss;
+    }
+    let Some(lhs) = scope.get_mut(name) else {
+        return PlainFast::Miss;
+    };
+    match super::apply_binary(
+        crate::grain::bytecode::BinOpKind::Add,
+        lhs,
+        super::stack_ref(vm, first),
+    ) {
+        Ok(Some(value)) => {
+            vm.truncate_stack(first);
+            vm.push_fast(value);
+            PlainFast::Did(None)
+        }
+        Ok(None) => PlainFast::Miss,
+        Err(err) => PlainFast::Did(Some(err)),
+    }
+}
+
+fn try_plain_abs_named(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    name: &str,
+    position: i64,
+) -> PlainFast {
+    let Some(entry) = scope.get_mut(name) else {
+        return PlainFast::Miss;
+    };
+    let Ok(x) = entry.as_int() else {
+        return PlainFast::Miss;
+    };
+    let value = if cfg!(not(feature = "unchecked")) {
+        match x.checked_abs() {
+            Some(abs) => Dynamic::from(abs),
+            None => {
+                return PlainFast::Did(Some(Box::new(crate::EvalAltResult::ErrorArithmetic(
+                    format!("Negation overflow: -{x}"),
+                    position_from_bits(position),
+                ))));
+            }
+        }
+    } else {
+        Dynamic::from(x.abs())
+    };
+    vm.push(value);
+    PlainFast::Did(None)
 }
 
 /// Write the scalar payload of an existing integer `Dynamic`.
@@ -764,6 +936,46 @@ pub(super) extern "C" fn stash_ok_result(frame: &mut GrainFrame<'_, '_>, value: 
     frame.jit_return_kind = 1;
 }
 
+/// Bind a compiled script call into [`Vm::prepared_scope`].
+///
+/// The portal then calls `run_frame` on that scope so the tracer can
+/// `can_inline` the body (`Function.call_args` → `execute_frame`).
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn prepare_compiled_call_abi(
+    vm: &mut Vm<'_>,
+    program: &Program<'_>,
+    name_index: u32,
+    argc: usize,
+    first: usize,
+    position: i64,
+) -> Option<Box<crate::EvalAltResult>> {
+    match vm.prepare_compiled_call(
+        program,
+        name_index,
+        argc,
+        first,
+        position_from_bits(position),
+    ) {
+        Ok(entry) => {
+            PREPARED_CHUNK_ENTRY.with(|cell| cell.set(entry as i64));
+            None
+        }
+        Err(err) => Some(err),
+    }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn prepared_chunk_entry() -> i64 {
+    PREPARED_CHUNK_ENTRY.with(Cell::get)
+}
+
+/// Rewind the prepared callee scope and give it back to the pool.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn finish_compiled_call_abi(vm: &mut Vm<'_>) {
+    vm.finish_compiled_call();
+}
+
 /// Run a stacked or syntactic call without exposing its internals to the trace.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
@@ -777,6 +989,17 @@ pub(super) extern "C" fn call_syntactic_or_stacked_abi(
     capture: i64,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
+    if capture == 0
+        && argc == 2
+        && vm.engine.fast_operators()
+        && cached_plain_add(program, name_index, argc)
+    {
+        match try_plain_add_stack(vm, first) {
+            PlainFast::Did(err) => return err,
+            PlainFast::Miss => {}
+        }
+    }
+    let _nest = ResidualNest::enter();
     let Some(name) = program.name_plain(name_index) else {
         return Some(Box::new(crate::EvalAltResult::ErrorRuntime(
             format!("malformed chunk: no name {name_index}").into(),
@@ -816,6 +1039,41 @@ pub(super) extern "C" fn call_by_reference_abi(
     capture: i64,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
+    if capture == 0 && vm.engine.fast_operators() {
+        // CallRef `add(s, i)` reports argc=2 (arity) with the receiver
+        // in a local/name and only `i` on the stack.
+        if (argc == 1 || argc == 2) && cached_plain_add(program, name_index, 2) {
+            if let Some(first) = vm.depth.checked_sub(1) {
+                let hit = match receiver_kind {
+                    0 => try_plain_add_ref(vm, scope, base, receiver_payload as u16, first),
+                    1 => match program.name_plain(receiver_payload) {
+                        Some(name) => try_plain_add_named(vm, scope, name, first),
+                        None => PlainFast::Miss,
+                    },
+                    _ => PlainFast::Miss,
+                };
+                match hit {
+                    PlainFast::Did(err) => return err,
+                    PlainFast::Miss => {}
+                }
+            }
+        }
+        if argc == 0 && program.name_plain(name_index) == Some("abs") {
+            let hit = match receiver_kind {
+                0 => try_plain_abs_ref(vm, scope, base, receiver_payload as u16, position),
+                1 => match program.name_plain(receiver_payload) {
+                    Some(name) => try_plain_abs_named(vm, scope, name, position),
+                    None => PlainFast::Miss,
+                },
+                _ => PlainFast::Miss,
+            };
+            match hit {
+                PlainFast::Did(err) => return err,
+                PlainFast::Miss => {}
+            }
+        }
+    }
+    let _nest = ResidualNest::enter();
     let Some(name) = program.name_plain(name_index) else {
         return Some(Box::new(crate::EvalAltResult::ErrorRuntime(
             format!("malformed chunk: no name {name_index}").into(),
@@ -1100,6 +1358,194 @@ pub(super) extern "C" fn operator_builtin_abi(
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn operator_builtin_handled() -> i64 {
     OPERATOR_BUILTIN_HANDLED.with(Cell::get)
+}
+
+/// Whether a compiled script function is the body `a + b`.
+///
+/// The tracer records the typed `+` already lowered for `BIN_OP`; a
+/// residual `CALL` of that body cannot. Program and name are green.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn compiled_fn_is_plain_add(
+    program: &Program<'_>,
+    name_index: u32,
+    argc: usize,
+) -> i64 {
+    i64::from(argc == 2 && function_body_is_plain_add(program, name_index, argc))
+}
+
+fn cached_plain_add(program: &Program<'_>, name_index: u32, argc: usize) -> bool {
+    let key = program as *const Program<'_> as usize;
+    PLAIN_ADD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((_, _, hit)) = cache.iter().find(|(p, n, _)| *p == key && *n == name_index) {
+            return *hit;
+        }
+        let hit = argc == 2 && function_body_is_plain_add(program, name_index, argc);
+        cache.push((key, name_index, hit));
+        hit
+    })
+}
+
+fn function_body_is_plain_add(program: &Program<'_>, name_index: u32, argc: usize) -> bool {
+    use crate::grain::bytecode::code::disassemble;
+    use crate::grain::bytecode::{BinOpKind, BinOperand, Op};
+    let Some(function) = program.function_plain(name_index, argc) else {
+        return false;
+    };
+    let start = function.chunk.entry() as usize;
+    let end = function.chunk.end() as usize;
+    let Some(bytes) = program.code().get(start..end) else {
+        return false;
+    };
+    let ops: Vec<Op> = disassemble(bytes)
+        .map(|(_, op)| op)
+        .filter(|op| !matches!(op, Op::Tick | Op::Checkpoint))
+        .collect();
+    match ops.as_slice() {
+        [
+            Op::BinOpFrom {
+                kind: BinOpKind::Add,
+                lhs: 0,
+                rhs: BinOperand::Local(1),
+                branch: None,
+                ..
+            },
+            Op::Return,
+        ]
+        | [
+            Op::BinOpFrom {
+                kind: BinOpKind::Add,
+                lhs: 0,
+                rhs: BinOperand::Local(1),
+                branch: None,
+                ..
+            },
+        ]
+        | [
+            Op::LoadLocal(0),
+            Op::LoadLocal(1),
+            Op::BinOp {
+                kind: BinOpKind::Add,
+                rhs: None,
+                branch: None,
+                ..
+            },
+            Op::Return,
+        ]
+        | [
+            Op::LoadLocal(0),
+            Op::LoadLocal(1),
+            Op::Call { argc: 2, .. },
+            Op::Return,
+        ]
+        | [Op::LoadLocal(0), Op::LoadLocal(1), Op::Call { argc: 2, .. }] => true,
+        _ => false,
+    }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn plain_add_handled() -> i64 {
+    PLAIN_ADD_HANDLED.with(Cell::get)
+}
+
+/// Two stack ints through the same `+` the portal already runs for `BIN_OP`.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn call_plain_add_abi(
+    vm: &mut Vm<'_>,
+    first: usize,
+) -> Option<Box<crate::EvalAltResult>> {
+    PLAIN_ADD_HANDLED.with(|cell| cell.set(0));
+    if !live_vm_ptr(vm) || first + 1 >= vm.depth {
+        return None;
+    }
+    match super::apply_binary(
+        crate::grain::bytecode::BinOpKind::Add,
+        super::stack_ref(vm, first),
+        super::stack_ref(vm, first + 1),
+    ) {
+        Ok(Some(value)) => {
+            vm.truncate_stack(first);
+            vm.push_fast(value);
+            PLAIN_ADD_HANDLED.with(|cell| cell.set(1));
+            None
+        }
+        Ok(None) => None,
+        Err(err) => Some(err),
+    }
+}
+
+/// `add(s, i)` as CallRef: local receiver plus one stack arg.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn call_plain_add_ref_abi(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    base: usize,
+    slot: u16,
+    first: usize,
+) -> Option<Box<crate::EvalAltResult>> {
+    PLAIN_ADD_HANDLED.with(|cell| cell.set(0));
+    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+        return None;
+    }
+    let at = base.saturating_add(slot as usize);
+    if at >= scope.len() || first >= vm.depth {
+        return None;
+    }
+    match super::apply_binary(
+        crate::grain::bytecode::BinOpKind::Add,
+        scope.get_mut_by_index(at),
+        super::stack_ref(vm, first),
+    ) {
+        Ok(Some(value)) => {
+            vm.truncate_stack(first);
+            vm.push_fast(value);
+            PLAIN_ADD_HANDLED.with(|cell| cell.set(1));
+            None
+        }
+        Ok(None) => None,
+        Err(err) => Some(err),
+    }
+}
+
+/// `abs(x)` as CallRef: the receiver is the sole operand.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn call_plain_abs_ref_abi(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    base: usize,
+    slot: u16,
+    position: i64,
+) -> Option<Box<crate::EvalAltResult>> {
+    UNARY_BUILTIN_HANDLED.with(|cell| cell.set(0));
+    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+        return None;
+    }
+    let at = base.saturating_add(slot as usize);
+    if at >= scope.len() {
+        return None;
+    }
+    let Ok(x) = scope.get_mut_by_index(at).as_int() else {
+        return None;
+    };
+    let value = if cfg!(not(feature = "unchecked")) {
+        match x.checked_abs() {
+            Some(abs) => Dynamic::from(abs),
+            None => {
+                return Some(Box::new(crate::EvalAltResult::ErrorArithmetic(
+                    format!("Negation overflow: -{x}"),
+                    position_from_bits(position),
+                )));
+            }
+        }
+    } else {
+        Dynamic::from(x.abs())
+    };
+    vm.push(value);
+    UNARY_BUILTIN_HANDLED.with(|cell| cell.set(1));
+    None
 }
 
 /// Whether a pooled name is the unary `abs` builtin, as one word.
@@ -1816,9 +2262,13 @@ impl Runtime {
         // before a trace clones staticdata. Keep them beside the state in one
         // thread-local owner because JitDriver is not a shared runtime object.
         jitcodes::install();
-        let descriptor = jit_state::grain_driver_descriptor();
+        let mut descriptor = jit_state::grain_driver_descriptor();
+        // pypyjitdriver.is_recursive: script-fn CALL's recursive
+        // `run_frame` is a portal call `can_inline` may look inside.
+        descriptor.is_recursive = true;
         let green_types = descriptor.green_args_spec();
         let mut driver = JitDriver::with_descriptor(THRESHOLD, descriptor);
+        driver.set_is_recursive(true);
         driver.ensure_descriptor_registered();
         let (insns, all_liveness) = jitcodes::liveness_parts();
         driver
@@ -2015,6 +2465,9 @@ impl GrainJitDriver {
         frame: &mut GrainFrame<'_, '_>,
         vm: &Vm<'_>,
     ) {
+        if RESIDUAL_NEST.with(Cell::get) != 0 {
+            return;
+        }
         // The door below resolves a celltable cell, builds a driver descriptor
         // and extracts the live values before it decides to interpret -- four
         // heap blocks per call, on a path taken once per *dispatched
@@ -2038,6 +2491,18 @@ impl GrainJitDriver {
             true
         });
         if !opened {
+            return;
+        }
+
+        // Compiled code holds `RUNTIME` for the whole residual it called.
+        // A nested `run_frame` (script-fn CALL) cannot consult, so decline
+        // before building the door's green key. `add` has no back edge of
+        // its own; the consult cannot compile it.
+        if RUNTIME
+            .try_with(|cell| cell.try_borrow_mut().is_err())
+            .unwrap_or(true)
+        {
+            bump_stats(|stats| stats.reentrant_consultations_declined += 1);
             return;
         }
 
@@ -2098,8 +2563,8 @@ impl GrainJitDriver {
             );
             let green_hash = majit_metainterp::green_key_hash_typed(&green_values, &green_types);
             let green_key = || GreenKey {
-                values: green_values.to_vec(),
-                types: green_types.clone(),
+                values: green_values.to_vec().into(),
+                types: green_types.clone().into(),
             };
 
             // The driver reads the live values off the state, and the state
@@ -2220,14 +2685,15 @@ impl GrainJitDriver {
                         })
                         .collect();
 
+                    let mut stack = majit_metainterp::StandaloneFrameStack::new();
                     let frame = majit_metainterp::setup_frame_from_merge_point(
                         ctx,
+                        &mut stack.frames,
                         Arc::clone(&portal),
                         header_pc,
                         &green_args,
                         &red_args,
                     );
-                    let mut stack = majit_metainterp::StandaloneFrameStack::new();
                     stack.frames.push(frame);
                     let trace_runtime = majit_metainterp::ClosureRuntime::new(|label| label);
 

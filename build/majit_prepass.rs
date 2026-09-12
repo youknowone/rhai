@@ -136,11 +136,17 @@ pub fn main() {
 fn jit_driver() -> majit_translate::JitDriverSpec {
     majit_translate::JitDriverSpec {
         portal: majit_translate::CallPath::from_segments(["grain", "vm", "Vm", "run_frame"]),
-        // This VM enters its portal directly. There is no synthetic runner to
-        // name, so no call classifies as recursive through one, and the
-        // configured portal path is registered as written rather than against
-        // a copy split before the marker.
-        portal_runner: None,
+        // Grain has no synthetic `portal_runner` wrapper: the dispatch loop
+        // is the portal. Naming that same path here is what makes a
+        // script-fn CALL's `self.run_frame(...)` classify as `'recursive'`
+        // (`call.py jitdriver_sd_from_portal_runner_ptr`) so the tracer can
+        // `can_inline` the callee body.
+        portal_runner: Some(majit_translate::CallPath::from_segments([
+            "grain",
+            "vm",
+            "Vm",
+            "run_frame",
+        ])),
         split_portal: false,
         greens: vec![
             "pc".to_string(),

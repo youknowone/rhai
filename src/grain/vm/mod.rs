@@ -1799,6 +1799,12 @@ pub struct Vm<'e> {
     /// The last generation handed out, so that the next one is one nothing
     /// carries. Never read back into an entry.
     last_generation: u64,
+    /// Detached callee scope filled by [`jit::prepare_compiled_call_abi`].
+    ///
+    /// Moved out around the recursive [`Self::run_frame`] so the portal can
+    /// hold `&mut Scope` and `&mut Vm` at once. Empty except during that call.
+    #[cfg(feature = "grain-jit")]
+    prepared_scope: Scope<'static>,
     /// Steps waiting for the statement that asked for them to end.
     ///
     /// Rhai keeps this in a `defer` per AST node (`eval/stmt.rs:271`): a `next`
@@ -1950,6 +1956,8 @@ impl<'e> Vm<'e> {
             callbacks: None,
             generation: 0,
             last_generation: 0,
+            #[cfg(feature = "grain-jit")]
+            prepared_scope: Scope::new(),
             #[cfg(feature = "debugging")]
             pending_steps: Vec::new(),
         }
@@ -2021,6 +2029,8 @@ impl<'e> Vm<'e> {
             callbacks: None,
             generation: 0,
             last_generation: warm.last_generation,
+            #[cfg(feature = "grain-jit")]
+            prepared_scope: Scope::new(),
             // A step belongs to the statement that asked for it, and that
             // statement is running in the `Vm` this crossing came from.
             #[cfg(feature = "debugging")]
@@ -4725,6 +4735,59 @@ impl<'e> Vm<'e> {
         result
     }
 
+    /// Bind a compiled script call into [`Self::prepared_scope`].
+    ///
+    /// The portal then calls [`Self::run_frame`] on that scope so the tracer
+    /// can inline the body. Setup stays residual because its Result shell
+    /// does not lower.
+    #[cfg(feature = "grain-jit")]
+    pub(super) fn prepare_compiled_call(
+        &mut self,
+        program: &Program,
+        name_index: u32,
+        argc: usize,
+        first: usize,
+        pos: Position,
+    ) -> Result<usize, Box<EvalAltResult>> {
+        let Some(function) = program_function(program, name_index, argc) else {
+            return Err(malformed(format!(
+                "no compiled function {name_index}/{argc}"
+            )));
+        };
+        self.engine.track_operation(&mut self.global, pos)?;
+        #[cfg(not(feature = "unchecked"))]
+        {
+            #[cfg(not(feature = "no_function"))]
+            if self.global.level + 1 > self.engine.max_call_levels() {
+                return Err(Box::new(EvalAltResult::ErrorStackOverflow(pos)));
+            }
+            if function.param_names.len() > self.engine.max_variables() {
+                return Err(Box::new(EvalAltResult::ErrorTooManyVariables(pos)));
+            }
+        }
+        self.global.level += 1;
+        let mut detached = self.take_scope();
+        for (param, slot) in function.param_names.iter().zip(first..) {
+            let value = or_raise!(
+                self.values_mut().get_mut(slot),
+                malformed("call with too few arguments".to_string())
+            )
+            .take();
+            detached.push_entry(param.clone(), value.access_mode(), value);
+        }
+        self.prepared_scope = detached;
+        Ok(function.chunk.entry() as usize)
+    }
+
+    /// Rewind the prepared callee scope and restore the caller's level.
+    #[cfg(feature = "grain-jit")]
+    pub(super) fn finish_compiled_call(&mut self) {
+        let mut detached = mem::take(&mut self.prepared_scope);
+        detached.rewind(0);
+        self.give_scope(detached);
+        self.global.level = self.global.level.saturating_sub(1);
+    }
+
     /// The same call, with a variable as its first argument and Rhai's
     /// method-call rewrite applied to it (`func/call.rs:1434-1460`).
     ///
@@ -7270,6 +7333,20 @@ impl<'e> Vm<'e> {
                     let value = {
                         #[cfg(feature = "grain-jit")]
                         {
+                            if argc == 2
+                                && fast_operators!()
+                                && jit::compiled_fn_is_plain_add(program, name_index, argc) != 0
+                            {
+                                if let Some(err) = jit::call_plain_add_abi(self, first) {
+                                    return Err(err);
+                                }
+                                if jit::plain_add_handled() != 0 {
+                                    let value = take_residual_push!();
+                                    deliver!(first, value);
+                                    pc += width;
+                                    continue;
+                                }
+                            }
                             if argc == 1 && jit::name_is_abs(program, name_index) != 0 {
                                 if let Some(err) = jit::unary_builtin_abi(
                                     self,
@@ -7362,24 +7439,62 @@ impl<'e> Vm<'e> {
                     let value = {
                         #[cfg(feature = "grain-jit")]
                         {
-                            let (receiver_kind, receiver_payload) = match receiver {
-                                Receiver::Local(slot) => (0, u32::from(slot)),
-                                Receiver::Named(index) => (1, index),
-                                Receiver::This => (2, 0),
-                            };
-                            if let Some(err) = jit::call_by_reference_abi(
-                                self,
-                                program,
-                                name_index,
-                                argc,
-                                receiver_kind,
-                                receiver_payload,
-                                scope,
-                                base,
-                                i64::from(capture),
-                                jit::position_bits(pos!()),
-                            ) {
-                                return Err(err);
+                            let mut used_plain_add = false;
+                            if !capture
+                                && argc == 0
+                                && fast_operators!()
+                                && jit::name_is_abs(program, name_index) != 0
+                            {
+                                if let Receiver::Local(slot) = receiver {
+                                    if let Some(err) = jit::call_plain_abs_ref_abi(
+                                        self,
+                                        scope,
+                                        base,
+                                        slot,
+                                        jit::position_bits(pos!()),
+                                    ) {
+                                        return Err(err);
+                                    }
+                                    used_plain_add = jit::unary_builtin_handled() != 0;
+                                }
+                            }
+                            if !used_plain_add
+                                && !capture
+                                && argc == 1
+                                && fast_operators!()
+                                && jit::compiled_fn_is_plain_add(program, name_index, 2) != 0
+                            {
+                                if let (Receiver::Local(slot), Some(first)) =
+                                    (receiver, self.depth.checked_sub(1))
+                                {
+                                    if let Some(err) =
+                                        jit::call_plain_add_ref_abi(self, scope, base, slot, first)
+                                    {
+                                        return Err(err);
+                                    }
+                                    used_plain_add = jit::plain_add_handled() != 0;
+                                }
+                            }
+                            if !used_plain_add {
+                                let (receiver_kind, receiver_payload) = match receiver {
+                                    Receiver::Local(slot) => (0, u32::from(slot)),
+                                    Receiver::Named(index) => (1, index),
+                                    Receiver::This => (2, 0),
+                                };
+                                if let Some(err) = jit::call_by_reference_abi(
+                                    self,
+                                    program,
+                                    name_index,
+                                    argc,
+                                    receiver_kind,
+                                    receiver_payload,
+                                    scope,
+                                    base,
+                                    i64::from(capture),
+                                    jit::position_bits(pos!()),
+                                ) {
+                                    return Err(err);
+                                }
                             }
                             take_residual_push!()
                         }
