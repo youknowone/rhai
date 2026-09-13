@@ -2807,7 +2807,20 @@ impl GrainJitDriver {
             // this instruction instead, the way a failed `JUMP_IF` resumes
             // after the test. `while` reports a real post-loop pc and
             // never takes this arm.
-            if resume_at == usize::MAX {
+            //
+            // Binding `scope_rewind` lets the blackhole run `UnwindTo`
+            // before this resume. The rotated body (`pc=126`) then
+            // reads the loop slot that rewind dropped. If that slot
+            // is gone, land after the header's `UnwindTo` instead.
+            let scope_len = frame.scope.len();
+            let from = if resume_at == usize::MAX {
+                pc
+            } else {
+                resume_at
+            };
+            if let Some(after) = skip_past_unwound_for(program.code(), from, scope_len) {
+                frame.jit_resume_pc_plus_one = after + 1;
+            } else if resume_at == usize::MAX {
                 if range_exhausted(vm) {
                     if let Some(header) = next_iter_header(program.code(), pc) {
                         frame.jit_resume_pc_plus_one = header + 1;
@@ -2858,4 +2871,83 @@ fn next_iter_header(code: &[u8], from: usize) -> Option<usize> {
         at += crate::grain::bytecode::code::width(code, at)?;
     }
     None
+}
+
+/// Slot an `ITER_NEXT_STORE` writes, if `header` is that opcode.
+fn iter_next_store_slot(code: &[u8], header: usize) -> Option<u16> {
+    if *code.get(header)? != code::tag::ITER_NEXT_STORE {
+        return None;
+    }
+    // `small!(5)` in the portal: u16 at offset 5 of a 7-byte insn.
+    let lo = *code.get(header + 5)?;
+    let hi = *code.get(header + 6)?;
+    Some(u16::from_le_bytes([lo, hi]))
+}
+
+fn iter_next_store_body(code: &[u8], header: usize) -> Option<usize> {
+    if *code.get(header)? != code::tag::ITER_NEXT_STORE {
+        return None;
+    }
+    // `wide!(1)` in the portal: u32 at offset 1.
+    let bytes: [u8; 4] = code.get(header + 1..header + 5)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes) as usize)
+}
+
+/// After `UnwindTo` has dropped a `for` slot, do not resume at the
+/// rotated body or the header. Land on the first opcode past that
+/// `UnwindTo` (the outer loop, or the statement after the `for`).
+///
+/// Only when `from` is that `for`'s own header or body. A resume in
+/// the outer body (before `i` is declared) also sees slot 4 missing
+/// and must not skip the increment / inner `IterInit`.
+fn skip_past_unwound_for(code: &[u8], from: usize, scope_len: usize) -> Option<usize> {
+    let header = next_iter_header(code, from)?;
+    let slot = iter_next_store_slot(code, header)? as usize;
+    if slot < scope_len {
+        return None;
+    }
+    let body = iter_next_store_body(code, header)?;
+    if from != header && from != body {
+        return None;
+    }
+    let after_header = header + crate::grain::bytecode::code::width(code, header)?;
+    if *code.get(after_header)? == code::tag::UNWIND_TO {
+        Some(after_header + crate::grain::bytecode::code::width(code, after_header)?)
+    } else {
+        Some(after_header)
+    }
+}
+
+#[cfg(test)]
+mod unwind_resume_tests {
+    use super::{iter_next_store_body, iter_next_store_slot, skip_past_unwound_for};
+    use crate::grain::bytecode::code;
+
+    fn inner_for_code() -> Vec<u8> {
+        // body at 0 (UNIT), header at 1, UnwindTo at 8.
+        let mut code = vec![code::tag::UNIT; 16];
+        code[1] = code::tag::ITER_NEXT_STORE;
+        code[2..6].copy_from_slice(&0u32.to_le_bytes());
+        code[6..8].copy_from_slice(&4u16.to_le_bytes());
+        code[8] = code::tag::UNWIND_TO;
+        code[9..11].copy_from_slice(&4u16.to_le_bytes());
+        code
+    }
+
+    #[test]
+    fn skip_past_unwound_for_from_rotated_body() {
+        let code = inner_for_code();
+        assert_eq!(iter_next_store_slot(&code, 1), Some(4));
+        assert_eq!(iter_next_store_body(&code, 1), Some(0));
+        assert_eq!(skip_past_unwound_for(&code, 0, 4), Some(11));
+        assert_eq!(skip_past_unwound_for(&code, 1, 4), Some(11));
+    }
+
+    #[test]
+    fn skip_past_unwound_for_ignores_outer_body() {
+        let code = inner_for_code();
+        // A pc that is neither this header nor its body.
+        assert_eq!(skip_past_unwound_for(&code, 11, 4), None);
+        assert_eq!(skip_past_unwound_for(&code, 0, 5), None);
+    }
 }

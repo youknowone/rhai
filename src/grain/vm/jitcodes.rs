@@ -513,6 +513,14 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::iterators_truncate as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::scope_rewind",
+            super::jit::scope_rewind as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::sizes_truncate",
+            super::jit::sizes_truncate as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::handlers_len",
             super::jit::handlers_len as *const () as usize as i64,
         ),
