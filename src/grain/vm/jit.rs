@@ -2065,6 +2065,47 @@ pub(super) extern "C" fn array_entry<'a>(array: &'a crate::Array, index: usize) 
     &array[index]
 }
 
+/// Take a scalar operand as one ABI word plus a tag.
+///
+/// `1` int, `2` bool, `3` float, `4` unit, `0` anything else (slot
+/// left in place). A walk-local `Dynamic` out-parameter is not an
+/// address; the payload is.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn operand_stack_take_fast(vm: &mut Vm<'_>, index: usize) -> i64 {
+    if !live_stack_store(vm, index) {
+        majit_metainterp::request_walk_abort();
+        return 0;
+    }
+    let slot = super::operand_mut(&mut vm.stack[index]);
+    let tag = match &slot.0 {
+        Union::Int(n, ..) => {
+            FAST_INT.with(|cell| cell.set(*n));
+            1
+        }
+        Union::Bool(held, ..) => {
+            FAST_BOOL.with(|cell| cell.set(i64::from(*held)));
+            2
+        }
+        #[cfg(not(feature = "no_float"))]
+        Union::Float(held, ..) => {
+            FAST_FLOAT.with(|cell| cell.set(**held));
+            3
+        }
+        Union::Unit(..) => 4,
+        _ => return 0,
+    };
+    *slot = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
+    majit_metainterp::note_residual_committed();
+    tag
+}
+
+/// Whether a trace is being recorded. The miss path of
+/// [`operand_stack_take_fast`] must not residualize a walk-local out-param.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn walk_is_recording() -> bool {
+    STEP.with(|step| step.recording.get()) || majit_metainterp::is_bridge_walking()
+}
+
 /// Move one value out of a pointer-stable operand slot.
 ///
 /// Keep `mem::take::<Dynamic>` behind this named ABI just as stores are kept
@@ -2405,6 +2446,10 @@ struct Step {
     tracing: Cell<bool>,
     /// Consultations answered without opening the door.
     skipped: Cell<usize>,
+    /// Set for the whole door body, including `back_edge` bridge
+    /// tracing. [`walk_is_recording`] reads this rather than the
+    /// post-walk `tracing` mirror.
+    recording: Cell<bool>,
 }
 
 thread_local! {
@@ -2418,6 +2463,7 @@ thread_local! {
             prev_pc: Cell::new(usize::MAX),
             tracing: Cell::new(false),
             skipped: Cell::new(0),
+            recording: Cell::new(false),
         }
     };
 }
@@ -2434,6 +2480,7 @@ pub(super) fn reset_stats() {
     STEP.with(|step| {
         step.skipped.set(0);
         step.prev_pc.set(usize::MAX);
+        step.recording.set(false);
     });
     COUNTERS.with(|cell| {
         *cell.borrow_mut() = Counters {
@@ -2557,6 +2604,14 @@ impl GrainJitDriver {
         if !opened {
             return;
         }
+        STEP.with(|step| step.recording.set(true));
+        struct RecordingGuard;
+        impl Drop for RecordingGuard {
+            fn drop(&mut self) {
+                STEP.with(|step| step.recording.set(false));
+            }
+        }
+        let _recording = RecordingGuard;
 
         // Compiled code holds `RUNTIME` for the whole residual it called.
         // A nested `run_frame` (script-fn CALL) cannot consult, so decline

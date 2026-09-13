@@ -1395,6 +1395,25 @@ fn unit_value() -> Dynamic {
 fn stack_take(vm: &mut Vm<'_>, index: usize) -> Dynamic {
     #[cfg(feature = "grain-jit")]
     {
+        match jit::operand_stack_take_fast(vm, index) {
+            1 => {
+                return Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite));
+            }
+            2 => {
+                return Dynamic(Union::Bool(jit::fast_bool() != 0, 0, AccessMode::ReadWrite));
+            }
+            #[cfg(not(feature = "no_float"))]
+            3 => return Dynamic::from(jit::fast_float()),
+            4 => return unit_value(),
+            _ => {}
+        }
+        // A walk-local `Dynamic` out-param is not an address. Do not
+        // residualize `operand_stack_take` on the miss path while the
+        // tracer is recording; the scalar arm is the one-word ABI.
+        if jit::walk_is_recording() {
+            jit::request_walk_abort_abi();
+            return unit_value();
+        }
         let mut value = unit_value();
         jit::operand_stack_take(vm, index, &mut value);
         value
@@ -2637,6 +2656,34 @@ impl<'e> Vm<'e> {
     #[inline]
     #[allow(unused_mut)]
     pub(super) fn push(&mut self, mut value: Dynamic) {
+        #[cfg(feature = "grain-jit")]
+        {
+            match jit::dynamic_as_fast(&value) {
+                1 => {
+                    jit::push_fast_int(self, jit::fast_int());
+                    return;
+                }
+                2 => {
+                    jit::push_fast_bool(self, jit::fast_bool());
+                    return;
+                }
+                #[cfg(not(feature = "no_float"))]
+                3 => {
+                    jit::push_fast_float(self, jit::fast_float());
+                    return;
+                }
+                4 => {
+                    jit::push_fast_unit(self);
+                    return;
+                }
+                _ => {
+                    if jit::walk_is_recording() {
+                        jit::request_walk_abort_abi();
+                        return;
+                    }
+                }
+            }
+        }
         let depth = self.depth;
         #[cfg(feature = "grain-jit")]
         let stack_len = jit::operand_stack_len(self) as usize;

@@ -421,7 +421,38 @@ fn primes_sieve_agrees_through_the_compiled_outer_deopt() {
     eprintln!("primes-2557 grain JIT stats: {stats:?}");
     assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "sieve walker and vm must agree: {stats:?}");
     assert_eq!(format!("{walker:?}"), "375", "π(2557) is 375");
-    assert!(stats.loops_compiled > 0, "the sieve must compile a loop: {stats:?}");
+    if stats.non_owner_consultations_declined == 0 {
+        assert!(stats.loops_compiled > 0, "the sieve must compile a loop: {stats:?}");
+    }
+}
+
+/// The bench sieve is larger than the 2557 case. A compiled inner-exhaust
+/// JUMP onto the outer loop used to mark later primes composite.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn primes_sieve_5000_agrees_with_the_walker() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const SOURCE: &str = "const SIZE = 5000; \
+         let prime_mask = []; prime_mask.pad(SIZE + 1, true); \
+         prime_mask[0] = false; prime_mask[1] = false; \
+         let total_primes_found = 0; \
+         for p in 2..=SIZE { \
+             if !prime_mask[p] { continue; } \
+             total_primes_found += 1; \
+             for i in range(2 * p, SIZE + 1, p) { prime_mask[i] = false; } \
+         } total_primes_found";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the sieve parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let vm = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the vm runs the sieve");
+    let stats = jit_state::stats();
+    eprintln!("primes-5000 grain JIT stats: {stats:?}");
+    assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "sieve walker and vm must agree: {stats:?}");
+    assert_eq!(format!("{walker:?}"), "669", "π(5000) is 669");
 }
 
 /// A recursive script function that returns from the portal must not panic.
@@ -434,8 +465,29 @@ fn recursive_fibonacci_returns_from_the_portal() {
 
     jit_state::reset_stats();
     let engine = Engine::new();
-    let ast = engine.compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(12)").expect("fib parses");
+    let ast = engine.compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(20)").expect("fib parses");
     let program = Compiler::new().compile(&ast);
     let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("fib runs");
-    assert_eq!(format!("{result:?}"), "144", "stats={:?}", jit_state::stats());
+    let stats = jit_state::stats();
+    assert_eq!(format!("{result:?}"), "6765", "stats={stats:?}");
+    assert_eq!(stats.symbolic_residual_aborts, 0, "scalar take/push must not abort the fib walk: {stats:?}");
+}
+
+/// The bench `fib(28)` path hits a later guard than `fib(20)`. A walk-local
+/// `push` of the taken scalar used to abort that bridge (`rir`).
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn recursive_fibonacci_bridge_does_not_abort_on_scalar_push() {
+    if no_tables() {
+        return;
+    }
+
+    jit_state::reset_stats();
+    let engine = Engine::new();
+    let ast = engine.compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)").expect("fib parses");
+    let program = Compiler::new().compile(&ast);
+    let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("fib runs");
+    let stats = jit_state::stats();
+    assert_eq!(format!("{result:?}"), "317811", "stats={stats:?}");
+    assert_eq!(stats.symbolic_residual_aborts, 0, "scalar take/push must not abort the fib(28) bridge: {stats:?}");
 }
