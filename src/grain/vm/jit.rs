@@ -221,6 +221,42 @@ fn try_plain_abs_named(
     PlainFast::Did(None)
 }
 
+#[cfg(not(feature = "no_float"))]
+fn int_as_float(x: crate::INT) -> super::arith::FastValue {
+    super::arith::FastValue::Float(x as crate::FLOAT)
+}
+
+/// `to_float` on an integer local. Same CallRef shape as `abs(a)`.
+#[cfg(not(feature = "no_float"))]
+fn try_plain_to_float_ref(
+    vm: &mut Vm<'_>,
+    scope: &mut Scope<'_>,
+    base: usize,
+    slot: u16,
+) -> PlainFast {
+    let at = base.saturating_add(slot as usize);
+    if at >= scope.len() {
+        return PlainFast::Miss;
+    }
+    let Ok(x) = scope.get_mut_by_index(at).as_int() else {
+        return PlainFast::Miss;
+    };
+    vm.push_fast(int_as_float(x));
+    PlainFast::Did(None)
+}
+
+#[cfg(not(feature = "no_float"))]
+fn try_plain_to_float_named(vm: &mut Vm<'_>, scope: &mut Scope<'_>, name: &str) -> PlainFast {
+    let Some(entry) = scope.get_mut(name) else {
+        return PlainFast::Miss;
+    };
+    let Ok(x) = entry.as_int() else {
+        return PlainFast::Miss;
+    };
+    vm.push_fast(int_as_float(x));
+    PlainFast::Did(None)
+}
+
 /// Write the scalar payload of an existing integer `Dynamic`.
 ///
 /// The MAJIT frontend lowers this named boundary to a `setfield_gc_i` on
@@ -1069,6 +1105,25 @@ pub(super) extern "C" fn call_by_reference_abi(
                 0 => try_plain_abs_ref(vm, scope, base, receiver_payload as u16, position),
                 1 => match program.name_plain(receiver_payload) {
                     Some(name) => try_plain_abs_named(vm, scope, name, position),
+                    None => PlainFast::Miss,
+                },
+                _ => PlainFast::Miss,
+            };
+            match hit {
+                PlainFast::Did(err) => return err,
+                PlainFast::Miss => {}
+            }
+        }
+        // CallRef `i.to_float()` is the same arity/depth as `abs(a)`.
+        // The builtin is `|x: INT| x as FLOAT` (`gen_conv_functions`).
+        #[cfg(not(feature = "no_float"))]
+        if (argc == 0 || (argc == 1 && vm.depth == 0))
+            && program.name_plain(name_index) == Some("to_float")
+        {
+            let hit = match receiver_kind {
+                0 => try_plain_to_float_ref(vm, scope, base, receiver_payload as u16),
+                1 => match program.name_plain(receiver_payload) {
+                    Some(name) => try_plain_to_float_named(vm, scope, name),
                     None => PlainFast::Miss,
                 },
                 _ => PlainFast::Miss,
