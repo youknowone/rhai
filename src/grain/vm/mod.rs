@@ -1101,6 +1101,9 @@ pub(super) enum Items {
         next: INT,
         end: INT,
     },
+    /// `range(from, to, step)` as `StepRange<INT>`, walked in place
+    /// the same way [`Self::IntRange`] walks `0..n`.
+    IntStepRange { next: INT, end: INT, step: INT },
     /// Whatever the registry built.
     Boxed(Box<dyn Iterator<Item = VmResult>>),
 }
@@ -1117,6 +1120,21 @@ impl Items {
                 }
                 let value = *next;
                 *next += 1;
+                Some(Ok(Dynamic::from_int(value)))
+            }
+            Self::IntStepRange { next, end, step } => {
+                let exhausted = if *step > 0 {
+                    *next >= *end
+                } else if *step < 0 {
+                    *next <= *end
+                } else {
+                    true
+                };
+                if exhausted {
+                    return None;
+                }
+                let value = *next;
+                *next = next.wrapping_add(*step);
                 Some(Ok(Dynamic::from_int(value)))
             }
             Self::Boxed(items) => items.next(),
@@ -4382,6 +4400,23 @@ impl<'e> Vm<'e> {
             return Ok(());
         }
 
+        if type_id == TypeId::of::<crate::packages::iter_basic::StepRange<INT>>()
+            && self.int_step_range_is_natural()
+        {
+            let range = iterable
+                .try_cast::<crate::packages::iter_basic::StepRange<INT>>()
+                .expect("the type id says it is a stepped integer range");
+            self.iterators.push(Iteration {
+                items: Items::IntStepRange {
+                    next: range.from,
+                    end: range.to,
+                    step: range.step,
+                },
+                count: -1,
+            });
+            return Ok(());
+        }
+
         let func = self
             .engine
             .global_modules
@@ -4416,6 +4451,28 @@ impl<'e> Vm<'e> {
     /// case this has to say no to.
     fn int_range_is_natural(&self) -> bool {
         let type_id = TypeId::of::<crate::ExclusiveRange>();
+
+        let natural = self
+            .engine
+            .global_modules
+            .iter()
+            .find_map(|module| module.iter_is_natural(type_id));
+
+        #[cfg(not(feature = "no_module"))]
+        let natural = natural
+            .or_else(|| self.global.iter_is_natural(type_id))
+            .or_else(|| {
+                self.engine
+                    .global_sub_modules
+                    .values()
+                    .find_map(|module| module.qualified_iter_is_natural(type_id))
+            });
+
+        natural == Some(true)
+    }
+
+    fn int_step_range_is_natural(&self) -> bool {
+        let type_id = TypeId::of::<crate::packages::iter_basic::StepRange<INT>>();
 
         let natural = self
             .engine
@@ -8270,6 +8327,15 @@ impl<'e> Vm<'e> {
                                     Some(*next)
                                 }
                             }
+                            Items::IntStepRange { next, end, step } => {
+                                if *step > 0 {
+                                    if *next >= *end { None } else { Some(*next) }
+                                } else if *step < 0 {
+                                    if *next <= *end { None } else { Some(*next) }
+                                } else {
+                                    None
+                                }
+                            }
                             _ => {
                                 if let Some(err) = jit::iter_next_store(
                                     self,
@@ -8288,7 +8354,11 @@ impl<'e> Vm<'e> {
                             }
                         };
                         if let Some(n) = range_next {
-                            jit::store_int_range_next(&mut iteration.items, n + 1);
+                            let next = match &iteration.items {
+                                Items::IntStepRange { step, .. } => n.wrapping_add(*step),
+                                _ => n + 1,
+                            };
+                            jit::store_int_range_next(&mut iteration.items, next);
                             if iteration.count == INT::MAX {
                                 return Err(Box::new(EvalAltResult::ErrorArithmetic(
                                     format!("for-loop counter overflow: {}", iteration.count),

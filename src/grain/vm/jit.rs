@@ -251,10 +251,12 @@ pub(super) fn dynamic_store_float(target: &mut Dynamic, value: crate::FLOAT) {
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn store_int_range_next(items: &mut super::Items, value: crate::INT) {
-    let super::Items::IntRange { next, .. } = items else {
-        return;
-    };
-    *next = value;
+    match items {
+        super::Items::IntRange { next, .. } | super::Items::IntStepRange { next, .. } => {
+            *next = value;
+        }
+        _ => {}
+    }
 }
 
 /// Write `Iteration.count` without a `&mut INT` borrow.
@@ -2830,6 +2832,15 @@ impl GrainJitDriver {
 fn range_exhausted(vm: &Vm<'_>) -> bool {
     match vm.iterators_last().map(|iteration| &iteration.items) {
         Some(super::Items::IntRange { next, end }) => *next >= *end,
+        Some(super::Items::IntStepRange { next, end, step }) => {
+            if *step > 0 {
+                *next >= *end
+            } else if *step < 0 {
+                *next <= *end
+            } else {
+                true
+            }
+        }
         _ => false,
     }
 }
