@@ -365,12 +365,63 @@ fn script_function_calls_match_the_walker() {
         let stats = jit_state::stats();
         assert_eq!(format!("{result:?}"), expected.to_string(), "limit {limit}, stats={stats:?}");
         if limit >= 2000 {
-            assert!(
-                stats.loops_compiled > 0,
-                "the script-fn loop must still compile at limit {limit}: {stats:?}"
-            );
+            assert!(stats.loops_compiled > 0, "the script-fn loop must still compile at limit {limit}: {stats:?}");
         }
     }
+}
+
+/// A compiled nested `for` must leave after its `UnwindTo`, not at the
+/// outer body. Resuming at the outer increment used to count one extra.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn nested_for_leave_does_not_replay_the_outer_body() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    // Inner trip count is above the warm threshold so the inner loop
+    // compiles. The outer body increments once per turn.
+    const SOURCE: &str = "let n = 0; for p in 0..6 { n += 1; for i in 0..2000 { n += 0; } } n";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the nested for parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let vm = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the vm runs the nested for");
+    let stats = jit_state::stats();
+    eprintln!("nested-for grain JIT stats: {stats:?}");
+    assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "walker and vm must agree after the inner compiled leave: {stats:?}");
+    assert_eq!(format!("{walker:?}"), "6", "six outer turns");
+    assert!(stats.loops_compiled > 0, "the inner for must compile: {stats:?}");
+}
+
+/// `p = 2557` is the prime whose compiled outer deopt used to apply
+/// `total += 1` twice (writeback plus the resume at the increment).
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn primes_sieve_agrees_through_the_compiled_outer_deopt() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const SOURCE: &str = "const SIZE = 2557; \
+         let prime_mask = []; prime_mask.pad(SIZE + 1, true); \
+         prime_mask[0] = false; prime_mask[1] = false; \
+         let total_primes_found = 0; \
+         for p in 2..=SIZE { \
+             if !prime_mask[p] { continue; } \
+             total_primes_found += 1; \
+             for i in range(2 * p, SIZE + 1, p) { prime_mask[i] = false; } \
+         } total_primes_found";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the sieve parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine.eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast).expect("the walker runs");
+    let vm = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("the vm runs the sieve");
+    let stats = jit_state::stats();
+    eprintln!("primes-2557 grain JIT stats: {stats:?}");
+    assert_eq!(format!("{walker:?}"), format!("{vm:?}"), "sieve walker and vm must agree: {stats:?}");
+    assert_eq!(format!("{walker:?}"), "375", "π(2557) is 375");
+    assert!(stats.loops_compiled > 0, "the sieve must compile a loop: {stats:?}");
 }
 
 /// A recursive script function that returns from the portal must not panic.

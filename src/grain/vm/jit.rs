@@ -2585,6 +2585,8 @@ impl GrainJitDriver {
         let mut report_event = None;
         let mut restored = Vec::new();
         let mut resume_pc = None;
+        let mut exhausted_nested = false;
+        let mut scope_ints_before: Vec<Option<i64>> = Vec::new();
         RUNTIME.with(|cell| {
             let Ok(mut slot) = cell.try_borrow_mut() else {
                 bump_stats(|stats| stats.reentrant_consultations_declined += 1);
@@ -2646,6 +2648,10 @@ impl GrainJitDriver {
             // closing at the back edge. The offset is still what seeds the
             // walk's first frame below, because that one names a position in
             // the lowered body.
+            let iters_before = vm.iterators_len();
+            scope_ints_before = (0..frame.scope.len())
+                .map(|i| frame.scope.get_by_index(i).as_int().ok())
+                .collect();
             let mut resume = runtime.driver.back_edge_structured(
                 green_hash,
                 green_key,
@@ -2654,6 +2660,15 @@ impl GrainJitDriver {
                 &env,
                 || {},
             );
+            // A compiled nested `for` that just exhausted popped its
+            // iterator. PyPy's `FOR_ITER` then jumps past that loop
+            // (`next_instr += jumpby`); do not hop back into the outer
+            // merge-point green the leave may have reported.
+            // A remaining iterator means the *inner* for popped; the
+            // outer one is still live. An outer exhaust goes 1→0 and
+            // must not be treated as a nested leave.
+            let iters_after = vm.iterators_len();
+            exhausted_nested = iters_after < iters_before && iters_after > 0;
             let started = !was_tracing && runtime.driver.is_tracing();
             if runtime.driver.take_back_edge_finish().is_some() {
                 // Compiled code finished the portal. The walk stashed the
@@ -2674,11 +2689,15 @@ impl GrainJitDriver {
                         if next == usize::MAX || next != pc {
                             break;
                         }
+                        if exhausted_nested {
+                            break;
+                        }
                         if !runtime.driver.has_compiled_loop(green_hash) {
                             break;
                         }
                         hops += 1;
                         runtime.state.publish_live(&env, &frame.jit_vable_words());
+                        let hop_iters = vm.iterators_len();
                         resume = runtime.driver.back_edge_structured(
                             green_hash,
                             green_key,
@@ -2687,6 +2706,14 @@ impl GrainJitDriver {
                             &env,
                             || {},
                         );
+                        let hop_after = vm.iterators_len();
+                        if hop_after < hop_iters && hop_after > 0 {
+                            exhausted_nested = true;
+                            if runtime.driver.take_back_edge_finish().is_some() {
+                                resume = None;
+                            }
+                            break;
+                        }
                         if runtime.driver.take_back_edge_finish().is_some() {
                             resume = None;
                             break;
@@ -2867,23 +2894,45 @@ impl GrainJitDriver {
             // never takes this arm.
             //
             // Binding `scope_rewind` lets the blackhole run `UnwindTo`
-            // before this resume. The rotated body (`pc=126`) then
-            // reads the loop slot that rewind dropped. If that slot
-            // is gone, land after the header's `UnwindTo` instead.
+            // before this resume. The compiled loop we just left is the
+            // one entered at `pc`. If that `for`'s slot is gone, land
+            // after its `UnwindTo` — PyPy's `FOR_ITER` exhaust jumps
+            // past the callee (`next_instr += jumpby`) instead of
+            // returning to the caller's merge-point green.
             let scope_len = frame.scope.len();
-            let from = if resume_at == usize::MAX {
-                pc
-            } else {
-                resume_at
-            };
-            if let Some(after) = skip_past_unwound_for(program.code(), from, scope_len) {
+            // Prefer the compiled loop we entered (`pc`). A leave that
+            // named the outer merge-point green is ignored when that
+            // `pc` is the exhausted inner header/body.
+            let after_callee = skip_past_unwound_for(program.code(), pc, scope_len).or_else(|| {
+                if exhausted_nested {
+                    skip_past_exhausted_for(program.code(), pc, scope_len)
+                } else {
+                    None
+                }
+            });
+            if let Some(after) = after_callee {
                 frame.jit_resume_pc_plus_one = after + 1;
+            } else if resume_at != usize::MAX
+                && resume_at != pc
+                && is_index_get(program.code(), pc)
+                && assign_already_applied(program.code(), resume_at, frame, &scope_ints_before)
+            {
+                // Blackhole/writeback already stored the increment the
+                // resume opcode would repeat. Land after it, like a
+                // merge point that sits past the committed tail.
+                if let Some(width) = crate::grain::bytecode::code::width(program.code(), resume_at)
+                {
+                    frame.jit_resume_pc_plus_one = resume_at + width + 1;
+                }
             } else if resume_at == usize::MAX {
                 if range_exhausted(vm) {
                     if let Some(header) = next_iter_header(program.code(), pc) {
                         frame.jit_resume_pc_plus_one = header + 1;
                     }
                 }
+            } else if let Some(after) = skip_past_unwound_for(program.code(), resume_at, scope_len)
+            {
+                frame.jit_resume_pc_plus_one = after + 1;
             } else if let Some(resume) = resume_at.checked_add(1) {
                 frame.jit_resume_pc_plus_one = resume;
             }
@@ -2951,6 +3000,56 @@ fn iter_next_store_body(code: &[u8], header: usize) -> Option<usize> {
     Some(u32::from_le_bytes(bytes) as usize)
 }
 
+fn is_index_get(code: &[u8], at: usize) -> bool {
+    matches!(
+        code.get(at).copied(),
+        Some(
+            code::tag::INDEX_GET
+                | code::tag::INDEX_GET_FROM_LOCAL
+                | code::tag::INDEX_GET_FROM_CONST
+        )
+    )
+}
+
+/// True when `at` is an in-place local assign whose slot already holds
+/// the value the compiled run/writeback stored. Re-executing it would
+/// apply the same `+= 1` twice.
+fn assign_already_applied(
+    code: &[u8],
+    at: usize,
+    frame: &GrainFrame<'_, '_>,
+    scope_ints_before: &[Option<i64>],
+) -> bool {
+    let Some(&tag) = code.get(at) else {
+        return false;
+    };
+    if !matches!(
+        tag,
+        code::tag::ASSIGN_LOCAL_FROM
+            | code::tag::ASSIGN_LOCAL_FROM_OP
+            | code::tag::ASSIGN_LOCAL_FROM_CONST
+            | code::tag::ASSIGN_LOCAL_FROM_CONST_OP
+    ) {
+        return false;
+    }
+    // `AssignLocalFrom`: u16 slot at offset 1 (`small!(1)`).
+    let Some(lo) = code.get(at + 1) else {
+        return false;
+    };
+    let Some(hi) = code.get(at + 2) else {
+        return false;
+    };
+    let slot = u16::from_le_bytes([*lo, *hi]) as usize;
+    let Some(before) = scope_ints_before.get(slot).copied().flatten() else {
+        return false;
+    };
+    frame
+        .scope
+        .get_by_index(slot)
+        .as_int()
+        .is_ok_and(|after| after == before + 1)
+}
+
 /// After `UnwindTo` has dropped a `for` slot, do not resume at the
 /// rotated body or the header. Land on the first opcode past that
 /// `UnwindTo` (the outer loop, or the statement after the `for`).
@@ -2959,13 +3058,31 @@ fn iter_next_store_body(code: &[u8], header: usize) -> Option<usize> {
 /// the outer body (before `i` is declared) also sees slot 4 missing
 /// and must not skip the increment / inner `IterInit`.
 fn skip_past_unwound_for(code: &[u8], from: usize, scope_len: usize) -> Option<usize> {
+    after_unwound_for(code, from, scope_len, true)
+}
+
+/// Same landing as [`skip_past_unwound_for`], but `from` may be the
+/// outer body that entered a compiled nested `for`. Only the caller
+/// that just saw that `for`'s iterator pop may use this: a later
+/// consult at the same outer pc still has slot 4 missing and must
+/// not skip the increment.
+fn skip_past_exhausted_for(code: &[u8], from: usize, scope_len: usize) -> Option<usize> {
+    after_unwound_for(code, from, scope_len, false)
+}
+
+fn after_unwound_for(
+    code: &[u8],
+    from: usize,
+    scope_len: usize,
+    require_from_is_loop: bool,
+) -> Option<usize> {
     let header = next_iter_header(code, from)?;
     let slot = iter_next_store_slot(code, header)? as usize;
     if slot < scope_len {
         return None;
     }
     let body = iter_next_store_body(code, header)?;
-    if from != header && from != body {
+    if require_from_is_loop && from != header && from != body {
         return None;
     }
     let after_header = header + crate::grain::bytecode::code::width(code, header)?;
@@ -2978,7 +3095,9 @@ fn skip_past_unwound_for(code: &[u8], from: usize, scope_len: usize) -> Option<u
 
 #[cfg(test)]
 mod unwind_resume_tests {
-    use super::{iter_next_store_body, iter_next_store_slot, skip_past_unwound_for};
+    use super::{
+        iter_next_store_body, iter_next_store_slot, skip_past_exhausted_for, skip_past_unwound_for,
+    };
     use crate::grain::bytecode::code;
 
     fn inner_for_code() -> Vec<u8> {
@@ -2989,6 +3108,17 @@ mod unwind_resume_tests {
         code[6..8].copy_from_slice(&4u16.to_le_bytes());
         code[8] = code::tag::UNWIND_TO;
         code[9..11].copy_from_slice(&4u16.to_le_bytes());
+        code
+    }
+
+    fn nested_for_code() -> Vec<u8> {
+        // Outer body at 0, inner body at 11, inner header at 12, UnwindTo at 19.
+        let mut code = vec![code::tag::UNIT; 32];
+        code[12] = code::tag::ITER_NEXT_STORE;
+        code[13..17].copy_from_slice(&11u32.to_le_bytes());
+        code[17..19].copy_from_slice(&4u16.to_le_bytes());
+        code[19] = code::tag::UNWIND_TO;
+        code[20..22].copy_from_slice(&4u16.to_le_bytes());
         code
     }
 
@@ -3007,5 +3137,16 @@ mod unwind_resume_tests {
         // A pc that is neither this header nor its body.
         assert_eq!(skip_past_unwound_for(&code, 11, 4), None);
         assert_eq!(skip_past_unwound_for(&code, 0, 5), None);
+    }
+
+    #[test]
+    fn skip_past_exhausted_for_from_outer_body_after_inner_pop() {
+        let code = nested_for_code();
+        // The leave reported the outer body (0), but this consult popped
+        // the inner iterator. Land after that for's UnwindTo.
+        assert_eq!(skip_past_unwound_for(&code, 0, 4), None);
+        assert_eq!(skip_past_exhausted_for(&code, 0, 4), Some(22));
+        // Slot still live: not an exhaust.
+        assert_eq!(skip_past_exhausted_for(&code, 0, 5), None);
     }
 }
