@@ -8187,7 +8187,7 @@ impl<'e> Vm<'e> {
                         // The bound is tested here rather than left to the
                         // element read, so what crosses the boundary below is
                         // an index already known to name an element.
-                        if index >= array.len() {
+                        if index >= array_len(array) {
                             break 'fast;
                         }
                         let cell = array_entry!(array, index);

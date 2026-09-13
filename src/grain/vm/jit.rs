@@ -2263,6 +2263,9 @@ pub(super) extern "C" fn scope_rewind(scope: &mut Scope<'_>, size: usize) {
 
 /// The lowering still emits a synthetic `__len` for some containers.
 /// Calling it with a walk-local is a null GETFIELD. Abort the walk.
+///
+/// Do not treat the Ref as `Array` and answer `.len()`: that compiled a
+/// second primes loop that counted one extra prime (669 vs 670).
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn refuse_synthetic_len(_obj: i64) -> i64 {
     majit_metainterp::request_walk_abort();
