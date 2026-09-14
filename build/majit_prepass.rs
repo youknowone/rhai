@@ -212,6 +212,7 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
             },
             register_trait_families: Vec::new(),
             jit_drivers: vec![jit_driver()],
+            helper_graphs: Vec::new(),
         },
     };
     let static_addrs = majit_translate::HostStaticAddrs {

@@ -2594,6 +2594,13 @@ impl GrainJitDriver {
         // can also fail to advance it, which costs one door call that decides
         // nothing. While a trace is open the door runs unconditionally -- the
         // tracer records every instruction, not every loop.
+        //
+        // Consulting `IterNext` on a forward arrival (PyPy `FOR_ITER`) is
+        // the next orthodox close: dest would be the header that stores
+        // the next item. A header-started trace still aborts
+        // (`entry/jump arity mismatch`, or a mid-arm residual that
+        // drops one switch increment). Until that compile closes, the
+        // header stays a skip and dest stays the rotated body.
         let opened = STEP.with(|step| {
             if pc > step.prev_pc.replace(pc) && !step.tracing.get() {
                 step.skipped.set(step.skipped.get() + 1);
@@ -2961,6 +2968,7 @@ impl GrainJitDriver {
             let after_callee = skip_past_unwound_for(program.code(), pc, scope_len).or_else(|| {
                 if exhausted_nested {
                     skip_past_exhausted_for(program.code(), pc, scope_len)
+                        .or_else(|| skip_to_inner_unwind(program.code(), pc))
                 } else {
                     None
                 }
@@ -2999,6 +3007,14 @@ impl GrainJitDriver {
     }
 }
 
+/// True when `pc` is an `ITER_NEXT*` header — PyPy's `FOR_ITER`.
+fn is_iter_header(code: &[u8], pc: usize) -> bool {
+    matches!(
+        code.get(pc).copied(),
+        Some(code::tag::ITER_NEXT | code::tag::ITER_NEXT_INDEXED | code::tag::ITER_NEXT_STORE)
+    )
+}
+
 /// Bytecode address of the next `ITER_NEXT*` after `from`, inclusive.
 ///
 /// A compiled rotated `for` resumes at the body. When the blackhole cannot
@@ -3023,11 +3039,7 @@ fn range_exhausted(vm: &Vm<'_>) -> bool {
 fn next_iter_header(code: &[u8], from: usize) -> Option<usize> {
     let mut at = from;
     for _ in 0..64 {
-        let tag = *code.get(at)?;
-        if matches!(
-            tag,
-            code::tag::ITER_NEXT | code::tag::ITER_NEXT_INDEXED | code::tag::ITER_NEXT_STORE
-        ) {
+        if is_iter_header(code, at) {
             return Some(at);
         }
         at += crate::grain::bytecode::code::width(code, at)?;
@@ -3046,13 +3058,49 @@ fn iter_next_store_slot(code: &[u8], header: usize) -> Option<u16> {
     Some(u16::from_le_bytes([lo, hi]))
 }
 
+/// Body a rotated `ITER_NEXT*` jumps to. Every form stores the target
+/// as `wide!(1)`.
+fn iter_next_body(code: &[u8], header: usize) -> Option<usize> {
+    if !is_iter_header(code, header) {
+        return None;
+    }
+    let bytes: [u8; 4] = code.get(header + 1..header + 5)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes) as usize)
+}
+
 fn iter_next_store_body(code: &[u8], header: usize) -> Option<usize> {
     if *code.get(header)? != code::tag::ITER_NEXT_STORE {
         return None;
     }
-    // `wide!(1)` in the portal: u32 at offset 1.
-    let bytes: [u8; 4] = code.get(header + 1..header + 5)?.try_into().ok()?;
-    Some(u32::from_le_bytes(bytes) as usize)
+    iter_next_body(code, header)
+}
+
+/// True when a backward jump to `target` should call `can_enter_jit`.
+///
+/// A rotated `for` jumps backward onto the body. PyPy's `can_enter_jit`
+/// names `FOR_ITER`, not the first body opcode. Calling it on the body
+/// files dest there; an exhaust JUMP then re-enters without the header
+/// store. The door consults the `ITER_NEXT*` header instead.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn should_enter_jit(code: &[u8], target: usize) -> bool {
+    !is_rotated_for_body(code, target)
+}
+
+/// True when `pc` is the landing of some `ITER_NEXT*` — the rotated
+/// body, not the `FOR_ITER` header.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_rotated_for_body(code: &[u8], pc: usize) -> bool {
+    let mut at = 0;
+    while at < code.len() {
+        if iter_next_body(code, at) == Some(pc) {
+            return true;
+        }
+        match crate::grain::bytecode::code::width(code, at) {
+            Some(w) if w > 0 => at += w,
+            _ => break,
+        }
+    }
+    false
 }
 
 fn is_index_get(code: &[u8], at: usize) -> bool {
@@ -3125,6 +3173,23 @@ fn skip_past_exhausted_for(code: &[u8], from: usize, scope_len: usize) -> Option
     after_unwound_for(code, from, scope_len, false)
 }
 
+/// After a nested `IterNext` exhaust, the iterator is gone but
+/// `UnwindTo` has not run, so the `for` slot is still live and
+/// [`skip_past_unwound_for`] / [`skip_past_exhausted_for`] return
+/// `None`. Landing on the dest body then hops into the compiled
+/// outer loop with a stale item. Land on that `for`'s `UnwindTo`
+/// instead — the slot drops, then the walk reaches the next
+/// `IterNext` (PyPy `FOR_ITER` after `next_instr += jumpby`).
+fn skip_to_inner_unwind(code: &[u8], from: usize) -> Option<usize> {
+    let header = next_iter_header(code, from)?;
+    let after_header = header + crate::grain::bytecode::code::width(code, header)?;
+    if *code.get(after_header)? == code::tag::UNWIND_TO {
+        Some(after_header)
+    } else {
+        None
+    }
+}
+
 fn after_unwound_for(
     code: &[u8],
     from: usize,
@@ -3151,7 +3216,8 @@ fn after_unwound_for(
 #[cfg(test)]
 mod unwind_resume_tests {
     use super::{
-        iter_next_store_body, iter_next_store_slot, skip_past_exhausted_for, skip_past_unwound_for,
+        is_iter_header, is_rotated_for_body, iter_next_store_body, iter_next_store_slot,
+        skip_past_exhausted_for, skip_past_unwound_for, skip_to_inner_unwind,
     };
     use crate::grain::bytecode::code;
 
@@ -3195,6 +3261,18 @@ mod unwind_resume_tests {
     }
 
     #[test]
+    fn iter_header_is_for_iter_not_the_rotated_body() {
+        let code = inner_for_code();
+        assert!(is_iter_header(&code, 1));
+        assert!(!is_iter_header(&code, 0));
+        assert!(!is_iter_header(&code, 8));
+        assert!(is_rotated_for_body(&code, 0));
+        assert!(!is_rotated_for_body(&code, 1));
+        assert!(!super::should_enter_jit(&code, 0));
+        assert!(super::should_enter_jit(&code, 1));
+    }
+
+    #[test]
     fn skip_past_exhausted_for_from_outer_body_after_inner_pop() {
         let code = nested_for_code();
         // The leave reported the outer body (0), but this consult popped
@@ -3203,5 +3281,8 @@ mod unwind_resume_tests {
         assert_eq!(skip_past_exhausted_for(&code, 0, 4), Some(22));
         // Slot still live: not an exhaust.
         assert_eq!(skip_past_exhausted_for(&code, 0, 5), None);
+        // Iterator popped, UnwindTo not yet run: land on UnwindTo.
+        assert_eq!(skip_to_inner_unwind(&code, 0), Some(19));
+        assert_eq!(skip_to_inner_unwind(&code, 11), Some(19));
     }
 }
