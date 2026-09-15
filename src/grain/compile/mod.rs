@@ -14,11 +14,11 @@ use crate::ast::{
 };
 use crate::tokenizer::Token;
 use crate::types::Span;
-use crate::{Dynamic, ImmutableString, Position, AST};
+use crate::{AST, Dynamic, ImmutableString, Position};
 
 use crate::grain::bytecode::{
-    assemble, resolve_switch_targets, AssignOp, BinOpKind, BinOperand, Branch, Chain, Chunk, Op,
-    Positions, Receiver, Root, Step, StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind,
+    AssignOp, BinOpKind, BinOperand, Branch, Chain, Chunk, Op, Positions, Receiver, Root, Step,
+    StepFlags, Switch, SwitchCase, SwitchRange, Tail, UnOpKind, assemble, resolve_switch_targets,
 };
 use crate::grain::compile::poolable::is_poolable;
 use crate::grain::compile::slots::Slots;
@@ -1527,17 +1527,40 @@ impl Lowering {
                 self.slots.declare(var.name.clone());
                 let var_slot = self.slots.depth() as u16 - 1;
 
-                // The loop is rotated: the header advances the iterator and
-                // branches *back* into the body, so the body's last
-                // instruction falls into the header instead of jumping to it.
-                // That is one dispatch off every turn of every `for` loop.
-                // Entering costs the one hop this emits, once.
-                let entry = self.emit_jump();
+                // PyPy `visit_For`: `FOR_ITER` is the backward-jump
+                // target (`JUMP_ABSOLUTE start`). Produce falls into the
+                // body; exhaust jumps to cleanup. Grain `IterNext*`
+                // polarity is the other way (produce jumps, exhaust
+                // falls through), so the header still sits first and
+                // the body jumps back to it. Dest is the store.
+                let header = self.here();
+                let iter_site = self.code.len();
+                match counter_slot {
+                    Some(..) => self.emit_at(
+                        Op::IterNext {
+                            body: u32::MAX,
+                            indexed: true,
+                        },
+                        flow.expr.position(),
+                    ),
+                    None => self.emit_at(
+                        Op::IterNextStore {
+                            body: u32::MAX,
+                            slot: var_slot,
+                        },
+                        flow.expr.position(),
+                    ),
+                }
+                // Exhausted: the header dropped the iterator and fell through.
+                self.emit(Op::UnwindTo(outside));
+                self.emit(Op::Unit);
+                let past = self.emit_jump();
+
                 let body = self.here();
-                // `for (x, i) in seq` pushes a count as well, so the item and
-                // the count come off the operand stack in the order the two
-                // locals were declared. They are popped at the top of the
-                // body, which is where the header's branch arrives.
+                self.patch_to(iter_site, body);
+                // `for (x, i) in seq` pushes a count as well, so the item
+                // and the count come off the operand stack in the order
+                // the two locals were declared.
                 if let Some(slot) = counter_slot {
                     self.emit(Op::StoreShared(var_slot));
                     self.emit(Op::StoreShared(slot));
@@ -1546,47 +1569,19 @@ impl Lowering {
                 if !self.block_discarding(flow.body.statements()) {
                     return false;
                 }
-
-                let header = self.here();
-                self.patch_to(entry, header);
-                match counter_slot {
-                    Some(..) => self.emit_at(
-                        Op::IterNext {
-                            body,
-                            indexed: true,
-                        },
-                        flow.expr.position(),
-                    ),
-                    // One variable, so the item would go onto the operand
-                    // stack and straight off it again on the next instruction
-                    // — every turn of every ordinary `for` loop. Fused, it
-                    // never goes there at all.
-                    None => self.emit_at(
-                        Op::IterNextStore {
-                            body,
-                            slot: var_slot,
-                        },
-                        flow.expr.position(),
-                    ),
-                }
+                self.emit_at(Op::Jump(header), flow.body.position());
                 let (breaks, continues) = self.end_loop();
                 // `continue` advances the iterator, so it arrives at the
                 // header rather than at the body.
                 for site in continues {
                     self.patch_to(site, header);
                 }
-
-                // Exhausted: the header dropped the iterator and fell through.
-                self.iters -= 1;
-                self.emit(Op::UnwindTo(outside));
-                self.slots.unwind_to(outside as usize);
-
-                self.emit(Op::Unit);
-                let past = self.emit_jump();
                 for site in breaks {
                     self.patch_here(site);
                 }
                 self.patch_here(past);
+                self.iters -= 1;
+                self.slots.unwind_to(outside as usize);
                 true
             }
 
@@ -3441,9 +3436,11 @@ fn indexed_slot(chain: &Chain, applied: Option<BinOpKind>) -> Option<u16> {
         Tail::Assign { op: Some(..) } if applied.is_some() => {}
         Tail::Assign { op: Some(..) } => return None,
     }
-    let [Step::Index {
-        operand: 0, flags, ..
-    }] = chain.steps[..]
+    let [
+        Step::Index {
+            operand: 0, flags, ..
+        },
+    ] = chain.steps[..]
     else {
         return None;
     };
@@ -3508,10 +3505,26 @@ mod tests {
         // body to fewer instructions is the point, and only raising one of
         // these numbers should have to be argued for.
         const SOURCES: &[(&str, usize, &str)] = &[
-            ("tight integer loop", 3, "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s"),
-            ("float arithmetic", 6, "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x"),
-            ("script fn calls", 4, "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s"),
-            ("recursive fibonacci", 13, "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)"),
+            (
+                "tight integer loop",
+                3,
+                "let s = 0; let i = 0; while i < 20000 { s += i; i += 1; } s",
+            ),
+            (
+                "float arithmetic",
+                6,
+                "let x = 0.0; let i = 0; while i < 20000 { x += (i.to_float() * 1.5) / 2.5; i += 1; } x",
+            ),
+            (
+                "script fn calls",
+                4,
+                "fn add(a, b) { a + b } let s = 0; for i in 0..5000 { s = add(s, i); } s",
+            ),
+            (
+                "recursive fibonacci",
+                13,
+                "fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)",
+            ),
             (
                 "switch, 4 arms",
                 10,
@@ -3530,8 +3543,16 @@ mod tests {
                  12 => s += 13, 13 => s += 14, 14 => s += 15, _ => s += 16 } \
                  } s",
             ),
-            ("branch heavy", 10, "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s"),
-            ("native function calls", 6, "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a"),
+            (
+                "branch heavy",
+                10,
+                "let s = 0; for i in 0..20000 { if i % 3 == 0 { s += 1; } else if i % 3 == 1 { s += 2; } else { s -= 1; } } s",
+            ),
+            (
+                "native function calls",
+                6,
+                "let a = 42; for i in 0..20000 { a = abs(abs(abs(abs(a)))); } a",
+            ),
             (
                 "native callbacks",
                 3,
@@ -3582,10 +3603,10 @@ mod tests {
             // there to the last back edge naming it. A loop has several: a
             // `continue` is one, and `Lowering::thread_jumps` turns each arm's
             // jump into another, so taking the first cuts the body off at the
-            // first arm. A rotated loop's own back edge belongs to whatever
-            // sits at the bottom testing it — the instruction that advances
-            // the iterator, or the operator that swallowed the test — so this
-            // asks every op that names a target, not only `Jump`.
+            // first arm. A `for` back edge is the jump onto `IterNext`
+            // (`FOR_ITER`); a `while` back edge is the test at the bottom
+            // when that loop is rotated. This asks every op that names a
+            // target, not only `Jump`.
             let edges: Vec<(usize, usize)> = decoded
                 .iter()
                 .filter_map(|(at, op)| {
@@ -3726,6 +3747,32 @@ mod tests {
                 "neither lowering agrees with the walker on {source}",
             );
         }
+    }
+
+    /// `for` dest is `IterNext` (`visit_For` / `FOR_ITER`): the body
+    /// jumps back onto the header that stores the next item.
+    #[test]
+    fn a_for_back_edge_lands_on_iter_next() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("let s = 0; for i in 0..3 { s += i; } s")
+            .expect("must compile");
+        let program = Compiler::new().compile(&ast);
+        program.verify().expect("the for verifies");
+        let ops: Vec<(usize, Op)> =
+            crate::grain::bytecode::code::disassemble(program.code()).collect();
+        let header = ops.iter().find_map(|(at, op)| match op {
+            Op::IterNextStore { .. } | Op::IterNext { .. } => Some(*at),
+            _ => None,
+        });
+        let back = ops.iter().find_map(|(at, op)| match op {
+            Op::Jump(target) if (*target as usize) < *at => Some(*target as usize),
+            _ => None,
+        });
+        assert_eq!(
+            header, back,
+            "the back edge must name IterNext, not the body"
+        );
     }
 
     /// The guard's operator carries the branch that reads it, and the one

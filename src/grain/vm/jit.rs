@@ -51,6 +51,11 @@ thread_local! {
     static PREPARED_CHUNK_ENTRY: Cell<i64> = const { Cell::new(0) };
     static RESIDUAL_NEST: Cell<u32> = const { Cell::new(0) };
     static PLAIN_ADD_CACHE: RefCell<Vec<(usize, u32, bool)>> = const { RefCell::new(Vec::new()) };
+    /// Dest `FOR_ITER` whose compiled loop just bailed. Interpret that
+    /// header until its iterator is gone. `compile.py` `done_compiling`
+    /// / `increment_trace_eagerness`: when the bridge does not compile,
+    /// stay in the interpreter instead of re-entering the same guard.
+    static INTERPRET_DEST: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 /// Compiled code holds `RUNTIME` for the residual it called. Nested
@@ -2482,6 +2487,7 @@ pub(super) fn reset_stats() {
         step.prev_pc.set(usize::MAX);
         step.recording.set(false);
     });
+    INTERPRET_DEST.with(|cell| cell.set(usize::MAX));
     COUNTERS.with(|cell| {
         *cell.borrow_mut() = Counters {
             abort_reasons_before: majit_metainterp::embed::abort_reasons(),
@@ -2595,12 +2601,9 @@ impl GrainJitDriver {
         // nothing. While a trace is open the door runs unconditionally -- the
         // tracer records every instruction, not every loop.
         //
-        // Consulting `IterNext` on a forward arrival (PyPy `FOR_ITER`) is
-        // the next orthodox close: dest would be the header that stores
-        // the next item. A header-started trace still aborts
-        // (`entry/jump arity mismatch`, or a mid-arm residual that
-        // drops one switch increment). Until that compile closes, the
-        // header stays a skip and dest stays the rotated body.
+        // `for` dest is `IterNext` (`visit_For` / `FOR_ITER`): the
+        // body jumps back onto the header that stores the next item.
+        // A forward arrival is still a skip; the back edge is the consult.
         let opened = STEP.with(|step| {
             if pc > step.prev_pc.replace(pc) && !step.tracing.get() {
                 step.skipped.set(step.skipped.get() + 1);
@@ -2609,6 +2612,9 @@ impl GrainJitDriver {
             true
         });
         if !opened {
+            return;
+        }
+        if INTERPRET_DEST.with(Cell::get) == pc {
             return;
         }
         STEP.with(|step| step.recording.set(true));
@@ -2714,14 +2720,16 @@ impl GrainJitDriver {
             scope_ints_before = (0..frame.scope.len())
                 .map(|i| frame.scope.get_by_index(i).as_int().ok())
                 .collect();
-            // Dest of a rotated `for` is the body. JUMP there is only
-            // sound after `IterNext` stored the next item (`FOR_ITER`).
-            // After a nested exhaust the inner slot is still live and
-            // the inner iterator is gone — entering dest now reuses
-            // the stale item (5000: 638 vs 669). Land on that `for`'s
-            // `UnwindTo` so the next consult is the header.
+            // Dest is `IterNext` (`visit_For` / `FOR_ITER`). After a
+            // nested exhaust PyPy's `FOR_ITER` jumps to cleanup
+            // (`next_instr += jumpby`), not back to dest. Land on
+            // that `for`'s `UnwindTo`; the body's `Jump header` is
+            // the `can_enter_jit` that re-enters dest.
             let arrived_via_exhaust =
                 arrived_via_nested_exhaust(program.code(), pc, frame.scope.len(), iters_before);
+            if arrived_via_exhaust.is_some() {
+                INTERPRET_DEST.with(|cell| cell.set(usize::MAX));
+            }
             let mut resume = if arrived_via_exhaust.is_some() {
                 arrived_via_exhaust
             } else {
@@ -2745,6 +2753,15 @@ impl GrainJitDriver {
             exhausted_nested =
                 (iters_after < iters_before && iters_after > 0) || arrived_via_exhaust.is_some();
             let started = !was_tracing && runtime.driver.is_tracing();
+            if resume == Some(usize::MAX)
+                && is_iter_header(program.code(), pc)
+                && live_store_header_count(program.code(), frame.scope.len()) >= 2
+            {
+                // Nested dest: the compiled inner loop failed
+                // `Items.__discriminant` and hopping dest storms. A
+                // single `for` (switch) must still re-enter dest.
+                INTERPRET_DEST.with(|cell| cell.set(pc));
+            }
             if runtime.driver.take_back_edge_finish().is_some() {
                 // Compiled code finished the portal. The walk stashed the
                 // return on the live frame; native `run_frame` takes it.
@@ -2764,6 +2781,9 @@ impl GrainJitDriver {
                         if next == usize::MAX || next != pc {
                             break;
                         }
+                        // `FOR_ITER` exhaust is a forward jump to cleanup,
+                        // not `can_enter_jit`. Hopping dest here would
+                        // re-enter the compiled loop before `UnwindTo`.
                         if exhausted_nested {
                             break;
                         }
@@ -2978,14 +2998,12 @@ impl GrainJitDriver {
             // Prefer the compiled loop we entered (`pc`). A leave that
             // named the outer merge-point green is ignored when that
             // `pc` is the exhausted inner header/body.
-            let after_callee = skip_past_unwound_for(program.code(), pc, scope_len).or_else(|| {
-                if exhausted_nested {
+            let after_callee = skip_past_unwound_for(program.code(), pc, scope_len)
+                .or_else(|| {
                     skip_past_exhausted_for(program.code(), pc, scope_len)
-                        .or_else(|| skip_to_inner_unwind(program.code(), pc))
-                } else {
-                    None
-                }
-            });
+                        .filter(|_| exhausted_nested)
+                })
+                .or_else(|| pending_exhaust_unwind(program.code(), scope_len, vm.iterators_len()));
             if let Some(after) = after_callee {
                 frame.jit_resume_pc_plus_one = after + 1;
             } else if resume_at != usize::MAX
@@ -3090,7 +3108,7 @@ fn iter_next_store_body(code: &[u8], header: usize) -> Option<usize> {
 
 /// True when a backward jump to `target` should call `can_enter_jit`.
 ///
-/// A rotated `for` jumps backward onto the body. PyPy's `can_enter_jit`
+/// A `for` jumps backward onto `IterNext` (`FOR_ITER`). PyPy's `can_enter_jit`
 /// names `FOR_ITER`, not the first body opcode. Calling it on the body
 /// files dest there; an exhaust JUMP then re-enters without the header
 /// store. The door consults the `ITER_NEXT*` header instead.
@@ -3185,15 +3203,40 @@ fn skip_past_exhausted_for(code: &[u8], from: usize, scope_len: usize) -> Option
     after_unwound_for(code, from, scope_len, false)
 }
 
-/// After a nested `IterNext` exhaust, the iterator is gone but
-/// `UnwindTo` has not run, so the `for` slot is still live and
-/// [`skip_past_unwound_for`] / [`skip_past_exhausted_for`] return
-/// `None`. Landing on the dest body then hops into the compiled
-/// outer loop with a stale item. Land on that `for`'s `UnwindTo`
-/// instead — the slot drops, then the walk reaches the next
-/// `IterNext` (PyPy `FOR_ITER` after `next_instr += jumpby`).
-fn skip_to_inner_unwind(code: &[u8], from: usize) -> Option<usize> {
-    let header = next_iter_header(code, from)?;
+/// `FOR_ITER` exhaust jumps to that loop's cleanup (`next_instr += jumpby`).
+///
+/// Each live `IterNextStore` slot is a `for` whose `UnwindTo` has not
+/// run. Iterators nest in the same order. When a header has exhausted,
+/// its slot is still live and its iterator is gone, so there are more
+/// live slots than iterators. The first live header without an iterator
+/// is the exhausted callee; land on its `UnwindTo`.
+fn live_store_headers(code: &[u8], scope_len: usize) -> Vec<usize> {
+    let mut live_headers = Vec::new();
+    let mut at = 0;
+    while at < code.len() {
+        if let Some(slot) = iter_next_store_slot(code, at) {
+            if (slot as usize) < scope_len {
+                live_headers.push(at);
+            }
+        }
+        match crate::grain::bytecode::code::width(code, at) {
+            Some(w) if w > 0 => at += w,
+            _ => break,
+        }
+    }
+    live_headers
+}
+
+fn live_store_header_count(code: &[u8], scope_len: usize) -> usize {
+    live_store_headers(code, scope_len).len()
+}
+
+fn pending_exhaust_unwind(code: &[u8], scope_len: usize, iterators_len: usize) -> Option<usize> {
+    let live_headers = live_store_headers(code, scope_len);
+    if live_headers.len() <= iterators_len {
+        return None;
+    }
+    let header = live_headers[iterators_len];
     let after_header = header + crate::grain::bytecode::code::width(code, header)?;
     if *code.get(after_header)? == code::tag::UNWIND_TO {
         Some(after_header)
@@ -3202,31 +3245,17 @@ fn skip_to_inner_unwind(code: &[u8], from: usize) -> Option<usize> {
     }
 }
 
-/// After a nested `IterNext` exhaust, dest (the rotated body) is
-/// consulted with the inner slot still live and only the outer
-/// iterator remaining. `FOR_ITER` has not stored the next item;
-/// do not enter dest. Resume at that `for`'s `UnwindTo`.
+/// After a nested `IterNext` exhaust, dest (`FOR_ITER`) is consulted
+/// with the inner slot still live and only the outer iterator remaining.
+/// PyPy's `FOR_ITER` then jumps to cleanup (`next_instr += jumpby`);
+/// do not enter dest until `UnwindTo` has dropped the inner slot.
 fn arrived_via_nested_exhaust(
     code: &[u8],
-    pc: usize,
+    _pc: usize,
     scope_len: usize,
     iterators_len: usize,
 ) -> Option<usize> {
-    if iterators_len != 1 || !is_rotated_for_body(code, pc) {
-        return None;
-    }
-    let header = next_iter_header(code, pc)?;
-    // The next header must be a *nested* `for`. Dest's own back edge
-    // also has a live slot and one iterator; treating that as exhaust
-    // skips the only compiled loop of a single `for`.
-    if iter_next_body(code, header) == Some(pc) {
-        return None;
-    }
-    let slot = iter_next_store_slot(code, header)? as usize;
-    if slot >= scope_len {
-        return None;
-    }
-    skip_to_inner_unwind(code, pc)
+    pending_exhaust_unwind(code, scope_len, iterators_len)
 }
 
 fn after_unwound_for(
@@ -3256,7 +3285,8 @@ fn after_unwound_for(
 mod unwind_resume_tests {
     use super::{
         arrived_via_nested_exhaust, is_iter_header, is_rotated_for_body, iter_next_store_body,
-        iter_next_store_slot, skip_past_exhausted_for, skip_past_unwound_for, skip_to_inner_unwind,
+        iter_next_store_slot, pending_exhaust_unwind, skip_past_exhausted_for,
+        skip_past_unwound_for,
     };
     use crate::grain::bytecode::code;
 
@@ -3320,38 +3350,68 @@ mod unwind_resume_tests {
         assert_eq!(skip_past_exhausted_for(&code, 0, 4), Some(22));
         // Slot still live: not an exhaust.
         assert_eq!(skip_past_exhausted_for(&code, 0, 5), None);
-        // Iterator popped, UnwindTo not yet run: land on UnwindTo.
-        assert_eq!(skip_to_inner_unwind(&code, 0), Some(19));
-        assert_eq!(skip_to_inner_unwind(&code, 11), Some(19));
+        // This fixture has only the inner header. One live slot and one
+        // iterator is dest itself, not a pending exhaust. Own exhaust
+        // (no iterator) lands on that header's UnwindTo.
+        assert_eq!(pending_exhaust_unwind(&code, 5, 1), None);
+        assert_eq!(pending_exhaust_unwind(&code, 5, 0), Some(19));
+    }
+
+    #[test]
+    fn pending_exhaust_unwind_skips_dest_headers_own_cleanup() {
+        // Unrotated: dest is the outer IterNext at 0. Its own UnwindTo
+        // is at 7. Inner IterNext at 12, UnwindTo at 19.
+        let mut code = vec![code::tag::UNIT; 40];
+        code[0] = code::tag::ITER_NEXT_STORE;
+        code[1..5].copy_from_slice(&22u32.to_le_bytes());
+        code[5..7].copy_from_slice(&3u16.to_le_bytes());
+        code[7] = code::tag::UNWIND_TO;
+        code[8..10].copy_from_slice(&3u16.to_le_bytes());
+        code[12] = code::tag::ITER_NEXT_STORE;
+        code[13..17].copy_from_slice(&30u32.to_le_bytes());
+        code[17..19].copy_from_slice(&4u16.to_le_bytes());
+        code[19] = code::tag::UNWIND_TO;
+        code[20..22].copy_from_slice(&4u16.to_le_bytes());
+        // Inner exhausted: live slots [3, 4], one iterator. Cleanup is
+        // the inner FOR_ITER's UnwindTo, not dest's.
+        assert_eq!(pending_exhaust_unwind(&code, 5, 1), Some(19));
+        // Inner dest after that same exhaust also lands on its UnwindTo.
+        assert_eq!(arrived_via_nested_exhaust(&code, 12, 5, 1), Some(19));
+        // Both iterators live: dest may be entered.
+        assert_eq!(pending_exhaust_unwind(&code, 5, 2), None);
     }
 
     #[test]
     fn dest_after_nested_exhaust_does_not_enter_until_header_store() {
         let code = nested_dest_code();
-        // Dest body, nested header's slot still live, only the outer
+        // Dest is IterNext. Inner slot still live, only the outer
         // iterator: UnwindTo has not run, so dest must not be entered.
         assert_eq!(arrived_via_nested_exhaust(&code, 0, 5, 1), Some(19));
         // UnwindTo already dropped the inner slot.
         assert_eq!(arrived_via_nested_exhaust(&code, 0, 4, 1), None);
         // Inner iterator still live: not an exhaust.
         assert_eq!(arrived_via_nested_exhaust(&code, 0, 5, 2), None);
-        // A single `for`: the next header is dest's own back edge.
+        // A single `for`: dest's own slot and iterator match.
         let single = inner_for_code();
-        assert_eq!(arrived_via_nested_exhaust(&single, 0, 5, 1), None);
+        assert_eq!(arrived_via_nested_exhaust(&single, 1, 5, 1), None);
+        // That `for` exhausted: land on its UnwindTo.
+        assert_eq!(arrived_via_nested_exhaust(&single, 1, 5, 0), Some(8));
     }
 
     fn nested_dest_code() -> Vec<u8> {
-        // Dest at 0, inner body 11, inner header 12, UnwindTo 19,
-        // outer header 22 jumps back to dest.
+        // Unrotated: outer dest IterNext at 0, UnwindTo at 7,
+        // inner IterNext at 12, UnwindTo at 19.
         let mut code = vec![code::tag::UNIT; 40];
+        code[0] = code::tag::ITER_NEXT_STORE;
+        code[1..5].copy_from_slice(&22u32.to_le_bytes());
+        code[5..7].copy_from_slice(&3u16.to_le_bytes());
+        code[7] = code::tag::UNWIND_TO;
+        code[8..10].copy_from_slice(&3u16.to_le_bytes());
         code[12] = code::tag::ITER_NEXT_STORE;
-        code[13..17].copy_from_slice(&11u32.to_le_bytes());
+        code[13..17].copy_from_slice(&30u32.to_le_bytes());
         code[17..19].copy_from_slice(&4u16.to_le_bytes());
         code[19] = code::tag::UNWIND_TO;
         code[20..22].copy_from_slice(&4u16.to_le_bytes());
-        code[22] = code::tag::ITER_NEXT_STORE;
-        code[23..27].copy_from_slice(&0u32.to_le_bytes());
-        code[27..29].copy_from_slice(&3u16.to_le_bytes());
         code
     }
 }
