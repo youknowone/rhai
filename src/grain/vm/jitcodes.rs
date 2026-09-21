@@ -357,6 +357,22 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::iterator_last_mut as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::iteration_at",
+            super::jit::iteration_at as *const () as usize as i64,
+        ),
+        (
+            "core::num::<Impl>::checked_add",
+            super::jit::i64_checked_add as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::i64_checked_add",
+            super::jit::i64_checked_add as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::dest_iteration_at",
+            super::jit::dest_iteration_at as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::iter_next_store",
             super::jit::iter_next_store as *const () as usize as i64,
         ),

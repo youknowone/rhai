@@ -621,6 +621,14 @@ pub(super) extern "C" fn int_max(a: i64, b: i64) -> i64 {
     if a >= b { a } else { b }
 }
 
+/// `core::num::<Impl>::checked_add` is Opaque in LLBC. Dest's
+/// `count + 1` / `n + 1` after an explicit `INT::MAX` check lands here
+/// as a two-int residual; the overflow arm is already handled.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn i64_checked_add(a: i64, b: i64) -> i64 {
+    a.wrapping_add(b)
+}
+
 /// Advance a `for` loop that stores into a scope slot.
 ///
 /// The produced/exhausted bit is a second one-word residual
@@ -714,12 +722,60 @@ pub(super) extern "C" fn store_shared_from_stack(
 }
 
 /// The innermost running `for` loop, without exposing `slice::last_mut`.
+///
+/// `inline(never)` is the same barrier [`program_switch`] uses: `extern "C"`
+/// is an ABI, not a same-crate inlining fence. An inlined `Vec::last_mut`
+/// leaves an interior `Items*` in the portal; compiled dest then treats
+/// `frame+0x28` (`GrainFrame.jit_finished`) as that pointer.
 #[majit_macros::dont_look_inside_cannot_raise]
+#[inline(never)]
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn iterator_last_mut<'a>(
     vm: &'a mut Vm<'_>,
 ) -> Option<&'a mut super::Iteration> {
     vm.iterators_last_mut()
+}
+
+/// Index the running `for` stack.
+///
+/// Dest peeks with the frame's reminted `iter_depth` (`FOR_ITER` /
+/// `peekvalue`), not [`iterator_last_mut`]. `dont_look_inside` (can
+/// raise) so the residual is not CSE-folded across an inner `pop` the
+/// way a `cannot_raise` last_mut of the same `vm` is.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn iteration_at<'a>(
+    vm: &'a mut Vm<'_>,
+    index: usize,
+) -> Option<&'a mut super::Iteration> {
+    if !live_vm_ptr(vm) {
+        majit_metainterp::request_walk_abort();
+        return None;
+    }
+    vm.iterators.get_mut(index)
+}
+
+/// Dest peek: `vm` then `scope`, same order as [`pin_scope_with_vm`].
+///
+/// Putting `scope` first made dest's first Ref the Scope; the colourer
+/// then dumped a stack ConstPtr as dest's vm and fail 24 was
+/// `Items.__discriminant` on a Scope while the live iterator was still
+/// `IntRange`. Depth is a vable int, not a Ref.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn dest_iteration_at<'a>(
+    vm: &'a mut Vm<'_>,
+    scope: &Scope<'_>,
+    index: usize,
+) -> Option<&'a mut super::Iteration> {
+    let _ = scope.len();
+    if !live_vm_ptr(vm) {
+        majit_metainterp::request_walk_abort();
+        return None;
+    }
+    vm.iterators.get_mut(index)
 }
 
 /// Pop one `switch` subject and classify it without exposing the hasher seed.
