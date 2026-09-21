@@ -214,14 +214,33 @@ impl JitCodeSym for GrainSym {
         self.header_pc
     }
 
-    fn loop_carried_boxes(&self, _vable_boxes: &[(OpRef, Type)]) -> Option<Vec<(OpRef, Type)>> {
-        Some(
-            self.reds
+    fn set_redboxes(&mut self, redboxes: &[(OpRef, Type)]) {
+        // pyjitpl.py `reached_loop_header(greenboxes, redboxes)`: the reds
+        // of the closing JUMP are the merge point's register boxes. A
+        // bridge's registers come from the guard's resume data, so the Vm
+        // is not at the loop's `InputArg(1)` name there.
+        if redboxes.len() == self.reds.len()
+            && redboxes
                 .iter()
-                .copied()
-                .zip(red_kinds().iter().copied())
-                .collect(),
-        )
+                .map(|(_, ty)| *ty)
+                .eq(red_kinds().iter().copied())
+        {
+            self.reds = redboxes.iter().map(|(opref, _)| *opref).collect();
+        }
+    }
+
+    fn loop_carried_boxes(&self, vable_boxes: &[(OpRef, Type)]) -> Option<Vec<(OpRef, Type)>> {
+        // pyjitpl.py:2981-2989 `live_arg_boxes = reds + virtualizable_boxes[:-1]`
+        let mut args: Vec<(OpRef, Type)> = self
+            .reds
+            .iter()
+            .copied()
+            .zip(red_kinds().iter().copied())
+            .collect();
+        if let Some((_, fields)) = vable_boxes.split_last() {
+            args.extend(fields.iter().copied());
+        }
+        Some(args)
     }
 }
 
