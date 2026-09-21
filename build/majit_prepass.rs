@@ -167,7 +167,6 @@ fn jit_driver() -> majit_translate::JitDriverSpec {
 }
 
 fn run_pipeline() -> majit_translate::ProgramPipelineResult {
-    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_, _| None;
     let config = majit_translate::AnalyzeConfig {
         pipeline: majit_translate::PipelineConfig {
             transform: majit_translate::GraphTransformConfig {
@@ -177,6 +176,9 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
                     "reached",
                     "stack_base",
                     "jit_resume_pc_plus_one",
+                    "jit_finished",
+                    "jit_return_kind",
+                    "iter_depth",
                 ]
                 .into_iter()
                 .enumerate()
@@ -214,6 +216,11 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
             jit_drivers: vec![jit_driver()],
             helper_graphs: Vec::new(),
         },
+    };
+    // warmspot.py `vinfos[VTYPEPTR] = VirtualizableInfo(self, VTYPEPTR)`: the
+    // codewriter-side handle is built from the `vable_fields` table above.
+    let vinfo_factory: &majit_translate::VirtualizableInfoFactory<'_> = &|_jd_idx, vtype| {
+        majit_translate::call::codewriter_vinfo_from_config(vtype, &config.pipeline.transform)
     };
     let static_addrs = majit_translate::HostStaticAddrs {
         error_carrier: RHAI_ERROR_CARRIER,

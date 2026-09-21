@@ -175,10 +175,18 @@ pub fn grain_driver_descriptor() -> JitDriverStaticData {
             .zip(kinds.iter().copied())
             .collect()
     };
-    JitDriverStaticData::new(
+    let mut sd = JitDriverStaticData::with_virtualizable(
         pair(&driver.greens, &driver.green_args_spec),
         pair(&driver.reds, &driver.red_args_types),
-    )
+        Some("frame"),
+    );
+    // warmspot.py `jd.virtualizable_info = vinfos[VTYPEPTR]`.
+    // `JitDriver::new` stamps this on MetaInterp before the
+    // descriptor is registered; the registered clone must carry
+    // the same info or `initialize_virtualizable` no-ops and JUMP
+    // drops `iter_depth`.
+    sd.virtualizable_info = GrainJitState::__build_virtualizable_info();
+    sd
 }
 
 /// The shape of the code being traced, captured when tracing starts.
@@ -700,6 +708,24 @@ impl JitState for GrainJitState {
             Type::Int,
             core::mem::offset_of!(GrainFrame<'static, 'static>, jit_resume_pc_plus_one),
         );
+        // Between `jit_resume_pc_plus_one` and `jit_return_kind` in the
+        // frame. Leaving this hole undeclared makes compiled dest treat
+        // `frame+0x28` as an `Items*` (`ldr [x0=0x28]`).
+        info.add_field(
+            "jit_finished",
+            Type::Ref,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, jit_finished),
+        );
+        info.add_field(
+            "jit_return_kind",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, jit_return_kind),
+        );
+        info.add_field(
+            "iter_depth",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, iter_depth),
+        );
         Some(
             info.finalize_arc(majit_ir::descr::make_size_descr(core::mem::size_of::<
                 GrainFrame<'static, 'static>,
@@ -738,7 +764,7 @@ impl JitState for GrainJitState {
     ///
     /// The generated `#[jit_interp]` `setup_bridge_sym` only calls
     /// `seed_bridge_virtualizable_boxes` when the state declares a virt
-    /// array. Grain's vable is five static fields and no arrays, so that
+    /// array. Grain's vable is eight static fields and no arrays, so that
     /// arm is empty and `GETFIELD_VABLE` aborts with no `VirtualizableInfo`
     /// on the bridge ctx. The main loop already ran
     /// `initialize_virtualizable`; a bridge has to re-bind the same

@@ -2380,6 +2380,12 @@ impl Runtime {
         let mut driver = JitDriver::with_descriptor(THRESHOLD, descriptor);
         driver.set_is_recursive(true);
         driver.ensure_descriptor_registered();
+        // `with_descriptor` registers a clone built before
+        // `JitDriver::new` stamped vinfo. Re-bind so
+        // `initialize_virtualizable` sees `jd.virtualizable_info`.
+        if let Some(info) = jit_state::GrainJitState::__build_virtualizable_info() {
+            driver.set_virtualizable_info(info);
+        }
         let (insns, all_liveness) = jitcodes::liveness_parts();
         driver
             .meta_interp_mut()
@@ -2617,6 +2623,11 @@ impl GrainJitDriver {
         if INTERPRET_DEST.with(Cell::get) == pc {
             return;
         }
+        // `FOR_ITER` peeks TOS off the live stack depth. Dest-abort
+        // writeback can leave `iter_depth` at the inner nest (2) after
+        // that iterator is gone; remint from the live stack before the
+        // door publishes vable words or dest peeks.
+        frame.iter_depth = vm.iterators_len();
         STEP.with(|step| step.recording.set(true));
         struct RecordingGuard;
         impl Drop for RecordingGuard {
@@ -2979,6 +2990,7 @@ impl GrainJitDriver {
         if !restored.is_empty() {
             frame.restore_from_jit(&restored, vm);
         }
+        frame.iter_depth = vm.iterators_len();
         if let Some(resume_at) = resume_pc {
             // usize::MAX is LeaveFrame from a blackhole that could not
             // finish (`convert_and_run_from_pyjitpl` had no merge point).

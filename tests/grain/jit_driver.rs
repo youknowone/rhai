@@ -98,8 +98,20 @@ fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
             ("reached", majit_ir::Type::Int),
             ("stack_base", majit_ir::Type::Int),
             ("jit_resume_pc_plus_one", majit_ir::Type::Int),
+            ("jit_finished", majit_ir::Type::Ref),
+            ("jit_return_kind", majit_ir::Type::Int),
+            ("iter_depth", majit_ir::Type::Int),
         ],
     );
+}
+
+#[test]
+fn the_driver_descriptor_carries_the_frame_virtualizable() {
+    let jd = jit_state::grain_driver_descriptor();
+    assert_eq!(jd.virtualizable.as_deref(), Some("frame"));
+    assert_eq!(jd.index_of_virtualizable, 0);
+    let info = jd.virtualizable_info.as_ref().expect("initialize_virtualizable reads jd.virtualizable_info");
+    assert_eq!(info.static_fields.len(), 8);
 }
 
 /// The compatibility gate checks the compiled red schema, not whether some

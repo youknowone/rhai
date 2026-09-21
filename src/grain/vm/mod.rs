@@ -1457,6 +1457,14 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// residual that would refuse every trace.
     #[cfg(feature = "grain-jit")]
     jit_return_kind: usize,
+    /// How many `for` iterators this frame currently owns.
+    ///
+    /// PyPy `FOR_ITER` peeks TOS with `peekvalue` off `valuestackdepth`.
+    /// Dest indexes the live iterator stack with this reminted Int
+    /// instead of residual `Vec::last_mut`, whose result CSE-folds
+    /// across an inner `pop`.
+    #[cfg(feature = "grain-jit")]
+    iter_depth: usize,
 }
 
 #[cfg(feature = "grain-jit")]
@@ -1469,13 +1477,18 @@ impl GrainFrame<'_, '_> {
     /// here instead of through those offsets keeps this module free of
     /// `unsafe`; what pairs the two is the order, which the export asserts the
     /// length of.
-    pub(super) fn jit_vable_words(&self) -> [i64; 5] {
+    pub(super) fn jit_vable_words(&self) -> [i64; 8] {
         [
             &*self.scope as *const Scope<'_> as usize as i64,
             self.base as i64,
             self.reached as i64,
             self.stack_base as i64,
             self.jit_resume_pc_plus_one as i64,
+            self.jit_finished
+                .as_ref()
+                .map_or(0, |result| (&**result as *const VmResult) as usize as i64),
+            self.jit_return_kind as i64,
+            self.iter_depth as i64,
         ]
     }
 
@@ -1497,6 +1510,9 @@ impl GrainFrame<'_, '_> {
         self.base = *base as usize;
         self.reached = *reached as usize;
         self.stack_base = *stack_base as usize;
+        if let Some(&depth) = values.get(9) {
+            self.iter_depth = depth as usize;
+        }
     }
 }
 
@@ -5488,6 +5504,8 @@ impl<'e> Vm<'e> {
             jit_finished: None,
             #[cfg(feature = "grain-jit")]
             jit_return_kind: 0,
+            #[cfg(feature = "grain-jit")]
+            iter_depth: self.iterators.len(),
         };
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
@@ -5510,6 +5528,10 @@ impl<'e> Vm<'e> {
                         // Handled, so the frames it unwound past are not where
                         // this run failed. Left behind, they would head the
                         // next error's trace.
+                        #[cfg(feature = "grain-jit")]
+                        {
+                            frame.iter_depth = self.iterators.len();
+                        }
                         self.clear_faults();
                         self.engine
                             .track_operation(&mut self.global, program.position(resume))?;
@@ -5523,6 +5545,7 @@ impl<'e> Vm<'e> {
         #[cfg(feature = "grain-jit")]
         {
             jit::iterators_truncate(self, iter_base);
+            frame.iter_depth = self.iterators.len();
             jit::handlers_truncate(self, handler_base);
             jit::sizes_truncate(self, size_base);
         }
@@ -8335,10 +8358,22 @@ impl<'e> Vm<'e> {
                 code::tag::ITER_INIT => {
                     let iterable = self.pop()?;
                     self.iter_init(iterable, pos!())?;
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        // `valuestackdepth += 1` after the iterator push.
+                        // `iterators.len()` is `dont_look_inside_cannot_raise`
+                        // and CSE-folds across the pop, leaving dest peeking
+                        // the inner index after that iterator is gone.
+                        frame.iter_depth += 1;
+                    }
                 }
 
                 code::tag::ITER_DROP => {
                     self.iterators.pop();
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        frame.iter_depth -= 1;
+                    }
                 }
 
                 code::tag::ITER_NEXT
@@ -8390,6 +8425,7 @@ impl<'e> Vm<'e> {
                                     return Err(err);
                                 }
                                 if jit::iter_next_produced() == 0 {
+                                    frame.iter_depth -= 1;
                                     pc += width;
                                     continue;
                                 }
@@ -8423,6 +8459,7 @@ impl<'e> Vm<'e> {
                         // iterator behind a bound residual, then let the
                         // dispatch loop advance `pc`.
                         jit::iterators_pop(self);
+                        frame.iter_depth -= 1;
                         range_store_done = true;
                     }
                     if !range_store_done {
@@ -8442,10 +8479,12 @@ impl<'e> Vm<'e> {
                         );
 
                         let Some(item) = iteration.items.next() else {
-                            // Out of the loop by falling through: this edge is
-                            // taken once, and the one back into the body is taken
-                            // every turn.
+                            // `FOR_ITER` exhaust: `next_instr += jumpby`.
                             self.iterators.pop();
+                            #[cfg(feature = "grain-jit")]
+                            {
+                                frame.iter_depth -= 1;
+                            }
                             pc += width;
                             continue;
                         };
@@ -8608,6 +8647,8 @@ mod tests {
             jit_finished: None,
             #[cfg(feature = "grain-jit")]
             jit_return_kind: 0,
+            #[cfg(feature = "grain-jit")]
+            iter_depth: 0,
         };
         let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;
