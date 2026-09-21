@@ -7511,13 +7511,10 @@ impl<'e> Vm<'e> {
                         return Err(malformed(format!("no name {name_index}")));
                     }
                     #[cfg(not(feature = "grain-jit"))]
-                    {
-                        let name = or_raise!(
-                            program_name!(program, name_index),
-                            malformed(format!("no name {name_index}"))
-                        );
-                        let _ = name;
-                    }
+                    let name = or_raise!(
+                        program_name!(program, name_index),
+                        malformed(format!("no name {name_index}"))
+                    );
                     let argc = byte!(3) as usize;
                     // `this` is a register, so this one carries no operand for
                     // the receiver and is two bytes shorter.
