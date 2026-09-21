@@ -1551,7 +1551,7 @@ impl Lowering {
                         flow.expr.position(),
                     ),
                 }
-                // Exhausted: the header dropped the iterator and fell through.
+                // Exhausted: dest jumps here (`FOR_ITER` `jumpby`).
                 self.emit(Op::UnwindTo(outside));
                 self.emit(Op::Unit);
                 let past = self.emit_jump();

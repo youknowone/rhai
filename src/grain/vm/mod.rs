@@ -1934,6 +1934,15 @@ impl<'e> Vm<'e> {
         self.iterators.last()
     }
 
+    /// One `for` on the running stack, for dest peek / dest hop.
+    ///
+    /// Dest is `FOR_ITER` / `peekvalue`: the iterator at
+    /// `iter_depth - 1`, not necessarily [`Self::iterators_last`].
+    #[cfg(feature = "grain-jit")]
+    pub(super) fn iterators_get(&self, index: usize) -> Option<&Iteration> {
+        self.iterators.get(index)
+    }
+
     /// Operand-stack depth, for the JIT residual boundary.
     #[cfg(feature = "grain-jit")]
     pub(super) fn depth(&self) -> usize {
@@ -4463,6 +4472,25 @@ impl<'e> Vm<'e> {
             return Ok(());
         }
 
+        // `2..=n` is the same integer walk as `0..n`, with an exclusive
+        // end one past the last value. Dest then peeks it as `IntRange`
+        // (`FOR_ITER` / `peekvalue`) instead of a boxed iterator whose
+        // exhaust cannot be seen as `next >= end`.
+        if type_id == TypeId::of::<crate::InclusiveRange>() && self.int_inclusive_range_is_natural()
+        {
+            let range = iterable
+                .try_cast::<crate::InclusiveRange>()
+                .expect("the type id says it is an inclusive range");
+            let next = *range.start();
+            let last = *range.end();
+            let end = last.saturating_add(1);
+            self.iterators.push(Iteration {
+                items: Items::IntRange { next, end },
+                count: -1,
+            });
+            return Ok(());
+        }
+
         if type_id == TypeId::of::<crate::packages::iter_basic::StepRange<INT>>()
             && self.int_step_range_is_natural()
         {
@@ -4512,9 +4540,15 @@ impl<'e> Vm<'e> {
     /// stopping at the first that has an entry rather than the first that has a
     /// natural one — a registration shadowing the built-in one is exactly the
     /// case this has to say no to.
-    fn int_range_is_natural(&self) -> bool {
-        let type_id = TypeId::of::<crate::ExclusiveRange>();
+    fn int_inclusive_range_is_natural(&self) -> bool {
+        self.int_range_type_is_natural(TypeId::of::<crate::InclusiveRange>())
+    }
 
+    fn int_range_is_natural(&self) -> bool {
+        self.int_range_type_is_natural(TypeId::of::<crate::ExclusiveRange>())
+    }
+
+    fn int_range_type_is_natural(&self, type_id: TypeId) -> bool {
         let natural = self
             .engine
             .global_modules
@@ -5971,9 +6005,13 @@ impl<'e> Vm<'e> {
             // the residual, so the colourer cannot reuse its register for
             // `scope`. Otherwise a mid-opcode guard snapshots the Scope
             // under the merge-point vm index.
+            // `scope_from_frame` is only a colourer residual: dropping its
+            // returned borrow lets dest SETFIELD `iter_depth` (`FOR_ITER`
+            // / `popvalue`) as a disjoint field while `scope` is live.
             #[cfg(feature = "grain-jit")]
-            let scope = jit::scope_from_frame(frame, self);
-            #[cfg(not(feature = "grain-jit"))]
+            {
+                let _ = jit::scope_from_frame(frame, self);
+            }
             let scope = &mut *frame.scope;
             // What this frame's memo entries are stamped with. Nothing else
             // can carry it, so nothing else can read them back. See
@@ -8380,7 +8418,6 @@ impl<'e> Vm<'e> {
                 | code::tag::ITER_NEXT_INDEXED
                 | code::tag::ITER_NEXT_STORE => {
                     let body = wide!(1) as usize;
-                    let mut range_store_done = false;
                     #[cfg(feature = "grain-jit")]
                     if tag == code::tag::ITER_NEXT_STORE {
                         // Integer `for i in 0..n` walks `Items::IntRange` in
@@ -8393,9 +8430,12 @@ impl<'e> Vm<'e> {
                         if index >= scope_len!() {
                             return Err(malformed(format!("local slot {slot} is out of scope")));
                         }
-                        let _ = jit::pin_scope_with_vm(self, scope);
+                        // `FOR_ITER` / `peekvalue`: `scope` and `vm` stay
+                        // live together at the peek so dest cannot colour
+                        // the Vm loc as `scope`. Depth is a vable int.
+                        let dest_depth = frame.iter_depth;
                         let iteration = or_raise!(
-                            jit::iterator_last_mut(self),
+                            jit::dest_iteration_at(self, scope, dest_depth.wrapping_sub(1)),
                             malformed("no iterator to advance".to_string())
                         );
                         let range_next = match &iteration.items {
@@ -8426,7 +8466,8 @@ impl<'e> Vm<'e> {
                                 }
                                 if jit::iter_next_produced() == 0 {
                                     frame.iter_depth -= 1;
-                                    pc += width;
+                                    // `FOR_ITER` exhaust: `next_instr += jumpby`.
+                                    transfer!(pc + width);
                                     continue;
                                 }
                                 transfer!(body);
@@ -8436,7 +8477,7 @@ impl<'e> Vm<'e> {
                         if let Some(n) = range_next {
                             let next = match &iteration.items {
                                 Items::IntStepRange { step, .. } => n.wrapping_add(*step),
-                                _ => n + 1,
+                                _ => n.wrapping_add(1),
                             };
                             jit::store_int_range_next(&mut iteration.items, next);
                             if iteration.count == INT::MAX {
@@ -8445,7 +8486,7 @@ impl<'e> Vm<'e> {
                                     pos!(),
                                 )));
                             }
-                            jit::store_iteration_count(iteration, iteration.count + 1);
+                            jit::store_iteration_count(iteration, iteration.count.wrapping_add(1));
                             let entry = scope_entry!(index);
                             if let Union::Int(..) = &entry.0 {
                                 jit::dynamic_store_int(entry, n);
@@ -8455,20 +8496,22 @@ impl<'e> Vm<'e> {
                             transfer!(body);
                             continue;
                         }
-                        // Same fall-through as `JUMP_IF` failing: drop the
-                        // iterator behind a bound residual, then let the
-                        // dispatch loop advance `pc`.
+                        // `FOR_ITER` exhaust is `next_instr += jumpby`,
+                        // not fall-through. A compiled dest loop that
+                        // JUMP dest here re-enters dest and peeks the
+                        // outer iterator.
                         jit::iterators_pop(self);
                         frame.iter_depth -= 1;
-                        range_store_done = true;
+                        transfer!(pc + width);
+                        continue;
                     }
-                    if !range_store_done {
+                    {
                         let iteration = or_raise!(
                             {
                                 #[cfg(feature = "grain-jit")]
                                 {
-                                    let _ = jit::pin_scope_with_vm(self, scope);
-                                    jit::iterator_last_mut(self)
+                                    let dest_depth = frame.iter_depth;
+                                    jit::dest_iteration_at(self, scope, dest_depth.wrapping_sub(1))
                                 }
                                 #[cfg(not(feature = "grain-jit"))]
                                 {
@@ -8477,7 +8520,6 @@ impl<'e> Vm<'e> {
                             },
                             malformed("no iterator to advance".to_string())
                         );
-
                         let Some(item) = iteration.items.next() else {
                             // `FOR_ITER` exhaust: `next_instr += jumpby`.
                             self.iterators.pop();
@@ -8485,7 +8527,7 @@ impl<'e> Vm<'e> {
                             {
                                 frame.iter_depth -= 1;
                             }
-                            pc += width;
+                            transfer!(pc + width);
                             continue;
                         };
 
