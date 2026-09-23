@@ -384,6 +384,25 @@ pub(super) extern "C" fn program_constant<'a>(
     program.constant(index)
 }
 
+/// `1` when constant-pool entry `index` is an integer.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn program_constant_is_int(program: &Program<'_>, index: u32) -> i64 {
+    match program.constant(index).map(|value| &value.0) {
+        Some(Union::Int(..)) => 1,
+        _ => 0,
+    }
+}
+
+/// The integer payload of constant-pool entry `index`, or `0` when it is not one.
+#[majit_macros::elidable_cannot_raise]
+pub(super) extern "C" fn program_constant_int(program: &Program<'_>, index: u32) -> i64 {
+    match program.constant(index).map(|value| &value.0) {
+        Some(Union::Int(held, ..)) => *held as i64,
+        _ => 0,
+    }
+}
+
+
 /// Resolve an immutable assignment-operator descriptor without exposing its
 /// backing `Vec` and `slice::get` implementation to the trace.
 #[majit_macros::elidable_cannot_raise]

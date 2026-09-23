@@ -302,7 +302,12 @@ impl GrainJitState {
     ///
     /// Overwrites in place: this runs on every consultation, and both lengths
     /// are fixed by the driver declaration, which does not change.
-    pub(super) fn publish_live(&mut self, env: &[i64], vable_statics: &[i64], operand_words: &[i64]) {
+    pub(super) fn publish_live(
+        &mut self,
+        env: &[i64],
+        vable_statics: &[i64],
+        operand_words: &[i64],
+    ) {
         self.reds.clear();
         self.reds.extend_from_slice(env);
         self.vable_statics.clear();
@@ -804,6 +809,16 @@ impl JitState for GrainJitState {
             "iter_depth",
             Type::Int,
             core::mem::offset_of!(GrainFrame<'static, 'static>, iter_depth),
+        );
+        info.add_field(
+            "local_sync",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, local_sync),
+        );
+        info.add_field(
+            "local_int_mask",
+            Type::Int,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, local_int_mask),
         );
         // The field is a `Box<Vec<i64>>`. The `Vec` behind it has len at 0
         // and the data pointer at 8.

@@ -14,25 +14,25 @@ use crate::eval::calc_data_sizes;
 use crate::eval::{Caches, FnResolutionCacheEntry, GlobalRuntimeState};
 use crate::func::native::FnBuiltin;
 use crate::func::{
-    CallSite, get_builtin_binary_op_fn, get_builtin_op_assignment_fn, is_syntactic_fn_name,
+    get_builtin_binary_op_fn, get_builtin_op_assignment_fn, is_syntactic_fn_name, CallSite,
 };
 use crate::packages::string_basic::print_with_func;
 use crate::tokenizer::Token;
-use crate::types::StringsInterner;
 use crate::types::dynamic::{AccessMode, DynamicWriteLock, Union};
 use crate::types::fn_ptr::FnPtrType;
+use crate::types::StringsInterner;
 // `Variant` is only re-exported from the crate root under `internals`, so it
 // comes from where it is defined.
+use crate::ast::{Expr, FnCallHashes};
 #[cfg(not(feature = "no_index"))]
 use crate::Array;
 #[cfg(not(feature = "no_object"))]
 use crate::Map;
-use crate::ast::{Expr, FnCallHashes};
 #[cfg(not(feature = "no_function"))]
-use crate::{CallFnOptions, types::dynamic::Variant};
+use crate::{types::dynamic::Variant, CallFnOptions};
 use crate::{
-    Dynamic, Engine, EvalAltResult, EvalContext, FUNC_TO_STRING, FnArgsVec, FnPtr, INT,
-    ImmutableString, NativeCallContext, Position, RhaiResultOf, Scope,
+    Dynamic, Engine, EvalAltResult, EvalContext, FnArgsVec, FnPtr, ImmutableString,
+    NativeCallContext, Position, RhaiResultOf, Scope, FUNC_TO_STRING, INT,
 };
 
 mod arith;
@@ -48,8 +48,8 @@ mod value;
 use value::{clone_value, flatten_clone_value, overwrite, release};
 
 use crate::grain::bytecode::{
-    AssignOp, BinOpKind, BinOperand, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail, UnOpKind,
-    code,
+    code, AssignOp, BinOpKind, BinOperand, Chain, Chunk, Receiver, Root, Step, StepFlags, Tail,
+    UnOpKind,
 };
 use crate::grain::program::{Program, SharedModule, SharedProgram};
 
@@ -1432,14 +1432,19 @@ fn stack_take(vm: &mut Vm<'_>, index: usize) -> Dynamic {
 }
 
 /// Slots in [`GrainFrame::operand_words`]. Fixed so every compiled entry
-/// exports the same array length.
+/// exports the same array length. The first [`STACK_WORDS`] are the operand
+/// prefix; the rest are this frame's locals.
 #[cfg(feature = "grain-jit")]
-pub(super) const OPERAND_WORDS: usize = 64;
+pub(super) const STACK_WORDS: usize = 64;
+#[cfg(feature = "grain-jit")]
+pub(super) const LOCAL_BASE: usize = STACK_WORDS;
+#[cfg(feature = "grain-jit")]
+pub(super) const OPERAND_WORDS: usize = LOCAL_BASE + 32;
 
 #[cfg(feature = "grain-jit")]
 fn import_operand_words(frame: &mut GrainFrame, vm: &Vm) {
-    let live = vm.depth.min(OPERAND_WORDS).min(vm.stack.len());
-    for index in 0..OPERAND_WORDS {
+    let live = vm.depth.min(STACK_WORDS).min(vm.stack.len());
+    for index in 0..STACK_WORDS {
         if index >= live {
             let zero = 0i64;
             frame.operand_words[index] = zero;
@@ -1454,7 +1459,7 @@ fn import_operand_words(frame: &mut GrainFrame, vm: &Vm) {
 
 #[cfg(feature = "grain-jit")]
 fn flush_operand_words(frame: &mut GrainFrame, vm: &mut Vm) {
-    let live = vm.depth.min(OPERAND_WORDS);
+    let live = vm.depth.min(STACK_WORDS);
     if vm.stack.len() < live {
         vm.grow_stack(live - vm.stack.len());
     }
@@ -1489,6 +1494,235 @@ fn dynamic_from_word(tag: u8, value: i64) -> Dynamic {
         #[cfg(not(feature = "no_float"))]
         3 => Dynamic::from(crate::FLOAT::from_bits(value as _)),
         _ => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+    }
+}
+
+/// Copy this frame's scalar locals into the array above the operand prefix.
+#[cfg(feature = "grain-jit")]
+fn import_local_words(frame: &mut GrainFrame) {
+    let scope_len = frame.scope.len();
+    let mut index = frame.base;
+    let mut slot = 0usize;
+    while index < scope_len && LOCAL_BASE + slot < OPERAND_WORDS {
+        let at = LOCAL_BASE + slot;
+        let (word, tag) = {
+            let entry = frame.scope.get_mut_by_index(index);
+            let (word, mut tag) = scalar_word(entry);
+            if entry.is_read_only() {
+                tag = 0;
+            }
+            (word, tag)
+        };
+        frame.operand_words[at] = word;
+        frame.operand_tags[at] = tag;
+        let bit = 1i64 << slot;
+        if tag == 1 {
+            frame.local_int_mask |= bit;
+        } else {
+            frame.local_int_mask &= !bit;
+        }
+        index += 1;
+        slot += 1;
+    }
+}
+
+/// Write the array's scalar locals back into the host `Scope`.
+#[cfg(feature = "grain-jit")]
+fn flush_local_words(frame: &mut GrainFrame) {
+    let scope_len = frame.scope.len();
+    let mut index = frame.base;
+    let mut slot = 0usize;
+    while index < scope_len && LOCAL_BASE + slot < OPERAND_WORDS {
+        let at = LOCAL_BASE + slot;
+        let tag = frame.operand_tags[at];
+        if tag != 0 {
+            let word = frame.operand_words[at];
+            let entry = frame.scope.get_mut_by_index(index);
+            if tag == 1 {
+                if let Union::Int(held, ..) = &mut entry.0 {
+                    *held = word as crate::INT;
+                } else {
+                    *entry = dynamic_from_word(tag, word);
+                }
+            } else {
+                *entry = dynamic_from_word(tag, word);
+            }
+        }
+        index += 1;
+        slot += 1;
+    }
+}
+
+/// Integer local assigns and a fused integer compare, indexed on the frame array.
+///
+/// `Ok(Some(pc))` is the next address. `Ok(None)` means the opcode still belongs
+/// to the `Scope` path.
+#[cfg(feature = "grain-jit")]
+#[inline(always)]
+fn frame_local_step(
+    vm: &mut Vm<'_>,
+    program: &Program<'_>,
+    frame: &mut GrainFrame<'_, '_>,
+    pc: usize,
+) -> Result<Option<usize>, Box<EvalAltResult>> {
+    let tag = match jit::code_byte(program, pc) {
+        -1 => return Ok(None),
+        byte => byte as u8,
+    };
+    let width = match jit::code_width(program, pc) {
+        -1 => return Ok(None),
+        width => width as usize,
+    };
+    macro_rules! u16_at {
+        ($offset:expr) => {{
+            let word = jit::code_u16(program, pc + $offset);
+            if word < 0 {
+                None
+            } else {
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                Some(word as u16)
+            }
+        }};
+    }
+    macro_rules! local_int {
+        ($slot:expr) => {{
+            let slot = $slot;
+            if slot >= 32 {
+                None
+            } else {
+                let bit = 1i64 << slot;
+                if frame.local_int_mask & bit == 0 {
+                    None
+                } else {
+                    let at = LOCAL_BASE + slot as usize;
+                    Some(frame.operand_words[at])
+                }
+            }
+        }};
+    }
+    match tag {
+        code::tag::ASSIGN_LOCAL_OP
+        | code::tag::ASSIGN_LOCAL_FROM_OP
+        | code::tag::ASSIGN_LOCAL_FROM_CONST_OP => {
+            let slot = match u16_at!(1) {
+                Some(slot) => slot,
+                None => return Ok(None),
+            };
+            if slot >= 32 {
+                return Ok(None);
+            }
+            let dst_bit = 1i64 << slot;
+            if frame.local_int_mask & dst_bit == 0 {
+                return Ok(None);
+            }
+            let dst = LOCAL_BASE + slot as usize;
+            let (rhs, from_stack) = match tag {
+                code::tag::ASSIGN_LOCAL_OP => return Ok(None),
+                code::tag::ASSIGN_LOCAL_FROM_OP => {
+                    let Some(src) = u16_at!(5) else {
+                        return Ok(None);
+                    };
+                    let Some(word) = local_int!(src) else {
+                        return Ok(None);
+                    };
+                    (word, None)
+                }
+                _ => {
+                    let Some(index) = u16_at!(5) else {
+                        return Ok(None);
+                    };
+                    if jit::program_constant_is_int(program, u32::from(index)) == 0 {
+                        return Ok(None);
+                    }
+                    (jit::program_constant_int(program, u32::from(index)), None)
+                }
+            };
+            let op_at = if tag == code::tag::ASSIGN_LOCAL_OP {
+                5
+            } else {
+                7
+            };
+            let Some(op_index) = u16_at!(op_at) else {
+                return Ok(None);
+            };
+            let Some(op) = jit::program_assign_op(program, u32::from(op_index)) else {
+                return Ok(None);
+            };
+            let Some(kind) = assign_op_kind(op) else {
+                return Ok(None);
+            };
+            let cur = frame.operand_words[dst] as crate::INT;
+            let Some(value) = arith::int_assign(kind, cur, rhs as crate::INT)? else {
+                return Ok(None);
+            };
+            frame.operand_words[dst] = value as i64;
+            if let Some(top) = from_stack {
+                vm.depth = top;
+                frame.operand_tags[top] = 0;
+                let cleared = 0i64;
+                frame.operand_words[top] = cleared;
+                if top < vm.stack.len() {
+                    *operand_mut(&mut vm.stack[top]) = unit_value();
+                }
+            }
+            Ok(Some(pc + width))
+        }
+        _ => {
+            let form = jit::code_form(tag) as u16;
+            if form & code::form::NAMES_FROM == 0 || form & code::form::TYPED == 0 {
+                return Ok(None);
+            }
+            if jit::fast_operators(vm) == 0 {
+                return Ok(None);
+            }
+            let Some(lhs_slot) = u16_at!(6) else {
+                return Ok(None);
+            };
+            let Some(lhs) = local_int!(lhs_slot) else {
+                return Ok(None);
+            };
+            let Some(rhs_word) = u16_at!(8) else {
+                return Ok(None);
+            };
+            let rhs = if form & code::form::NAMED_IS_LOCAL != 0 {
+                let Some(word) = local_int!(rhs_word) else {
+                    return Ok(None);
+                };
+                word
+            } else {
+                if jit::program_constant_is_int(program, u32::from(rhs_word)) == 0 {
+                    return Ok(None);
+                }
+                jit::program_constant_int(program, u32::from(rhs_word))
+            };
+            let kind_byte = match jit::code_byte(program, pc + 3) {
+                -1 => return Ok(None),
+                byte => byte as u8,
+            };
+            let Some(kind) = BinOpKind::from_byte(kind_byte) else {
+                return Ok(None);
+            };
+            let Some(value) = arith::int_binary(kind, lhs as crate::INT, rhs as crate::INT)? else {
+                return Ok(None);
+            };
+            if form & code::form::BRANCHES == 0 {
+                return Ok(None);
+            }
+            let holds = match value {
+                arith::FastValue::Bool(held) => held,
+                _ => return Ok(None),
+            };
+            let taken_when = form & code::form::TAKEN_WHEN != 0;
+            if holds == taken_when {
+                let dest = jit::code_u32(program, pc + width - 4);
+                if dest < 0 {
+                    return Ok(None);
+                }
+                Ok(Some(dest as usize))
+            } else {
+                Ok(Some(pc + width))
+            }
+        }
     }
 }
 
@@ -1533,6 +1767,15 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// across an inner `pop`.
     #[cfg(feature = "grain-jit")]
     iter_depth: usize,
+    /// `1` when the host `Scope` is ahead of the local words and the next
+    /// opcode must copy it in. A frame field so the trace reads a red, not
+    /// a loop-carried local that the merge point does not seed.
+    #[cfg(feature = "grain-jit")]
+    local_sync: i64,
+    /// Bit `slot` is set when that frame-local is an integer in the array.
+    /// A vable int, so the hot path does not index the side `Vec<u8>`.
+    #[cfg(feature = "grain-jit")]
+    local_int_mask: i64,
     /// Scalar operand prefix. Item `i` is the payload at `Vm.depth == i`.
     /// The `Box` is the container the virtualizable array descriptor loads:
     /// length at 0, data pointer at 8.
@@ -1541,6 +1784,11 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// Tag beside [`Self::operand_words`]: 1 int, 2 bool, 3 float, 4 unit, 0 heap.
     #[cfg(feature = "grain-jit")]
     pub(super) operand_tags: Vec<u8>,
+    /// Set when a compiled guard just handed control back. The next merge
+    /// point writes the loop values; if the bottom test is already false,
+    /// the body must not run again.
+    #[cfg(feature = "grain-jit")]
+    resume_check: u8,
 }
 
 #[cfg(feature = "grain-jit")]
@@ -1553,7 +1801,7 @@ impl GrainFrame<'_, '_> {
     /// here instead of through those offsets keeps this module free of
     /// `unsafe`; what pairs the two is the order, which the export asserts the
     /// length of.
-    pub(super) fn jit_vable_words(&self) -> [i64; 8] {
+    pub(super) fn jit_vable_words(&self) -> [i64; 10] {
         [
             &*self.scope as *const Scope<'_> as usize as i64,
             self.base as i64,
@@ -1565,6 +1813,8 @@ impl GrainFrame<'_, '_> {
                 .map_or(0, |result| (&**result as *const VmResult) as usize as i64),
             self.jit_return_kind as i64,
             self.iter_depth as i64,
+            self.local_sync,
+            self.local_int_mask,
         ]
     }
 
@@ -1592,6 +1842,12 @@ impl GrainFrame<'_, '_> {
         self.stack_base = *stack_base as usize;
         if let Some(&depth) = values.get(9) {
             self.iter_depth = depth as usize;
+        }
+        if let Some(&sync) = values.get(10) {
+            self.local_sync = sync;
+        }
+        if let Some(&mask) = values.get(11) {
+            self.local_int_mask = mask;
         }
     }
 }
@@ -2040,7 +2296,7 @@ macro_rules! pop_unit_word {
 macro_rules! push_scalar {
     ($me:tt, $frame:ident, $tag:expr, $value:expr) => {{
         let depth = $me.depth;
-        if depth < OPERAND_WORDS {
+        if depth < STACK_WORDS {
             $frame.operand_words[depth] = $value;
             $frame.operand_tags[depth] = $tag;
             if depth == $me.stack.len() {
@@ -2089,7 +2345,7 @@ macro_rules! push_word {
             }
             _ => {
                 let depth = $me.depth;
-                if depth < OPERAND_WORDS {
+                if depth < STACK_WORDS {
                     $frame.operand_tags[depth] = 0;
                 }
                 $me.push(value)
@@ -2105,7 +2361,7 @@ macro_rules! pop_word {
             malformed("operand stack underflow".to_string())
         );
         $me.depth = depth;
-        if depth < OPERAND_WORDS && $frame.operand_tags[depth] != 0 {
+        if depth < STACK_WORDS && $frame.operand_tags[depth] != 0 {
             let tag = $frame.operand_tags[depth];
             let value = $frame.operand_words[depth];
             $frame.operand_tags[depth] = 0;
@@ -2126,7 +2382,7 @@ macro_rules! pop_unit_word {
         match $me.depth.checked_sub(1) {
             Some(depth) => {
                 $me.depth = depth;
-                if depth < OPERAND_WORDS && $frame.operand_tags[depth] != 0 {
+                if depth < STACK_WORDS && $frame.operand_tags[depth] != 0 {
                     let tag = $frame.operand_tags[depth];
                     let value = $frame.operand_words[depth];
                     $frame.operand_tags[depth] = 0;
@@ -5753,9 +6009,15 @@ impl<'e> Vm<'e> {
             #[cfg(feature = "grain-jit")]
             iter_depth: self.iterators.len(),
             #[cfg(feature = "grain-jit")]
+            local_sync: 1,
+            #[cfg(feature = "grain-jit")]
+            local_int_mask: 0,
+            #[cfg(feature = "grain-jit")]
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
+            #[cfg(feature = "grain-jit")]
+            resume_check: 0,
         };
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
@@ -5777,24 +6039,24 @@ impl<'e> Vm<'e> {
                     #[cfg(feature = "grain-jit")]
                     flush_operand_words(&mut frame, self);
                     match self.catch(program, err, handler_base, frame.scope) {
-                    // Metered like a backward jump, and for the same reason:
-                    // a catch block that sits before the throw is a cycle the
-                    // dispatch loop never sees as one, because control got
-                    // there through the error path rather than through a jump.
-                    Ok(resume) => {
-                        // Handled, so the frames it unwound past are not where
-                        // this run failed. Left behind, they would head the
-                        // next error's trace.
-                        #[cfg(feature = "grain-jit")]
-                        {
-                            frame.iter_depth = self.iterators.len();
+                        // Metered like a backward jump, and for the same reason:
+                        // a catch block that sits before the throw is a cycle the
+                        // dispatch loop never sees as one, because control got
+                        // there through the error path rather than through a jump.
+                        Ok(resume) => {
+                            // Handled, so the frames it unwound past are not where
+                            // this run failed. Left behind, they would head the
+                            // next error's trace.
+                            #[cfg(feature = "grain-jit")]
+                            {
+                                frame.iter_depth = self.iterators.len();
+                            }
+                            self.clear_faults();
+                            self.engine
+                                .track_operation(&mut self.global, program.position(resume))?;
+                            start = resume;
                         }
-                        self.clear_faults();
-                        self.engine
-                            .track_operation(&mut self.global, program.position(resume))?;
-                        start = resume;
-                    }
-                    Err(err) => break Err(err),
+                        Err(err) => break Err(err),
                     }
                 }
             }
@@ -6208,8 +6470,10 @@ impl<'e> Vm<'e> {
                 if frame.jit_return_kind != 0 {
                     let mut value = unit_value();
                     if let Some(err) = jit::take_finished_result(frame, &mut value) {
+                        flush_local_words(frame);
                         return Err(err);
                     }
+                    flush_local_words(frame);
                     return Ok(value);
                 }
                 if frame.jit_resume_pc_plus_one != 0 {
@@ -6225,6 +6489,38 @@ impl<'e> Vm<'e> {
             // replaying the function entry.
             let base = frame.base;
             let stack_base = frame.stack_base;
+
+            #[cfg(feature = "grain-jit")]
+            {
+                if frame.local_sync != 0 {
+                    import_local_words(frame);
+                    frame.local_sync = 0;
+                }
+                match frame_local_step(self, program, frame, pc) {
+                    Ok(Some(target)) => {
+                        if target <= pc {
+                            jit::track_operation_error(self, program, pc);
+                            jit_driver.can_enter_jit(
+                                target,
+                                program.jit_identity(),
+                                program,
+                                frame,
+                                self,
+                            );
+                        }
+                        pc = target;
+                        continue;
+                    }
+                    Ok(None) => {
+                        flush_local_words(frame);
+                        frame.local_sync = 1;
+                    }
+                    Err(err) => {
+                        flush_local_words(frame);
+                        return Err(err);
+                    }
+                }
+            }
 
             // Borrow the locals only after the marker has seen the whole
             // frame; the borrow ends at the iteration boundary before the next
@@ -6368,7 +6664,7 @@ impl<'e> Vm<'e> {
                         let new_depth = $depth;
                         let old_depth = self.depth;
                         if new_depth < old_depth {
-                            let end = old_depth.min(OPERAND_WORDS);
+                            let end = old_depth.min(STACK_WORDS);
                             let start = new_depth.min(end);
                             let mut slot = start;
                             while slot < end {
@@ -6730,7 +7026,9 @@ impl<'e> Vm<'e> {
 
             // The index a naming tag carries.
             macro_rules! indexed_value {
-                ($offset:expr) => {{ operand_value!($offset, index_is_local!()) }};
+                ($offset:expr) => {{
+                    operand_value!($offset, index_is_local!())
+                }};
             }
 
             // A named operand as a FastValue, through the bound scalar residual.
@@ -6760,7 +7058,9 @@ impl<'e> Vm<'e> {
             // written after the index and before the operator, so it sits at
             // seven however the form spells the other two.
             macro_rules! assigned_value {
-                () => {{ operand_value!(7, false) }};
+                () => {{
+                    operand_value!(7, false)
+                }};
             }
 
             // Every transfer of control goes through this, and a backward one
@@ -7174,11 +7474,15 @@ impl<'e> Vm<'e> {
                     // Rhai's read is `this_ptr.cloned()` and does not flatten
                     // (`eval/expr.rs:272`); its consumers do. Which tag this is
                     // is which consumer asked.
-                    push_word!(self, frame, if tag == code::tag::LOAD_THIS {
-                        flatten_clone_value(value)
-                    } else {
-                        clone_value(value)
-                    });
+                    push_word!(
+                        self,
+                        frame,
+                        if tag == code::tag::LOAD_THIS {
+                            flatten_clone_value(value)
+                        } else {
+                            clone_value(value)
+                        }
+                    );
                 }
 
                 code::tag::REQUIRE_THIS => {
@@ -7647,8 +7951,8 @@ impl<'e> Vm<'e> {
                         // verified program's byte can never make it do.
                         if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
                             #[cfg(feature = "grain-jit")]
-                            if under < OPERAND_WORDS
-                                && top - 1 < OPERAND_WORDS
+                            if under < STACK_WORDS
+                                && top - 1 < STACK_WORDS
                                 && frame.operand_tags[under] == 1
                                 && frame.operand_tags[top - 1] == 1
                             {
@@ -7754,7 +8058,7 @@ impl<'e> Vm<'e> {
                             self.grow_stack(self.depth - self.stack.len());
                         }
                         let mut slot = first;
-                        let top_slot = self.depth.min(OPERAND_WORDS);
+                        let top_slot = self.depth.min(STACK_WORDS);
                         while slot < top_slot {
                             let tag = frame.operand_tags[slot];
                             if tag != 0 {
@@ -8277,7 +8581,9 @@ impl<'e> Vm<'e> {
                             .as_ref()
                             .and_then(|owned| callback::pointer(owned, index, name))
                             .unwrap_or(FnPtrType::Normal);
-                        push_word!(self, frame, 
+                        push_word!(
+                            self,
+                            frame,
                             FnPtr {
                                 name: name.into(),
                                 curry: Default::default(),
@@ -8795,9 +9101,17 @@ impl<'e> Vm<'e> {
                             }
                             Items::IntStepRange { next, end, step } => {
                                 if *step > 0 {
-                                    if *next >= *end { None } else { Some(*next) }
+                                    if *next >= *end {
+                                        None
+                                    } else {
+                                        Some(*next)
+                                    }
                                 } else if *step < 0 {
-                                    if *next <= *end { None } else { Some(*next) }
+                                    if *next <= *end {
+                                        None
+                                    } else {
+                                        Some(*next)
+                                    }
                                 } else {
                                     None
                                 }
@@ -9002,10 +9316,10 @@ impl<'e> Vm<'e> {
 #[cfg(not(feature = "no_function"))]
 mod tests {
     use super::*;
-    use crate::grain::bytecode::{Chain, Chunk, Op, Positions, Step, Strings, Tail, assemble};
+    use crate::grain::bytecode::{assemble, Chain, Chunk, Op, Positions, Step, Strings, Tail};
     use crate::grain::format::Abi;
     use crate::grain::program::{Function, Parts};
-    use crate::{CallFnOptions, Engine, INT, Scope};
+    use crate::{CallFnOptions, Engine, Scope, INT};
 
     /// The meta-tracer's `getarrayitem_gc_r` works on an array of references,
     /// just as PyPy's value stack does.  The boxes are allocated only when the
@@ -9045,9 +9359,15 @@ mod tests {
             #[cfg(feature = "grain-jit")]
             iter_depth: 0,
             #[cfg(feature = "grain-jit")]
+            local_sync: 1,
+            #[cfg(feature = "grain-jit")]
+            local_int_mask: 0,
+            #[cfg(feature = "grain-jit")]
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
+            #[cfg(feature = "grain-jit")]
+            resume_check: 0,
         };
         let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;

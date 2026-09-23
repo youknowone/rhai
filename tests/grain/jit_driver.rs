@@ -12,7 +12,7 @@
 //! default types every red Int.
 
 use majit_metainterp::{JitDriver, JitState};
-use rhai::grain::{Compiler, Vm, jit_state, jitcodes};
+use rhai::grain::{jit_state, jitcodes, Compiler, Vm};
 use rhai::{Engine, Scope};
 
 /// The unchanged majit/RPython warm-loop threshold used by the Grain runtime.
@@ -101,6 +101,8 @@ fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
             ("jit_finished", majit_ir::Type::Ref),
             ("jit_return_kind", majit_ir::Type::Int),
             ("iter_depth", majit_ir::Type::Int),
+            ("local_sync", majit_ir::Type::Int),
+            ("local_int_mask", majit_ir::Type::Int),
         ],
     );
 }
@@ -111,7 +113,7 @@ fn the_driver_descriptor_carries_the_frame_virtualizable() {
     assert_eq!(jd.virtualizable.as_deref(), Some("frame"));
     assert_eq!(jd.index_of_virtualizable, 0);
     let info = jd.virtualizable_info.as_ref().expect("initialize_virtualizable reads jd.virtualizable_info");
-    assert_eq!(info.static_fields.len(), 8);
+    assert_eq!(info.static_fields.len(), 10);
 }
 
 /// The compatibility gate checks the compiled red schema, not whether some

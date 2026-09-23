@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use majit_metainterp::{EmbeddedJitCodeTable, init_global_build_descr_pool};
+use majit_metainterp::{init_global_build_descr_pool, EmbeddedJitCodeTable};
 use majit_translate::jitcode::{BhDescr, JitCode};
 
 /// Concatenated jitcode bodies, in allocation order.
@@ -101,6 +101,14 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
         (
             "rhai::grain::vm::jit::program_constant",
             super::jit::program_constant as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_constant_is_int",
+            super::jit::program_constant_is_int as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::program_constant_int",
+            super::jit::program_constant_int as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::program_assign_op",
