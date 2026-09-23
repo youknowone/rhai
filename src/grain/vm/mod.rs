@@ -1938,21 +1938,6 @@ impl<'e> Vm<'e> {
         self.iterators.last_mut()
     }
 
-    /// Shared twin of [`Self::iterators_last_mut`].
-    #[cfg(feature = "grain-jit")]
-    pub(super) fn iterators_last(&self) -> Option<&Iteration> {
-        self.iterators.last()
-    }
-
-    /// One `for` on the running stack, for dest peek / dest hop.
-    ///
-    /// Dest is `FOR_ITER` / `peekvalue`: the iterator at
-    /// `iter_depth - 1`, not necessarily [`Self::iterators_last`].
-    #[cfg(feature = "grain-jit")]
-    pub(super) fn iterators_get(&self, index: usize) -> Option<&Iteration> {
-        self.iterators.get(index)
-    }
-
     /// Operand-stack depth, for the JIT residual boundary.
     #[cfg(feature = "grain-jit")]
     pub(super) fn depth(&self) -> usize {
