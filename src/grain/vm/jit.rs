@@ -2158,6 +2158,33 @@ pub(super) extern "C" fn walk_is_recording() -> bool {
     STEP.with(|step| step.recording.get()) || majit_metainterp::is_bridge_walking()
 }
 
+/// Move a non-scalar call result from the stack top down to `floor`.
+///
+/// `stack_take` of that cell is a `BC_ABORT` at pos 57, so a bridge that
+/// pops the result and pushes it again never attaches. Scalars stay on the
+/// fast path (`0`). `1` means this call did the move.
+#[majit_macros::dont_look_inside_cannot_raise]
+#[allow(improper_ctypes_definitions)]
+pub(super) extern "C" fn reseat_top_to_floor(vm: &mut Vm<'_>, floor: usize) -> i64 {
+    if !live_vm_ptr(vm) || !live_count(floor) {
+        return 0;
+    }
+    let Some(top) = vm.depth.checked_sub(1) else {
+        return 0;
+    };
+    if top < floor || top >= vm.stack.len() {
+        return 0;
+    }
+    if dynamic_as_fast(super::operand_ref(&vm.stack[top])) != 0 {
+        return 0;
+    }
+    let value = core::mem::take(super::operand_mut(&mut vm.stack[top]));
+    vm.truncate_stack(floor);
+    vm.push(value);
+    majit_metainterp::note_residual_committed();
+    1
+}
+
 /// Move one value out of a pointer-stable operand slot.
 ///
 /// Keep `mem::take::<Dynamic>` behind this named ABI just as stores are kept

@@ -496,6 +496,10 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::walk_is_recording as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::jit::reseat_top_to_floor",
+            super::jit::reseat_top_to_floor as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::operand_stack_store",
             super::jit::operand_stack_store as *const () as usize as i64,
         ),

@@ -7606,6 +7606,11 @@ impl<'e> Vm<'e> {
                             ) {
                                 return Err(err);
                             }
+                            self.depth = jit::vm_depth(self) as usize;
+                            if !branching && jit::reseat_top_to_floor(self, first) != 0 {
+                                pc += width;
+                                continue;
+                            }
                             take_residual_push!()
                         }
                         #[cfg(not(feature = "grain-jit"))]
