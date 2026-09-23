@@ -476,7 +476,9 @@ fn recursive_fibonacci_returns_from_the_portal() {
     }
 
     jit_state::reset_stats();
-    let engine = Engine::new();
+    let mut engine = Engine::new();
+    // Debug builds cap calls at 8 levels; fib descends one level per `n`.
+    engine.set_max_call_levels(64);
     let ast = engine.compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(20)").expect("fib parses");
     let program = Compiler::new().compile(&ast);
     let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("fib runs");
@@ -495,7 +497,9 @@ fn recursive_fibonacci_bridge_does_not_abort_on_scalar_push() {
     }
 
     jit_state::reset_stats();
-    let engine = Engine::new();
+    let mut engine = Engine::new();
+    // Debug builds cap calls at 8 levels; fib descends one level per `n`.
+    engine.set_max_call_levels(64);
     let ast = engine.compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)").expect("fib parses");
     let program = Compiler::new().compile(&ast);
     let result = Vm::new(&engine).eval_with_scope(&mut Scope::new(), &program).expect("fib runs");
