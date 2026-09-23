@@ -467,6 +467,42 @@ fn primes_sieve_5000_agrees_with_the_walker() {
     assert_eq!(format!("{walker:?}"), "669", "π(5000) is 669");
 }
 
+/// Larger than the inner-exhaust bridge's first failure. `p = 12197` was
+/// counted twice: the consult stored `total += 1` and `run_frame` ran it again.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn primes_sieve_100000_agrees_with_the_walker() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const SOURCE: &str = "const SIZE = 100000; \
+         let prime_mask = []; prime_mask.pad(SIZE + 1, true); \
+         prime_mask[0] = false; prime_mask[1] = false; \
+         let total_primes_found = 0; \
+         for p in 2..=SIZE { \
+             if !prime_mask[p] { continue; } \
+             total_primes_found += 1; \
+             for i in range(2 * p, SIZE + 1, p) { prime_mask[i] = false; } \
+         } total_primes_found";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the sieve parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine
+        .eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast)
+        .expect("the walker runs");
+    let vm = Vm::new(&engine)
+        .eval_with_scope(&mut Scope::new(), &program)
+        .expect("the vm runs the sieve");
+    let stats = jit_state::stats();
+    assert_eq!(
+        format!("{walker:?}"),
+        format!("{vm:?}"),
+        "sieve walker and vm must agree: {stats:?}"
+    );
+    assert_eq!(format!("{walker:?}"), "9592", "π(100000) is 9592");
+}
+
 /// A recursive script function that returns from the portal must not panic.
 #[test]
 #[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
@@ -546,6 +582,37 @@ fn recursive_fibonacci_returns_before_the_deadline() {
         stats.traces_aborted < 50,
         "fib(28) must not retrace without bound: {stats:?}"
     );
+}
+
+/// `a.map` / `a.filter` leave the VM per element. A compiled back edge that
+/// returned the same pc used to skip that opcode, so `run_frame` consulted
+/// it again and the bench never printed the row.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn native_callbacks_return_before_the_deadline() {
+    if no_tables() {
+        return;
+    }
+
+    const SOURCE: &str = "let a = []; for i in 0..500 { a.push(i); } \
+                          let b = a.map(|x| x * 2); b.filter(|x| x % 3 == 0).len";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("callbacks parse");
+    let program = Compiler::new().compile(&ast).into_shared();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if done_rx.recv_timeout(std::time::Duration::from_secs(30)).is_err() {
+            eprintln!("native callbacks did not return within 30s");
+            std::process::exit(1);
+        }
+    });
+    jit_state::reset_stats();
+    let result = Vm::new(&engine)
+        .eval_with_callbacks(&mut Scope::new(), &program)
+        .expect("callbacks run");
+    let stats = jit_state::stats();
+    let _ = done_tx.send(());
+    assert_eq!(format!("{result:?}"), "167", "stats={stats:?}");
 }
 
 /// `for i in 0..201 { for j in 0..2000 { s += 1 } }` reuses the inner

@@ -3158,7 +3158,19 @@ impl GrainJitDriver {
                 if let Some(body) =
                     produced_for_iter_body(program.code(), frame, &scope_ints_before)
                 {
-                    frame.jit_resume_pc_plus_one = body + 1;
+                    // The produce already stored the new item, and the
+                    // consult may have applied this body's `+=` as well.
+                    // Landing on that assign counts the item twice. Step
+                    // over it only when its slot changed; a later opcode
+                    // is the inner loop and still has to run.
+                    let land = skip_applied_assign(
+                        program.code(),
+                        body,
+                        frame,
+                        &scope_ints_before,
+                    )
+                    .unwrap_or(body);
+                    frame.jit_resume_pc_plus_one = land + 1;
                 } else {
                     frame.jit_resume_pc_plus_one = after + 1;
                 }
@@ -3201,9 +3213,20 @@ impl GrainJitDriver {
                     .flatten();
                 if let Some(after) = skip {
                     frame.jit_resume_pc_plus_one = after + 1;
+                } else if resume_at == pc && !is_iter_header(program.code(), pc) {
+                    // Same pc, and this opcode is not a loop header. Hopping
+                    // skips it and the door is consulted again with no progress.
                 } else if let Some(resume) = resume_at.checked_add(1) {
                     frame.jit_resume_pc_plus_one = resume;
                 }
+            }
+        } else if !is_iter_header(program.code(), pc) {
+            // The consult already stored this assign and left no resume pc,
+            // so `run_frame` would execute it again. A loop header must
+            // still run; its later assign belongs to the next turn.
+            if let Some(land) = skip_applied_assign(program.code(), pc, frame, &scope_ints_before)
+            {
+                frame.jit_resume_pc_plus_one = land + 1;
             }
         }
 
@@ -3434,6 +3457,55 @@ fn is_index_get(code: &[u8], at: usize) -> bool {
     )
 }
 
+/// `after - before` for an in-place local assign, when both sides are ints.
+fn assign_int_delta(
+    code: &[u8],
+    at: usize,
+    frame: &GrainFrame<'_, '_>,
+    scope_ints_before: &[Option<i64>],
+) -> Option<i64> {
+    let tag = *code.get(at)?;
+    if !matches!(
+        tag,
+        code::tag::ASSIGN_LOCAL_FROM
+            | code::tag::ASSIGN_LOCAL_FROM_OP
+            | code::tag::ASSIGN_LOCAL_FROM_CONST
+            | code::tag::ASSIGN_LOCAL_FROM_CONST_OP
+    ) {
+        return None;
+    }
+    // `AssignLocalFrom`: u16 slot at offset 1 (`small!(1)`).
+    let lo = *code.get(at + 1)?;
+    let hi = *code.get(at + 2)?;
+    let slot = u16::from_le_bytes([lo, hi]) as usize;
+    let before = scope_ints_before.get(slot).copied().flatten()?;
+    let after = frame.scope.get_by_index(slot).as_int().ok()?;
+    Some(after - before)
+}
+
+/// Pc just past the first local assign at or after `from` whose slot
+/// the consult already wrote.
+fn skip_applied_assign(
+    code: &[u8],
+    from: usize,
+    frame: &GrainFrame<'_, '_>,
+    scope_ints_before: &[Option<i64>],
+) -> Option<usize> {
+    let mut at = from;
+    for _ in 0..12 {
+        if assign_slot_changed(code, at, frame, scope_ints_before) {
+            let width = crate::grain::bytecode::code::width(code, at)?;
+            return Some(at + width);
+        }
+        let width = crate::grain::bytecode::code::width(code, at)?;
+        if width == 0 {
+            break;
+        }
+        at += width;
+    }
+    None
+}
+
 /// True when `at` is an in-place local assign whose slot already holds
 /// the value the compiled run/writeback stored. Re-executing it would
 /// apply the same `+= 1` twice.
@@ -3443,34 +3515,17 @@ fn assign_already_applied(
     frame: &GrainFrame<'_, '_>,
     scope_ints_before: &[Option<i64>],
 ) -> bool {
-    let Some(&tag) = code.get(at) else {
-        return false;
-    };
-    if !matches!(
-        tag,
-        code::tag::ASSIGN_LOCAL_FROM
-            | code::tag::ASSIGN_LOCAL_FROM_OP
-            | code::tag::ASSIGN_LOCAL_FROM_CONST
-            | code::tag::ASSIGN_LOCAL_FROM_CONST_OP
-    ) {
-        return false;
-    }
-    // `AssignLocalFrom`: u16 slot at offset 1 (`small!(1)`).
-    let Some(lo) = code.get(at + 1) else {
-        return false;
-    };
-    let Some(hi) = code.get(at + 2) else {
-        return false;
-    };
-    let slot = u16::from_le_bytes([*lo, *hi]) as usize;
-    let Some(before) = scope_ints_before.get(slot).copied().flatten() else {
-        return false;
-    };
-    frame
-        .scope
-        .get_by_index(slot)
-        .as_int()
-        .is_ok_and(|after| after == before + 1)
+    assign_int_delta(code, at, frame, scope_ints_before).is_some_and(|delta| delta == 1)
+}
+
+/// Writeback stored this assign, by one or by many loop turns.
+fn assign_slot_changed(
+    code: &[u8],
+    at: usize,
+    frame: &GrainFrame<'_, '_>,
+    scope_ints_before: &[Option<i64>],
+) -> bool {
+    assign_int_delta(code, at, frame, scope_ints_before).is_some_and(|delta| delta != 0)
 }
 
 /// After `UnwindTo` has dropped a `for` slot, do not resume at the
