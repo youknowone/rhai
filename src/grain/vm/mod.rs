@@ -1499,7 +1499,7 @@ fn dynamic_from_word(tag: u8, value: i64) -> Dynamic {
 
 /// Copy this frame's scalar locals into the array above the operand prefix.
 #[cfg(feature = "grain-jit")]
-fn import_local_words(frame: &mut GrainFrame) {
+pub(super) fn import_local_words(frame: &mut GrainFrame) {
     let scope_len = frame.scope.len();
     let mut index = frame.base;
     let mut slot = 0usize;
@@ -1526,26 +1526,22 @@ fn import_local_words(frame: &mut GrainFrame) {
     }
 }
 
-/// Write the array's scalar locals back into the host `Scope`.
+/// Write the array's int locals back into the host `Scope`.
+///
+/// Only the mask bits are ints. The tag vector is not read here: indexing
+/// it from a residual walk faults. Non-int locals stay in `Scope`.
 #[cfg(feature = "grain-jit")]
-fn flush_local_words(frame: &mut GrainFrame) {
+pub(super) fn flush_local_words(frame: &mut GrainFrame) {
     let scope_len = frame.scope.len();
+    let mask = frame.local_int_mask;
     let mut index = frame.base;
     let mut slot = 0usize;
-    while index < scope_len && LOCAL_BASE + slot < OPERAND_WORDS {
-        let at = LOCAL_BASE + slot;
-        let tag = frame.operand_tags[at];
-        if tag != 0 {
-            let word = frame.operand_words[at];
+    while index < scope_len && slot < 32 {
+        if mask & (1i64 << slot) != 0 {
+            let word = frame.operand_words[LOCAL_BASE + slot];
             let entry = frame.scope.get_mut_by_index(index);
-            if tag == 1 {
-                if let Union::Int(held, ..) = &mut entry.0 {
-                    *held = word as crate::INT;
-                } else {
-                    *entry = dynamic_from_word(tag, word);
-                }
-            } else {
-                *entry = dynamic_from_word(tag, word);
+            if let Union::Int(held, ..) = &mut entry.0 {
+                *held = word as crate::INT;
             }
         }
         index += 1;
@@ -6692,9 +6688,26 @@ impl<'e> Vm<'e> {
                 () => {{
                     #[cfg(feature = "grain-jit")]
                     {
+                        // The residual wrote `Vm.stack` and did not update the
+                        // scalar tag. Popping through the tag would replay the
+                        // previous word.
                         self.depth = jit::vm_depth(self) as usize;
+                        let depth = or_raise!(
+                            self.depth.checked_sub(1),
+                            malformed("operand stack underflow".to_string())
+                        );
+                        self.depth = depth;
+                        if depth < STACK_WORDS {
+                            frame.operand_tags[depth] = 0;
+                            let cleared = 0i64;
+                            frame.operand_words[depth] = cleared;
+                        }
+                        stack_take(self, depth)
                     }
-                    pop_unit_word!(self, frame)
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        pop_unit_word!(self, frame)
+                    }
                 }};
             }
 
@@ -7143,7 +7156,14 @@ impl<'e> Vm<'e> {
                         push_fast_word!(self, frame, fast);
                     } else {
                         #[cfg(feature = "grain-jit")]
-                        jit::push_from_cell(self, value);
+                        {
+                            // A scalar push leaves a tag. A later non-scalar
+                            // at the same depth must not be popped as that tag.
+                            if self.depth < STACK_WORDS {
+                                frame.operand_tags[self.depth] = 0;
+                            }
+                            jit::push_from_cell(self, value);
+                        }
                         #[cfg(not(feature = "grain-jit"))]
                         push_word!(self, frame, clone_value(value));
                     }
@@ -7176,7 +7196,12 @@ impl<'e> Vm<'e> {
                         push_fast_word!(self, frame, fast);
                     } else {
                         #[cfg(feature = "grain-jit")]
-                        jit::push_from_cell(self, cell);
+                        {
+                            if self.depth < STACK_WORDS {
+                                frame.operand_tags[self.depth] = 0;
+                            }
+                            jit::push_from_cell(self, cell);
+                        }
                         #[cfg(not(feature = "grain-jit"))]
                         push_word!(self, frame, flatten_clone_value(cell));
                     }
