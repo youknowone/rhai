@@ -80,6 +80,13 @@ pub struct Function {
 /// `Expr` trees, which is precisely the allocation we are trying to remove. The
 /// artifact format refuses to write a `Program` that has any, so nothing
 /// reaching a device can depend on them.
+/// `jit_identity` is fixed at construction.  The tracing JIT reads it as a
+/// green on every back edge; marking it immutable lets that read fold to the
+/// constant instead of reloading a stack address that the next frame reuses.
+#[cfg_attr(
+    feature = "grain-jit",
+    majit_macros::jit_immutable_fields("jit_identity")
+)]
 pub struct Program<'a> {
     /// Process-unique identity used by the tracing JIT's green key.
     ///

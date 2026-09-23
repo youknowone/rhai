@@ -1407,10 +1407,13 @@ fn stack_take(vm: &mut Vm<'_>, index: usize) -> Dynamic {
             4 => return unit_value(),
             _ => {}
         }
-        // A walk-local `Dynamic` out-param is not an address. Do not
-        // residualize `operand_stack_take` on the miss path while the
-        // tracer is recording; the scalar arm is the one-word ABI.
+        // A non-scalar in a live slot is parked on `prepared_taken`.
+        // Abort only when the slot itself is not a cell; that out-param
+        // is what `operand_stack_take` cannot residualize.
         if jit::walk_is_recording() {
+            if jit::operand_stack_take_cell(vm, index) != 0 {
+                return core::mem::take(&mut vm.prepared_taken);
+            }
             jit::request_walk_abort_abi();
             return unit_value();
         }
@@ -1858,6 +1861,13 @@ pub struct Vm<'e> {
     /// hold `&mut Scope` and `&mut Vm` at once. Empty except during that call.
     #[cfg(feature = "grain-jit")]
     prepared_scope: Scope<'static>,
+    /// Non-scalar popped off the operand stack while a trace is recorded.
+    ///
+    /// [`jit::operand_stack_take_cell`] parks it here so the `Dynamic` does
+    /// not cross the residual ABI as an out-parameter. Empty except between
+    /// that call and the `mem::take` in [`stack_take`].
+    #[cfg(feature = "grain-jit")]
+    prepared_taken: Dynamic,
     /// Steps waiting for the statement that asked for them to end.
     ///
     /// Rhai keeps this in a `defer` per AST node (`eval/stmt.rs:271`): a `next`
@@ -2020,6 +2030,8 @@ impl<'e> Vm<'e> {
             last_generation: 0,
             #[cfg(feature = "grain-jit")]
             prepared_scope: Scope::new(),
+            #[cfg(feature = "grain-jit")]
+            prepared_taken: Dynamic::default(),
             #[cfg(feature = "debugging")]
             pending_steps: Vec::new(),
         }
@@ -2093,6 +2105,8 @@ impl<'e> Vm<'e> {
             last_generation: warm.last_generation,
             #[cfg(feature = "grain-jit")]
             prepared_scope: Scope::new(),
+            #[cfg(feature = "grain-jit")]
+            prepared_taken: Dynamic::default(),
             // A step belongs to the statement that asked for it, and that
             // statement is running in the `Vm` this crossing came from.
             #[cfg(feature = "debugging")]
@@ -2702,7 +2716,13 @@ impl<'e> Vm<'e> {
                     return;
                 }
                 _ => {
-                    if jit::walk_is_recording() {
+                    // A machine int/bool/float/unit already left through
+                    // `push_fast_*`. What remains is a real cell: a pooled
+                    // `Variant` such as `0..end`, which a nested `for` exhaust
+                    // bridge has to push. Aborting every non-scalar while
+                    // recording drops that bridge. A walk-local word is not a
+                    // cell; `operand_stack_store` refuses it.
+                    if jit::walk_is_recording() && !jit::live_dynamic_ptr(&value) {
                         jit::request_walk_abort_abi();
                         return;
                     }
@@ -6399,9 +6419,17 @@ impl<'e> Vm<'e> {
                                 #[cfg(not(feature = "no_float"))]
                                 3 => Dynamic::from(jit::fast_float()),
                                 4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                                // A pooled range or other `Variant` is a real
+                                // cell. Cloning it is what the non-jit path
+                                // does; aborting here drops the exhaust bridge
+                                // that re-enters `for j in 0..end`.
                                 _ => {
-                                    jit::request_walk_abort_abi();
-                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                    if jit::live_dynamic_ptr(cell) {
+                                        flatten_clone_value(cell)
+                                    } else {
+                                        jit::request_walk_abort_abi();
+                                        Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                    }
                                 }
                             }
                         }
@@ -6429,8 +6457,12 @@ impl<'e> Vm<'e> {
                                 3 => Dynamic::from(jit::fast_float()),
                                 4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
                                 _ => {
-                                    jit::request_walk_abort_abi();
-                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                    if jit::live_dynamic_ptr(value) {
+                                        clone_value(value)
+                                    } else {
+                                        jit::request_walk_abort_abi();
+                                        Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                    }
                                 }
                             }
                         }
@@ -7292,7 +7324,10 @@ impl<'e> Vm<'e> {
                                     self.push_fast(lhs);
                                     self.push_fast(rhs);
                                 }
-                                _ => jit::request_walk_abort_abi(),
+                                _ => {
+                                    self.push(operand_value!(6, true));
+                                    self.push(operand_value!(8, named_is_local));
+                                }
                             }
                         }
                         #[cfg(not(feature = "grain-jit"))]
@@ -7310,7 +7345,7 @@ impl<'e> Vm<'e> {
                         if let Some(rhs) = named_fast!(6, named_is_local) {
                             self.push_fast(rhs);
                         } else {
-                            jit::request_walk_abort_abi();
+                            self.push(operand_value!(6, named_is_local));
                         }
                         #[cfg(not(feature = "grain-jit"))]
                         {
@@ -8394,15 +8429,26 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::ITER_INIT => {
-                    let iterable = self.pop()?;
-                    self.iter_init(iterable, pos!())?;
                     #[cfg(feature = "grain-jit")]
                     {
+                        // The range `Dynamic` stays inside the residual.
+                        // Tracing `stack_take` of it is the exhaust bridge's
+                        // `BC_ABORT` in `stack_take`.
+                        if let Some(err) =
+                            jit::iter_init_from_top(self, jit::position_bits(pos!()))
+                        {
+                            return Err(err);
+                        }
                         // `valuestackdepth += 1` after the iterator push.
                         // `iterators.len()` is `dont_look_inside_cannot_raise`
                         // and CSE-folds across the pop, leaving dest peeking
                         // the inner index after that iterator is gone.
                         frame.iter_depth += 1;
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        let iterable = self.pop()?;
+                        self.iter_init(iterable, pos!())?;
                     }
                 }
 
@@ -8491,7 +8537,13 @@ impl<'e> Vm<'e> {
                             if let Union::Int(..) = &entry.0 {
                                 jit::dynamic_store_int(entry, n);
                             } else {
-                                jit::store_scope_int(scope, index, n, jit::position_bits(pos!()));
+                                // Packed bits. The store builds the Position.
+                                jit::store_scope_int(
+                                    scope,
+                                    index,
+                                    n,
+                                    jit::code_position_bits(program, pc),
+                                );
                             }
                             transfer!(body);
                             continue;

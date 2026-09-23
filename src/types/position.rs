@@ -27,6 +27,15 @@ pub struct Position {
 impl Position {
     /// A [`Position`] representing no position.
     pub const NONE: Self = Self { line: 0, pos: 0 };
+
+    /// Line and column as stored, including line 0.
+    ///
+    /// [`Self::new`] rejects line 0. This builds that bit pattern without
+    /// naming [`Self::NONE`], which the tracer would residualize as a call.
+    #[inline(always)]
+    pub(crate) const fn from_stored(line: u16, pos: u16) -> Self {
+        Self { line, pos }
+    }
     /// A [`Position`] representing the first position.
     pub const START: Self = Self { line: 1, pos: 0 };
 

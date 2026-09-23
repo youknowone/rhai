@@ -312,10 +312,11 @@ pub(super) fn position_bits(position: Position) -> i64 {
 fn position_from_bits(bits: i64) -> Position {
     let bits = bits as u32;
     let line = (bits >> 16) as u16;
+    let pos = bits as u16;
     if line == 0 {
-        Position::NONE
+        Position::from_stored(0, 0)
     } else {
-        Position::new(line, bits as u16)
+        Position::from_stored(line, pos)
     }
 }
 
@@ -614,14 +615,6 @@ pub(super) extern "C" fn int_modulo_result() -> crate::INT {
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn int_max(a: i64, b: i64) -> i64 {
     if a >= b { a } else { b }
-}
-
-/// `core::num::<Impl>::checked_add` is Opaque in LLBC. Dest's
-/// `count + 1` / `n + 1` after an explicit `INT::MAX` check lands here
-/// as a two-int residual; the overflow arm is already handled.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn i64_checked_add(a: i64, b: i64) -> i64 {
-    a.wrapping_add(b)
 }
 
 /// Advance a `for` loop that stores into a scope slot.
@@ -2071,7 +2064,7 @@ pub(super) extern "C" fn push_from_cell(vm: &mut Vm<'_>, cell: &Dynamic) {
 /// a bound helper with whatever is in the register, which for a lowered local
 /// is a small integer (often a FastValue tag or a payload). Dropping that as
 /// `Union` is `EXC_BAD_ACCESS` at that address. Refuse rather than dereference.
-fn live_dynamic_ptr(value: &Dynamic) -> bool {
+pub(super) fn live_dynamic_ptr(value: &Dynamic) -> bool {
     let addr = value as *const Dynamic as usize;
     addr > 0x1000
 }
@@ -2153,6 +2146,20 @@ pub(super) extern "C" fn operand_stack_take_fast(vm: &mut Vm<'_>, index: usize) 
     *slot = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
     majit_metainterp::note_residual_committed();
     tag
+}
+
+/// Move a non-scalar operand into [`Vm::prepared_taken`].
+///
+/// `1` when the slot is a live cell, `0` when it is not. The `Dynamic`
+/// stays on the `Vm` so a trace does not residualize an out-parameter.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn operand_stack_take_cell(vm: &mut Vm<'_>, index: usize) -> i64 {
+    if !live_stack_store(vm, index) {
+        return 0;
+    }
+    vm.prepared_taken = core::mem::take(super::operand_mut(&mut vm.stack[index]));
+    majit_metainterp::note_residual_committed();
+    1
 }
 
 /// Whether a trace is being recorded. The miss path of
@@ -2283,6 +2290,38 @@ pub(super) extern "C" fn truncate_stack(vm: &mut Vm<'_>, depth: usize) {
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn iterators_len(vm: &Vm<'_>) -> i64 {
     vm.iterators_len() as i64
+}
+
+/// Pop the iterable and start the `for`, inside one residual.
+///
+/// Tracing `stack_take` of a range `Dynamic` reaches a `BC_ABORT` arm
+/// (`stack_take` at pos 57). The natural integer range only needs the
+/// two bounds on the iterator, which is what [`Vm::iter_init`] records.
+/// `Some` is the error; `None` means the iterator was pushed.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub(super) extern "C" fn iter_init_from_top(
+    vm: &mut Vm<'_>,
+    position: i64,
+) -> Option<Box<crate::EvalAltResult>> {
+    if !live_vm_ptr(vm) {
+        majit_metainterp::request_walk_abort();
+        return None;
+    }
+    let Some(depth) = vm.depth.checked_sub(1) else {
+        return Some(Box::new(crate::EvalAltResult::ErrorRuntime(
+            "operand stack underflow".into(),
+            position_from_bits(position),
+        )));
+    };
+    if !live_count(depth) || depth >= vm.stack.len() {
+        majit_metainterp::request_walk_abort();
+        return None;
+    }
+    vm.depth = depth;
+    let iterable = core::mem::take(super::operand_mut(&mut vm.stack[depth]));
+    majit_metainterp::note_residual_committed();
+    vm.iter_init(iterable, position_from_bits(position))
+        .err()
 }
 
 /// Drop the innermost `for` iterator without exposing `Vec::pop`.

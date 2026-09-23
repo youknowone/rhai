@@ -361,14 +361,6 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::iteration_at as *const () as usize as i64,
         ),
         (
-            "core::num::<Impl>::checked_add",
-            super::jit::i64_checked_add as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::i64_checked_add",
-            super::jit::i64_checked_add as *const () as usize as i64,
-        ),
-        (
             "rhai::grain::vm::jit::dest_iteration_at",
             super::jit::dest_iteration_at as *const () as usize as i64,
         ),
@@ -490,6 +482,14 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
         (
             "rhai::grain::vm::jit::operand_stack_take_fast",
             super::jit::operand_stack_take_fast as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::operand_stack_take_cell",
+            super::jit::operand_stack_take_cell as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::jit::iter_init_from_top",
+            super::jit::iter_init_from_top as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::walk_is_recording",

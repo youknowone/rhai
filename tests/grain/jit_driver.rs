@@ -503,3 +503,43 @@ fn recursive_fibonacci_bridge_does_not_abort_on_scalar_push() {
     assert_eq!(format!("{result:?}"), "317811", "stats={stats:?}");
     assert_eq!(stats.symbolic_residual_aborts, 0, "scalar take/push must not abort the fib(28) bridge: {stats:?}");
 }
+
+/// `for i in 0..201 { for j in 0..2000 { s += 1 } }` reuses the inner
+/// exhaust bridge. Each reuse starts the next inner loop with a non-int
+/// slot, and that item still has to be counted.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn nested_for_exhaust_bridge_counts_every_inner_step() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const SOURCE: &str = "let s = 0; for i in 0..201 { for j in 0..2000 { s += 1; } } s";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the nested for parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine
+        .eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast)
+        .expect("the walker runs");
+    let vm = Vm::new(&engine)
+        .eval_with_scope(&mut Scope::new(), &program)
+        .expect("the vm runs the nested for");
+    let stats = jit_state::stats();
+    let diag = jit_state::majit_diag_summary();
+    eprintln!("nested-for exhaust grain JIT stats: {stats:?} diag={diag}");
+    assert_eq!(
+        format!("{walker:?}"),
+        format!("{vm:?}"),
+        "walker and vm must agree: {stats:?} diag={diag}"
+    );
+    assert_eq!(format!("{walker:?}"), "402000", "201 * 2000 inner steps");
+    assert!(
+        stats.loops_compiled > 0,
+        "the inner for must compile: {stats:?}"
+    );
+    assert!(
+        diag.split_whitespace().any(|pair| pair.starts_with("cb_entered=")
+            && pair.rsplit_once('=').is_some_and(|(_, n)| n != "0")),
+        "the exhaust bridge must be compiled: {diag} stats={stats:?}"
+    );
+}
