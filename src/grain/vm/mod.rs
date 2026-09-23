@@ -101,13 +101,17 @@ macro_rules! is_shared {
 #[cfg(feature = "grain-jit")]
 macro_rules! fast_from_cell {
     ($cell:expr) => {{
-        match jit::dynamic_as_fast($cell) {
-            1 => Some(arith::FastValue::Int(jit::fast_int())),
-            2 => Some(arith::FastValue::Bool(jit::fast_bool() != 0)),
-            #[cfg(not(feature = "no_float"))]
-            3 => Some(arith::FastValue::Float(jit::fast_float())),
-            4 => Some(arith::FastValue::Unit),
-            _ => None,
+        if majit_metainterp::jit::we_are_jitted() {
+            match jit::dynamic_as_fast($cell) {
+                1 => Some(arith::FastValue::Int(jit::fast_int())),
+                2 => Some(arith::FastValue::Bool(jit::fast_bool() != 0)),
+                #[cfg(not(feature = "no_float"))]
+                3 => Some(arith::FastValue::Float(jit::fast_float())),
+                4 => Some(arith::FastValue::Unit),
+                _ => None,
+            }
+        } else {
+            arith::FastValue::from_cell($cell)
         }
     }};
 }
@@ -6007,8 +6011,14 @@ impl<'e> Vm<'e> {
             // `scope_from_frame` is only a colourer residual: dropping its
             // returned borrow lets dest SETFIELD `iter_depth` (`FOR_ITER`
             // / `popvalue`) as a disjoint field while `scope` is live.
+            // False in the interpreter, folded to true in the traced portal.
+            // The pin residuals exist so the colourer keeps the merge-point
+            // Vm and `scope` in distinct registers; a forward opcode that is
+            // not being traced has no consult for them to feed.
             #[cfg(feature = "grain-jit")]
-            {
+            let jitted = majit_metainterp::jit::we_are_jitted();
+            #[cfg(feature = "grain-jit")]
+            if jitted {
                 let _ = jit::scope_from_frame(frame, self);
             }
             let scope = &mut *frame.scope;
@@ -6021,12 +6031,18 @@ impl<'e> Vm<'e> {
             // colourer still reuses the merge-point vm register for
             // `scope` and a mid-opcode guard snapshots Scope there.
             #[cfg(feature = "grain-jit")]
-            let _ = jit::pin_scope_with_vm(self, scope);
+            if jitted {
+                let _ = jit::pin_scope_with_vm(self, scope);
+            }
             macro_rules! scope_len {
                 () => {{
                     #[cfg(feature = "grain-jit")]
                     {
-                        jit::scope_len(scope) as usize
+                        if jitted {
+                            jit::scope_len(scope) as usize
+                        } else {
+                            scope.len()
+                        }
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -6038,7 +6054,11 @@ impl<'e> Vm<'e> {
                 ($index:expr) => {{
                     #[cfg(feature = "grain-jit")]
                     {
-                        jit::scope_entry(scope, $index)
+                        if jitted {
+                            jit::scope_entry(scope, $index)
+                        } else {
+                            scope.get_mut_by_index($index)
+                        }
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -6065,7 +6085,11 @@ impl<'e> Vm<'e> {
                 ($jit:ident, $plain:ident, $program:expr, $index:expr) => {{
                     #[cfg(feature = "grain-jit")]
                     {
-                        jit::$jit($program, $index)
+                        if jitted {
+                            jit::$jit($program, $index)
+                        } else {
+                            $program.$plain($index)
+                        }
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -6080,7 +6104,11 @@ impl<'e> Vm<'e> {
                 ($array:expr, $index:expr) => {{
                     #[cfg(feature = "grain-jit")]
                     {
-                        jit::array_entry_mut($array, $index)
+                        if jitted {
+                            jit::array_entry_mut($array, $index)
+                        } else {
+                            &mut $array[$index]
+                        }
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -6093,7 +6121,11 @@ impl<'e> Vm<'e> {
                 ($array:expr, $index:expr) => {{
                     #[cfg(feature = "grain-jit")]
                     {
-                        jit::array_entry($array, $index)
+                        if jitted {
+                            jit::array_entry($array, $index)
+                        } else {
+                            &$array[$index]
+                        }
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -6105,7 +6137,11 @@ impl<'e> Vm<'e> {
                 ($depth:expr) => {{
                     #[cfg(feature = "grain-jit")]
                     {
-                        jit::truncate_stack(self, $depth);
+                        if jitted {
+                            jit::truncate_stack(self, $depth);
+                        } else {
+                            self.truncate_stack($depth);
+                        }
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -6508,6 +6544,7 @@ impl<'e> Vm<'e> {
             macro_rules! transfer {
                 ($target:expr) => {{
                     let target: usize = $target;
+                    let mut land = target;
                     if target <= pc {
                         #[cfg(feature = "grain-jit")]
                         {
@@ -6519,6 +6556,20 @@ impl<'e> Vm<'e> {
                                 frame,
                                 self,
                             );
+                            // The next iteration clears `jit_resume_pc_plus_one`
+                            // before reading it. Apply the exit merge point here,
+                            // where `can_enter_jit` just published it.
+                            if frame.jit_return_kind != 0 {
+                                let mut value = unit_value();
+                                if let Some(err) = jit::take_finished_result(frame, &mut value) {
+                                    return Err(err);
+                                }
+                                return Ok(value);
+                            }
+                            if frame.jit_resume_pc_plus_one != 0 {
+                                land = frame.jit_resume_pc_plus_one - 1;
+                                frame.jit_resume_pc_plus_one = 0;
+                            }
                         }
                         // The position is a table lookup keyed on the
                         // address, and metering only reports one when it
@@ -6528,7 +6579,7 @@ impl<'e> Vm<'e> {
                         self.engine
                             .track_operation_at(&mut self.global, || pos!())?;
                     }
-                    pc = target;
+                    pc = land;
                 }};
             }
 

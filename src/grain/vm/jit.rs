@@ -2427,6 +2427,9 @@ struct Runtime {
     portal: Arc<majit_metainterp::JitCode>,
     portal_merge_point: usize,
     green_types: Vec<GreenType>,
+    /// Target pc plus the declared greens. Built once: a back edge only
+    /// bumps a counter, and hashing that key must not allocate.
+    enter_green_types: Vec<GreenType>,
 }
 
 impl Runtime {
@@ -2455,6 +2458,9 @@ impl Runtime {
         // `run_frame` is a portal call `can_inline` may look inside.
         descriptor.is_recursive = true;
         let green_types = descriptor.green_args_spec();
+        let enter_green_types: Vec<GreenType> = std::iter::once(GreenType::Int)
+            .chain(green_types.iter().copied())
+            .collect();
         let mut driver = JitDriver::with_descriptor(THRESHOLD, descriptor);
         driver.set_is_recursive(true);
         driver.ensure_descriptor_registered();
@@ -2501,6 +2507,7 @@ impl Runtime {
             portal_merge_point: jitcodes::portal_merge_point_offset()
                 .expect("the registered portal names its merge point"),
             green_types,
+            enter_green_types,
         })
     }
 }
@@ -2634,12 +2641,12 @@ fn report_if_enabled(event: &str) {
 pub struct GrainJitDriver;
 
 impl GrainJitDriver {
-    /// A control-flow transfer is about to enter a loop header.
+    /// A backward jump is about to land on a loop header.
     ///
-    /// The untranslated marker is inert, as RPython's `JitDriver` hint is.
-    /// The translator recognises this receiver and lowers the call to
-    /// `loop_header`; the following [`Self::jit_merge_point`] performs the
-    /// native warm-state consultation with the target state.
+    /// The translator lowers this call to `loop_header`. Outside a trace the
+    /// body is `warmstate.py` `maybe_compile_and_run`: one counter bump, and
+    /// the compiled loop when the cell already has one. A forward opcode does
+    /// not call this.
     #[inline(never)]
     pub fn can_enter_jit(
         &self,
@@ -2647,15 +2654,22 @@ impl GrainJitDriver {
         program_identity: u64,
         program: &Program,
         frame: &mut GrainFrame<'_, '_>,
-        vm: &Vm<'_>,
+        vm: &mut Vm<'_>,
     ) {
-        let _ = (pc, program_identity, program, frame, vm);
+        // An open trace records the header through the lowered `loop_header`,
+        // not through a second native counter bump.
+        if STEP.with(|step| step.tracing.get()) {
+            return;
+        }
+        self.consult_at(pc, program_identity, program, frame, vm);
     }
 
     /// One iteration of the dispatch loop is about to run.
     ///
     /// Greens `(pc, program_identity, program)` first, then reds
-    /// `(frame, vm)`.
+    /// `(frame, vm)`. Outside a trace the body returns without a consult:
+    /// counting and compiled entry belong to [`Self::can_enter_jit`]. While a
+    /// trace is open the door still runs, so each opcode is recorded.
     #[inline(never)]
     pub fn jit_merge_point(
         &self,
@@ -2665,36 +2679,25 @@ impl GrainJitDriver {
         frame: &mut GrainFrame<'_, '_>,
         vm: &mut Vm<'_>,
     ) {
-        if RESIDUAL_NEST.with(Cell::get) != 0 {
+        if !STEP.with(|step| step.tracing.get()) {
             return;
         }
-        // The door below resolves a celltable cell, builds a driver descriptor
-        // and extracts the live values before it decides to interpret -- four
-        // heap blocks per call, on a path taken once per *dispatched
-        // instruction*. Upstream is not asked that often. `jit_merge_point`
-        // sits at the top of the dispatch loop there too, but what ticks the
-        // counter is `can_enter_jit`, and `pyopcode.py jump_absolute` calls
-        // that only on a backward jump.
-        //
-        // There is no separate `can_enter_jit` on this driver, so the back edge
-        // is recognised instead of being told: `pc` advances on its own every
-        // instruction and only a jump can fail to advance it, so a jump that
-        // did not advance it went backwards. Entering or returning from a frame
-        // can also fail to advance it, which costs one door call that decides
-        // nothing. While a trace is open the door runs unconditionally -- the
-        // tracer records every instruction, not every loop.
-        //
-        // `for` dest is `IterNext` (`visit_For` / `FOR_ITER`): the
-        // body jumps back onto the header that stores the next item.
-        // A forward arrival is still a skip; the back edge is the consult.
-        let opened = STEP.with(|step| {
-            if pc > step.prev_pc.replace(pc) && !step.tracing.get() {
-                step.skipped.set(step.skipped.get() + 1);
-                return false;
-            }
-            true
-        });
-        if !opened {
+        self.consult_at(pc, program_identity, program, frame, vm);
+    }
+
+    /// Warm-state consult for one program position.
+    ///
+    /// `can_enter_jit` calls this on a back edge. `jit_merge_point` calls it
+    /// only while a trace is already open.
+    fn consult_at(
+        &self,
+        pc: usize,
+        program_identity: u64,
+        program: &Program,
+        frame: &mut GrainFrame<'_, '_>,
+        vm: &mut Vm<'_>,
+    ) {
+        if RESIDUAL_NEST.with(Cell::get) != 0 {
             return;
         }
         // `FOR_ITER` peeks TOS off the live stack depth. Dest-abort
@@ -2770,18 +2773,17 @@ impl GrainJitDriver {
                 program_identity as i64,
                 program as *const Program as usize as i64,
             ];
-            let green_types: Vec<GreenType> = std::iter::once(GreenType::Int)
-                .chain(runtime.green_types.iter().copied())
-                .collect();
             assert_eq!(
                 green_values.len(),
-                green_types.len(),
+                runtime.enter_green_types.len(),
                 "the merge point passes the target and one value per declared green",
             );
-            let green_hash = majit_metainterp::green_key_hash_typed(&green_values, &green_types);
+            let mut type_buf = [GreenType::Int; 4];
+            type_buf.copy_from_slice(&runtime.enter_green_types);
+            let green_hash = majit_metainterp::green_key_hash_typed(&green_values, &type_buf);
             let green_key = || GreenKey {
                 values: green_values.to_vec().into(),
-                types: green_types.clone().into(),
+                types: type_buf.to_vec().into(),
             };
 
             // The driver reads the live values off the state, and the state
