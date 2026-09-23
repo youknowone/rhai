@@ -2683,9 +2683,6 @@ impl<'e> Vm<'e> {
         #[cfg(not(feature = "grain-jit"))]
         let stack_len = self.stack.len();
         if self.depth + extra > stack_len {
-            #[cfg(feature = "grain-jit")]
-            jit::grow_stack_abi(self, extra);
-            #[cfg(not(feature = "grain-jit"))]
             self.grow_stack(extra);
         }
     }
@@ -2735,9 +2732,6 @@ impl<'e> Vm<'e> {
         #[cfg(not(feature = "grain-jit"))]
         let stack_len = self.stack.len();
         if depth == stack_len {
-            #[cfg(feature = "grain-jit")]
-            jit::grow_stack_abi(self, 1);
-            #[cfg(not(feature = "grain-jit"))]
             self.grow_stack(1);
         }
         #[cfg(feature = "grain-jit")]
