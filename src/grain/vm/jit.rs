@@ -24,7 +24,7 @@ use std::cell::{Cell, RefCell};
 use std::sync::{Arc, OnceLock};
 
 use majit_ir::{GreenKey, GreenType};
-use majit_metainterp::{JitDriver, JitState};
+use majit_metainterp::{BackEdgeWarmth, JitDriver, JitState};
 
 use super::{jit_state, jitcodes};
 use super::{GrainFrame, Vm};
@@ -2741,6 +2741,7 @@ impl GrainJitDriver {
         let mut report_event = None;
         let mut restored = Vec::new();
         let mut resume_pc = None;
+        let mut cold_interpret = false;
         RUNTIME.with(|cell| {
             let Ok(mut slot) = cell.try_borrow_mut() else {
                 bump_stats(|stats| stats.reentrant_consultations_declined += 1);
@@ -2781,6 +2782,22 @@ impl GrainJitDriver {
             let mut type_buf = [GreenType::Int; 4];
             type_buf.copy_from_slice(&runtime.enter_green_types);
             let green_hash = majit_metainterp::green_key_hash_typed(&green_values, &type_buf);
+            // `maybe_compile_and_run`: hash, cheap cell lookup, tick. The
+            // descriptor and the live-value list wait until the tick overflows
+            // or a compiled token is already there.
+            let warmth = {
+                let driver = &mut runtime.driver;
+                let state = &runtime.state;
+                if STEP.with(|step| step.tracing.get()) {
+                    BackEdgeWarmth::Full
+                } else {
+                    driver.back_edge_warmth(green_hash, state)
+                }
+            };
+            if warmth == BackEdgeWarmth::Interpret {
+                cold_interpret = true;
+                return;
+            }
             let green_key = || GreenKey {
                 values: green_values.to_vec().into(),
                 types: type_buf.to_vec().into(),
@@ -2806,14 +2823,22 @@ impl GrainJitDriver {
             // `ContinueRunningNormally`, whose first green is the merge-point
             // pc the blackhole stopped on. The frame was written by that
             // resume. Do not invent another pc from the live slots.
-            let resume = runtime.driver.back_edge_structured(
-                green_hash,
-                green_key,
-                pc,
-                &mut runtime.state,
-                &env,
-                || {},
-            );
+            let resume = if warmth == BackEdgeWarmth::Trace {
+                let started = {
+                    let driver = &mut runtime.driver;
+                    let state = &mut runtime.state;
+                    driver.commit_back_edge_trace(green_hash, green_key, pc, state, &env)
+                };
+                if started {
+                    Some(pc)
+                } else {
+                    None
+                }
+            } else {
+                let driver = &mut runtime.driver;
+                let state = &mut runtime.state;
+                driver.back_edge_structured(green_hash, green_key, pc, state, &env, || {})
+            };
             let started = !was_tracing && runtime.driver.is_tracing();
             if runtime.driver.take_back_edge_finish().is_some() {
                 resume_pc = None;
@@ -2993,6 +3018,11 @@ impl GrainJitDriver {
 
             restored = runtime.state.take_restored();
         });
+
+        if cold_interpret {
+            bump_stats(|stats| stats.entry_door_interpret += 1);
+            return;
+        }
 
         if !restored.is_empty() {
             frame.restore_from_jit(&restored, vm);

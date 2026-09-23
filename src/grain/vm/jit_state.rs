@@ -19,8 +19,8 @@
 
 use majit_ir::{GcRef, OpRef, Type, Value};
 use majit_metainterp::{
-    GuardResumeFrame, JitCodeRuntime, JitCodeSym, JitDriverStaticData, JitState, TraceAction,
-    TraceCtx, seed_bridge_virtualizable_boxes, trace_jitcode_at_resume_framestack,
+    seed_bridge_virtualizable_boxes, trace_jitcode_at_resume_framestack, GuardResumeFrame,
+    JitCodeRuntime, JitCodeSym, JitDriverStaticData, JitState, TraceAction, TraceCtx,
 };
 
 /// The six register lists of a `jit_merge_point` op: green I/R/F then red I/R/F.
@@ -603,8 +603,36 @@ impl JitState for GrainJitState {
         self.reds.clone()
     }
 
+    fn extract_live_into(&self, meta: &Self::Meta, out: &mut Vec<i64>) {
+        let _ = meta;
+        out.extend_from_slice(&self.reds);
+    }
+
     fn live_value_types(&self, _meta: &Self::Meta) -> Vec<Type> {
         red_kinds().to_vec()
+    }
+
+    fn live_value_types_into(&self, _meta: &Self::Meta, out: &mut Vec<Type>) {
+        out.extend_from_slice(red_kinds());
+    }
+
+    fn extract_live_values_into(
+        &self,
+        meta: &Self::Meta,
+        out: &mut Vec<Value>,
+        raw: &mut Vec<i64>,
+        types: &mut Vec<Type>,
+    ) {
+        let _ = meta;
+        raw.clear();
+        types.clear();
+        raw.extend_from_slice(&self.reds);
+        types.extend_from_slice(red_kinds());
+        out.extend(raw.iter().zip(types.iter().copied()).map(|(v, t)| match t {
+            Type::Float => Value::Float(f64::from_bits(*v as u64)),
+            Type::Ref => Value::Ref(GcRef(*v as usize)),
+            _ => Value::Int(*v),
+        }));
     }
 
     fn create_sym(meta: &Self::Meta, header_pc: usize) -> Self::Sym {
@@ -716,8 +744,8 @@ impl JitState for GrainJitState {
     }
 
     #[allow(non_snake_case)]
-    fn __build_virtualizable_info()
-    -> Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
+    fn __build_virtualizable_info(
+    ) -> Option<std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo>> {
         use super::GrainFrame;
         use majit_metainterp::virtualizable::VirtualizableInfo;
 
