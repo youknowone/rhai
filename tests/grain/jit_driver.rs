@@ -508,6 +508,46 @@ fn recursive_fibonacci_bridge_does_not_abort_on_scalar_push() {
     assert_eq!(stats.symbolic_residual_aborts, 0, "scalar take/push must not abort the fib(28) bridge: {stats:?}");
 }
 
+/// `fib(28)` has to finish. A release grain-JIT run used to stay in
+/// `Vm::execute` / `jit_merge_point` and never produce 317811.
+///
+/// A second thread exits the process if the VM is still running after the
+/// deadline, so a regression cannot keep the test binary alive.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn recursive_fibonacci_returns_before_the_deadline() {
+    if no_tables() {
+        return;
+    }
+
+    let mut engine = Engine::new();
+    engine.set_max_call_levels(64);
+    let ast = engine
+        .compile("fn fib(n) { if n < 2 { n } else { fib(n-1) + fib(n-2) }} fib(28)")
+        .expect("fib parses");
+    let program = Compiler::new().compile(&ast);
+    // `Engine` is not `Send`, and the first thread owns tracing, so the VM
+    // stays here. The other thread only enforces the deadline.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        if done_rx.recv_timeout(std::time::Duration::from_secs(180)).is_err() {
+            eprintln!("fib(28) did not return within 180s");
+            std::process::exit(1);
+        }
+    });
+    jit_state::reset_stats();
+    let result = Vm::new(&engine)
+        .eval_with_scope(&mut Scope::new(), &program)
+        .expect("fib runs");
+    let stats = jit_state::stats();
+    let _ = done_tx.send(());
+    assert_eq!(format!("{result:?}"), "317811", "stats={stats:?}");
+    assert!(
+        stats.traces_aborted < 50,
+        "fib(28) must not retrace without bound: {stats:?}"
+    );
+}
+
 /// `for i in 0..201 { for j in 0..2000 { s += 1 } }` reuses the inner
 /// exhaust bridge. Each reuse starts the next inner loop with a non-int
 /// slot, and that item still has to be counted.
