@@ -7302,6 +7302,2179 @@ impl<'e> Vm<'e> {
         Ok(false)
     }
 
+    #[cfg(feature = "grain-jit")]
+    fn finished_frame_value(&mut self, frame: &mut GrainFrame<'_, '_>) -> VmResult {
+        let mut value = unit_value();
+        if let Some(err) = jit::take_finished_result(frame, &mut value) {
+            return Err(err);
+        }
+        Ok(value)
+    }
+
+    #[cfg_attr(feature = "grain-jit", majit_macros::unroll_safe)]
+    #[inline(never)]
+    fn dispatch_cold(
+        &mut self,
+        frame: &mut GrainFrame<'_, '_>,
+        program: &Program<'_>,
+        pc_slot: &mut usize,
+        tag: u8,
+        base: usize,
+        stack_base: usize,
+        width: usize,
+        jitted: bool,
+        generation: u64,
+        #[cfg(feature = "grain-jit")] jit_driver: &jit::GrainJitDriver,
+    ) -> Result<bool, Box<EvalAltResult>> {
+        let mut pc = *pc_slot;
+        let scope = &mut *frame.scope;
+        #[cfg(feature = "grain-jit")]
+        macro_rules! depth {
+            () => {
+                frame.operand_depth
+            };
+            ($new:expr) => {{
+                frame.operand_depth = $new;
+            }};
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        macro_rules! depth {
+            () => {
+                self.depth
+            };
+            ($new:expr) => {{
+                self.depth = $new;
+            }};
+        }
+
+        macro_rules! scope_len {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::scope_len(scope) as usize
+                    } else {
+                        scope.len()
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    scope.len()
+                }
+            }};
+        }
+
+        macro_rules! scope_entry {
+            ($index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::scope_entry(scope, $index)
+                    } else {
+                        scope.get_mut_by_index($index)
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    scope.get_mut_by_index($index)
+                }
+            }};
+        }
+
+        macro_rules! program_entry {
+            ($jit:ident, $plain:ident, $program:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::$jit($program, $index)
+                    } else {
+                        $program.$plain($index)
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    $program.$plain($index)
+                }
+            }};
+        }
+
+        macro_rules! array_entry_mut {
+            ($array:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::array_entry_mut($array, $index)
+                    } else {
+                        &mut $array[$index]
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    &mut $array[$index]
+                }
+            }};
+        }
+
+        macro_rules! array_entry {
+            ($array:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::array_entry($array, $index)
+                    } else {
+                        &$array[$index]
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    &$array[$index]
+                }
+            }};
+        }
+
+        macro_rules! truncate_stack {
+            ($depth:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    let new_depth = $depth;
+                    let old_depth = depth!();
+                    if new_depth < old_depth {
+                        let end = old_depth.min(STACK_WORDS);
+                        let start = new_depth.min(end);
+                        let mut slot = start;
+                        while slot < end {
+                            frame.operand_tags[slot] = 0;
+                            slot += 1;
+                        }
+                    }
+                    self.depth = depth!();
+                    if jitted {
+                        jit::truncate_stack(self, new_depth);
+                    } else {
+                        self.truncate_stack(new_depth);
+                    }
+                    depth!(new_depth);
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    self.truncate_stack($depth);
+                    depth!(self.depth);
+                }
+            }};
+        }
+
+        macro_rules! take_residual_push {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    // The residual wrote `Vm.stack` and did not update the
+                    // scalar tag. Popping through the tag would replay the
+                    // previous word.
+                    depth!(jit::vm_depth(self) as usize);
+                    let depth = or_raise!(
+                        depth!().checked_sub(1),
+                        malformed("operand stack underflow".to_string())
+                    );
+                    depth!(depth);
+                    if depth < STACK_WORDS {
+                        frame.operand_tags[depth] = 0;
+                        let cleared = 0i64;
+                        frame.operand_words[depth] = cleared;
+                    }
+                    stack_take(self, depth)
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    pop_unit_word!(self, frame)
+                }
+            }};
+        }
+
+        macro_rules! eval_chain {
+            ($chain:expr, $index:expr, $keeps:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if let Some(err) = jit::run_chain_abi(
+                        self,
+                        program,
+                        $chain,
+                        $index,
+                        scope,
+                        base,
+                        jit::position_bits(pos!()),
+                    ) {
+                        return Err(err);
+                    }
+                    depth!(jit::vm_depth(self) as usize);
+                    if !$keeps {
+                        let floor = depth!().saturating_sub(1);
+                        truncate_stack!(floor);
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let value =
+                        self.run_chain_inner(program, $chain, $index, scope, base, pos!())?;
+                    if $keeps {
+                        self.push(value);
+                        depth!(self.depth);
+                    } else {
+                        drop(value);
+                    }
+                }
+            }};
+        }
+
+        macro_rules! small {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_u16(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u16,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match code::u16_at(program.code(), pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! wide {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_u32(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u32,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match code::u32_at(program.code(), pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! pos {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    jit::code_position(program, pc)
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    program.position(pc)
+                }
+            }};
+        }
+
+        macro_rules! byte {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_byte(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u8,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match program.code().get(pc + $offset) {
+                        Some(operand) => *operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! fast_operators {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    // Keep the merge-point Vm in its reserved register
+                    // across this deopt. Without the pin, the colourer
+                    // reuses that slot for `scope` and the compiled
+                    // guard's failargs drop the Vm; resume then bakes
+                    // `ConstPtr(this eval's stack)` and the next
+                    // `Vm::new` fails the guard every time.
+                    let _ = jit::pin_scope_with_vm(self, scope);
+                    jit::fast_operators(self) != 0
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    self.engine.fast_operators()
+                }
+            }};
+        }
+
+        macro_rules! index_is_local {
+            () => {{
+                matches!(
+                    tag,
+                    code::tag::INDEX_GET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                )
+            }};
+        }
+
+        macro_rules! indexed_int {
+            ($offset:expr, $under:expr) => {{
+                let mut found = None;
+                if index_is_local!() {
+                    let at = base + small!($offset) as usize;
+                    if at < scope_len!() {
+                        if let Union::Int(i, ..) = scope_entry!(at).0 {
+                            found = Some(i);
+                        }
+                    }
+                } else if matches!(
+                    tag,
+                    code::tag::INDEX_GET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
+                ) {
+                    let index = u32::from(small!($offset));
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    if let Some(Union::Int(i, ..)) = constant.map(|value| &value.0) {
+                        found = Some(*i);
+                    }
+                } else if let Some(under) = $under {
+                    if let Union::Int(i, ..) = stack_ref(self, under).0 {
+                        found = Some(i);
+                    }
+                }
+                found
+            }};
+        }
+
+        macro_rules! operand_value {
+            ($offset:expr, $is_local:expr) => {{
+                if $is_local {
+                    let slot = small!($offset);
+                    let at = base + slot as usize;
+                    if at >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    let cell = scope_entry!(at);
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        // `flatten_clone_value` / `from_cell` are their
+                        // own jitcodes. The bound `dynamic_as_fast`
+                        // residual is the one-word owner.
+                        match jit::dynamic_as_fast(cell) {
+                            1 => Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite)),
+                            2 => Dynamic(Union::Bool(
+                                jit::fast_bool() != 0,
+                                0,
+                                AccessMode::ReadWrite,
+                            )),
+                            #[cfg(not(feature = "no_float"))]
+                            3 => Dynamic::from(jit::fast_float()),
+                            4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                            // A pooled range or other `Variant` is a real
+                            // cell. Cloning it is what the non-jit path
+                            // does; aborting here drops the exhaust bridge
+                            // that re-enters `for j in 0..end`.
+                            _ => {
+                                if jit::live_dynamic_ptr(cell) {
+                                    flatten_clone_value(cell)
+                                } else {
+                                    jit::request_walk_abort_abi();
+                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        flatten_clone_value(cell)
+                    }
+                } else {
+                    let index = u32::from(small!($offset));
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    let value = or_raise!(constant, malformed(format!("no constant {index}")));
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        match jit::dynamic_as_fast(value) {
+                            1 => Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite)),
+                            2 => Dynamic(Union::Bool(
+                                jit::fast_bool() != 0,
+                                0,
+                                AccessMode::ReadWrite,
+                            )),
+                            #[cfg(not(feature = "no_float"))]
+                            3 => Dynamic::from(jit::fast_float()),
+                            4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                            _ => {
+                                if jit::live_dynamic_ptr(value) {
+                                    clone_value(value)
+                                } else {
+                                    jit::request_walk_abort_abi();
+                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        clone_value(value)
+                    }
+                }
+            }};
+        }
+
+        macro_rules! indexed_value {
+            ($offset:expr) => {{
+                operand_value!($offset, index_is_local!())
+            }};
+        }
+
+        macro_rules! named_fast {
+            ($offset:expr, $is_local:expr) => {{
+                if $is_local {
+                    let slot = small!($offset);
+                    let at = base + slot as usize;
+                    if at >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    fast_from_cell!(scope_entry!(at))
+                } else {
+                    let index = u32::from(small!($offset));
+                    match jit::program_constant(program, index) {
+                        Some(value) => fast_from_cell!(value),
+                        None => {
+                            return Err(malformed(format!("no constant {index}")));
+                        }
+                    }
+                }
+            }};
+        }
+
+        macro_rules! assigned_value {
+            () => {{
+                operand_value!(7, false)
+            }};
+        }
+
+        macro_rules! transfer {
+            ($target:expr) => {{
+                let target: usize = $target;
+                let mut land = target;
+                if target <= pc {
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::track_operation_error(self, program, pc);
+                        jit_driver.can_enter_jit(
+                            target,
+                            program.jit_identity(),
+                            program,
+                            frame,
+                            self,
+                        );
+                        // The next iteration clears `jit_resume_pc_plus_one`
+                        // before reading it. Apply the exit merge point here,
+                        // where `can_enter_jit` just published it.
+                        if frame.jit_return_kind != 0 {
+                            *pc_slot = pc;
+                            return Ok(true);
+                        }
+                        if frame.jit_resume_pc_plus_one != 0 {
+                            land = frame.jit_resume_pc_plus_one - 1;
+                            frame.jit_resume_pc_plus_one = 0;
+                        }
+                    }
+                    // The position is a table lookup keyed on the
+                    // address, and metering only reports one when it
+                    // stops the run — so it is asked for behind the
+                    // check rather than in front of it.
+                    #[cfg(not(feature = "grain-jit"))]
+                    self.engine
+                        .track_operation_at(&mut self.global, || pos!())?;
+                }
+                pc = land;
+            }};
+        }
+
+        match tag {
+            code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
+                let index = u32::from(small!(1));
+                let flatten = tag == code::tag::LOAD_NAMED;
+                #[cfg(feature = "grain-jit")]
+                {
+                    if let Some(err) = jit::load_named_abi(
+                        self,
+                        program,
+                        scope,
+                        index,
+                        i64::from(flatten),
+                        jit::position_bits(pos!()),
+                    ) {
+                        return Err(err);
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let name = or_raise!(
+                        program_name!(program, index),
+                        malformed(format!("no name {index}"))
+                    );
+                    let value = self.load_named(name, scope, flatten, pos!())?;
+                    self.push(value);
+                    depth!(self.depth);
+                }
+            }
+
+            code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
+                let index = u32::from(small!(1));
+                let op = if tag == code::tag::ASSIGN_NAMED_OP {
+                    let index = u32::from(small!(3));
+                    #[cfg(feature = "grain-jit")]
+                    let assign_op = jit::program_assign_op(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let assign_op = program.assign_op(index);
+                    Some(or_raise!(
+                        assign_op,
+                        malformed(format!("no op-assignment {index}"))
+                    ))
+                } else {
+                    None
+                };
+
+                #[cfg(feature = "grain-jit")]
+                {
+                    if let Some(err) = jit::assign_named_abi(
+                        self,
+                        program,
+                        scope,
+                        index,
+                        op,
+                        jit::position_bits(pos!()),
+                    ) {
+                        return Err(err);
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let name = or_raise!(
+                        program_name!(program, index),
+                        malformed(format!("no name {index}"))
+                    );
+                    // Flattened before assigning, as Rhai does, so a shared
+                    // cell is copied out rather than aliased into the target.
+                    let rhs = self.pop()?.flatten();
+                    depth!(self.depth);
+                    self.assign_named(program, op, name, rhs, scope, pos!())?;
+                }
+            }
+            code::tag::LOAD_THIS | code::tag::LOAD_THIS_SHARED => {
+                let value = or_raise!(
+                    self.this.as_ref(),
+                    Box::new(EvalAltResult::ErrorUnboundThis(pos!()))
+                );
+                // Rhai's read is `this_ptr.cloned()` and does not flatten
+                // (`eval/expr.rs:272`); its consumers do. Which tag this is
+                // is which consumer asked.
+                push_word!(
+                    self,
+                    frame,
+                    if tag == code::tag::LOAD_THIS {
+                        flatten_clone_value(value)
+                    } else {
+                        clone_value(value)
+                    }
+                );
+            }
+
+            code::tag::REQUIRE_THIS => {
+                if self.this.is_none() {
+                    return Err(Box::new(EvalAltResult::ErrorUnboundThis(pos!())));
+                }
+            }
+
+            code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
+                let op = if tag == code::tag::ASSIGN_THIS_OP {
+                    let index = u32::from(small!(1));
+                    #[cfg(feature = "grain-jit")]
+                    let assign_op = jit::program_assign_op(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let assign_op = program.assign_op(index);
+                    Some(or_raise!(
+                        assign_op,
+                        malformed(format!("no op-assignment {index}"))
+                    ))
+                } else {
+                    None
+                };
+
+                // Flattened before assigning, as everywhere else.
+                let rhs = pop_word!(self, frame)?.flatten();
+
+                // Taken out of the register rather than borrowed from it:
+                // `store` wants the whole `Vm`, and a write lock into the
+                // field could not outlive that borrow. Put back on both
+                // paths — Rhai's mutation survives an error, and a frame
+                // that lost its receiver would answer `ErrorUnboundThis` to
+                // every read after this one.
+                let mut this = or_raise!(
+                    self.this.take(),
+                    Box::new(EvalAltResult::ErrorUnboundThis(pos!()))
+                );
+
+                let outcome = if this.is_read_only() {
+                    // Named for an expression that has no name, which is
+                    // what Rhai reports too (`eval/stmt.rs:118-122`).
+                    Err(Box::new(EvalAltResult::ErrorAssignmentToConstant(
+                        String::new(),
+                        pos!(),
+                    )))
+                } else {
+                    // Written through, not over: a shared receiver has to
+                    // keep its cell, as a captured local does.
+                    match place(&mut this, "", pos!()) {
+                        Ok(mut target) => self.store(program, op, &mut target, rhs, pos!()),
+                        Err(err) => Err(err),
+                    }
+                };
+
+                self.this = Some(this);
+                outcome?;
+            }
+            code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
+                let index = u32::from(small!(1));
+                let expr = or_raise!(
+                    program_entry!(program_residual, residual, program, index),
+                    malformed(format!("no residual {index}"))
+                );
+                let rewind_scope = tag == code::tag::EVAL_AST;
+
+                // Straight to the walker's own entry points rather than
+                // through `EvalContext::eval_expression_tree_raw`, which
+                // is the same two calls behind a shim that only exists
+                // under `custom_syntax`. Total language coverage rests on
+                // this, so it must not depend on a feature.
+                //
+                // The frame's receiver goes with it, by reference. A body
+                // that uses `this` can still hold a fragment — `this?.x`,
+                // or a `this` body containing an `import` — and the walker
+                // has to read and write the same receiver the surrounding
+                // instructions do. The engine is copied out first so the
+                // four borrows below are of disjoint fields.
+                let engine = self.engine;
+                let value = match expr {
+                    Expr::Stmt(block) => engine.eval_stmt_block(
+                        &mut self.global,
+                        &mut self.caches,
+                        scope,
+                        self.this.as_mut(),
+                        block.statements(),
+                        rewind_scope,
+                    ),
+                    expr => engine.eval_expr(
+                        &mut self.global,
+                        &mut self.caches,
+                        scope,
+                        self.this.as_mut(),
+                        expr,
+                    ),
+                }?;
+
+                push_word!(self, frame, value);
+            }
+            code::tag::CALL_LOCAL_REF
+            | code::tag::CALL_LOCAL_REF_CAPTURE
+            | code::tag::CALL_NAMED_REF
+            | code::tag::CALL_NAMED_REF_CAPTURE
+            | code::tag::CALL_THIS_REF
+            | code::tag::CALL_THIS_REF_CAPTURE => {
+                let name_index = u32::from(small!(1));
+                #[cfg(feature = "grain-jit")]
+                if jit::program_name(program, name_index) == 0 {
+                    return Err(malformed(format!("no name {name_index}")));
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                let name = or_raise!(
+                    program_name!(program, name_index),
+                    malformed(format!("no name {name_index}"))
+                );
+                let argc = byte!(3) as usize;
+                // `this` is a register, so this one carries no operand for
+                // the receiver and is two bytes shorter.
+                let receiver = match tag {
+                    code::tag::CALL_LOCAL_REF | code::tag::CALL_LOCAL_REF_CAPTURE => {
+                        Receiver::Local(small!(4))
+                    }
+                    code::tag::CALL_NAMED_REF | code::tag::CALL_NAMED_REF_CAPTURE => {
+                        Receiver::Named(u32::from(small!(4)))
+                    }
+                    code::tag::CALL_THIS_REF | code::tag::CALL_THIS_REF_CAPTURE => {
+                        Receiver::This
+                    }
+                    _ => unreachable!(),
+                };
+                let capture = matches!(
+                    tag,
+                    code::tag::CALL_LOCAL_REF_CAPTURE
+                        | code::tag::CALL_NAMED_REF_CAPTURE
+                        | code::tag::CALL_THIS_REF_CAPTURE
+                );
+
+                let value = {
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        let mut used_plain_add = false;
+                        if !capture
+                            && argc == 0
+                            && fast_operators!()
+                            && jit::name_is_abs(program, name_index) != 0
+                        {
+                            if let Receiver::Local(slot) = receiver {
+                                if let Some(err) = jit::call_plain_abs_ref_abi(
+                                    self,
+                                    scope,
+                                    base,
+                                    slot,
+                                    jit::position_bits(pos!()),
+                                ) {
+                                    return Err(err);
+                                }
+                                used_plain_add = jit::unary_builtin_handled() != 0;
+                            }
+                        }
+                        if !used_plain_add
+                            && !capture
+                            && argc == 1
+                            && fast_operators!()
+                            && jit::compiled_fn_is_plain_add(program, name_index, 2) != 0
+                        {
+                            if let (Receiver::Local(slot), Some(first)) =
+                                (receiver, depth!().checked_sub(1))
+                            {
+                                if let Some(err) =
+                                    jit::call_plain_add_ref_abi(self, scope, base, slot, first)
+                                {
+                                    return Err(err);
+                                }
+                                used_plain_add = jit::plain_add_handled() != 0;
+                            }
+                        }
+                        if !used_plain_add {
+                            let (receiver_kind, receiver_payload) = match receiver {
+                                Receiver::Local(slot) => (0, u32::from(slot)),
+                                Receiver::Named(index) => (1, index),
+                                Receiver::This => (2, 0),
+                            };
+                            if let Some(err) = jit::call_by_reference_abi(
+                                self,
+                                program,
+                                name_index,
+                                argc,
+                                receiver_kind,
+                                receiver_payload,
+                                scope,
+                                base,
+                                i64::from(capture),
+                                jit::position_bits(pos!()),
+                            ) {
+                                return Err(err);
+                            }
+                        }
+                        take_residual_push!()
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        self.call_by_reference(
+                            program,
+                            name_index,
+                            name,
+                            argc,
+                            receiver,
+                            scope,
+                            base,
+                            capture,
+                            pos!(),
+                        )?
+                    }
+                };
+                push_word!(self, frame, value);
+            }
+
+            code::tag::ROTATE => {
+                let under = byte!(1) as usize;
+                let top = or_raise!(
+                    depth!().checked_sub(1),
+                    malformed("rotate on an empty stack".to_string())
+                );
+                let to = or_raise!(
+                    top.checked_sub(under),
+                    malformed("rotate past the bottom".to_string())
+                );
+                self.values_mut()[to..].rotate_right(1);
+            }
+
+            // Emitted only for a literal, which is not syntax under the
+            // feature that removes the type.
+            #[cfg(not(feature = "no_index"))]
+            code::tag::MAKE_ARRAY => {
+                let len = small!(1) as usize;
+                let first = or_raise!(
+                    depth!().checked_sub(len),
+                    malformed("array with too few elements".to_string())
+                );
+
+                // The running total belongs to this literal and goes with
+                // it. `Op::CheckSize` is what filled it in, one element at
+                // a time, and what raised `ErrorDataTooLarge` against the
+                // element that tipped it over (`eval/expr.rs:307-330`).
+                //
+                // Only if there was one: an empty literal emits no
+                // `CheckSize` and pushed nothing, so popping here would
+                // take the *enclosing* literal's total — `[a, [], b]`.
+                if len > 0 {
+                    self.sizes.pop();
+                }
+
+                // Flattened, as Rhai does, so a shared cell is copied in
+                // rather than aliased.
+                self.depth = depth!();
+                let array: Array = self
+                    .take_values_from(first)
+                    .into_iter()
+                    .map(Dynamic::flatten)
+                    .collect();
+                depth!(self.depth);
+                push_word!(self, frame, Dynamic::from_array(array));
+            }
+
+            #[cfg(not(feature = "no_object"))]
+            code::tag::MAKE_MAP => {
+                let len = small!(1) as usize;
+                let first = or_raise!(
+                    depth!().checked_sub(2 * len + 1),
+                    malformed("map with too few operands".to_string())
+                );
+                // As for `MakeArray`: nothing was pushed for a literal
+                // with no computed entries, so nothing may be popped.
+                if len > 0 {
+                    self.sizes.pop();
+                }
+
+                self.depth = depth!();
+                let mut parts = self.take_values_from(first).into_iter();
+                depth!(self.depth);
+                let template = parts.next().expect("checked above");
+                let mut map = or_raise!(
+                    template.try_cast::<Map>(),
+                    malformed("map literal without a template".to_string())
+                );
+                while let Some(key) = parts.next() {
+                    let value = parts.next().expect("pairs, checked above");
+                    let key = match key.into_immutable_string() {
+                        Ok(key) => key,
+                        Err(actual) => {
+                            return Err(malformed(format!(
+                                "map key is a {actual}, not a string"
+                            )));
+                        }
+                    };
+                    // Flattened as Rhai does, so a shared cell is copied
+                    // in rather than aliased.
+                    map.insert(key.as_str().into(), value.flatten());
+                }
+                drop(parts);
+                push_word!(self, frame, Dynamic::from_map(map));
+            }
+
+            code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
+                let index = small!(1);
+                let map = tag == code::tag::CHECK_MAP_SIZE;
+                self.check_size(index, map, pos!())?;
+            }
+
+            code::tag::SWITCH => {
+                let index = u32::from(small!(1));
+                let table = or_raise!(
+                    program_entry!(program_switch, switch, program, index),
+                    malformed(format!("no switch {index}"))
+                );
+                // Always a jump: an arm that matched nothing still has the
+                // default to go to.
+                #[cfg(feature = "grain-jit")]
+                {
+                    // Hasher seed stays behind the residual. Integer arms
+                    // compare the subject against recovered case keys so
+                    // a taken arm is a guard in this loop.
+                    if let Some(err) = jit::switch_pop_subject(self, table) {
+                        return Err(err);
+                    }
+                    if jit::switch_subject_kind() == 1 {
+                        let value = jit::fast_int();
+                        let n = jit::switch_case_count(table);
+                        let mut i = 0i64;
+                        while i < n {
+                            if jit::switch_case_has_int(table, i) != 0
+                                && value == jit::switch_case_int_key(table, i)
+                            {
+                                let target = majit_metainterp::jit::promote(
+                                    jit::switch_case_target(table, i) as usize,
+                                );
+                                transfer!(target);
+                                *pc_slot = pc;
+                                return Ok(true);
+                            }
+                            i += 1;
+                        }
+                        let ranges = jit::switch_range_count(table);
+                        let mut j = 0i64;
+                        while j < ranges {
+                            let from = jit::switch_range_from(table, j);
+                            let to = jit::switch_range_to(table, j);
+                            let hits = if jit::switch_range_inclusive(table, j) != 0 {
+                                value >= from && value <= to
+                            } else {
+                                value >= from && value < to
+                            };
+                            if hits {
+                                let target = majit_metainterp::jit::promote(
+                                    jit::switch_range_target(table, j) as usize,
+                                );
+                                transfer!(target);
+                                *pc_slot = pc;
+                                return Ok(true);
+                            }
+                            j += 1;
+                        }
+                        let target =
+                            majit_metainterp::jit::promote(jit::switch_default(table) as usize);
+                        transfer!(target);
+                        *pc_slot = pc;
+                        return Ok(true);
+                    }
+                    let target = jit::switch_target() as usize;
+                    let n = jit::switch_case_count(table);
+                    let mut i = 0i64;
+                    while i < n {
+                        let arm = jit::switch_case_target(table, i) as usize;
+                        if target == arm {
+                            transfer!(majit_metainterp::jit::promote(arm));
+                            *pc_slot = pc;
+                            return Ok(true);
+                        }
+                        i += 1;
+                    }
+                    let ranges = jit::switch_range_count(table);
+                    let mut j = 0i64;
+                    while j < ranges {
+                        let arm = jit::switch_range_target(table, j) as usize;
+                        if target == arm {
+                            transfer!(majit_metainterp::jit::promote(arm));
+                            *pc_slot = pc;
+                            return Ok(true);
+                        }
+                        j += 1;
+                    }
+                    transfer!(majit_metainterp::jit::promote(
+                        jit::switch_default(table) as usize,
+                    ));
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let subject = self.pop()?;
+                    depth!(self.depth);
+                    let target = table.dispatch(&subject) as usize;
+                    release(subject);
+                    transfer!(target);
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+            }
+
+            code::tag::LOAD_SHARED => {
+                let slot = small!(1);
+                let index = base + slot as usize;
+                if index >= scope_len!() {
+                    return Err(malformed(format!("local slot {slot} is out of scope")));
+                }
+                // Cloned, not flattened: cloning a shared `Dynamic` clones
+                // the `Rc`, which is the capture.
+                push_word!(self, frame, clone_value(scope_entry!(index)));
+            }
+
+            // Emitted only for a closure capture, which cannot be parsed
+            // under `no_closure`.
+            #[cfg(not(feature = "no_closure"))]
+            code::tag::SHARE | code::tag::SHARE_NAMED => {
+                if tag == code::tag::SHARE_NAMED {
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        let name_index = u32::from(small!(1));
+                        if let Some(err) = jit::share_named_abi(
+                            self,
+                            program,
+                            scope,
+                            name_index,
+                            jit::position_bits(pos!()),
+                        ) {
+                            return Err(err);
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        let name_index = u32::from(small!(1));
+                        self.share_named(program, scope, name_index, pos!())?;
+                    }
+                } else {
+                    let slot = small!(1);
+                    let index = base + slot as usize;
+                    if index >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    let value = scope_entry!(index);
+                    if !value.is_shared() {
+                        let shared = value.take().into_shared();
+                        store_value(value, shared);
+                    }
+                }
+            }
+
+            code::tag::MAKE_CLOSURE => {
+                let index = u32::from(small!(1));
+                #[cfg(feature = "grain-jit")]
+                {
+                    if let Some(err) =
+                        jit::make_closure_abi(self, program, index, jit::position_bits(pos!()))
+                    {
+                        return Err(err);
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let name = or_raise!(
+                        program_name!(program, index),
+                        malformed(format!("no name {index}"))
+                    );
+                    // Non-validated, because `anon$…` is not a name a script could
+                    // have written and the validating constructors refuse it.
+                    // Nothing unsound rides on that check — a name that will
+                    // not resolve simply fails when the pointer is called.
+                    //
+                    // Carrying the body where there is a share of the program
+                    // to carry, which is what spares a native the lookup on
+                    // every element. See [`callback::pointer`].
+                    debug_assert!(
+                        self.callbacks
+                            .as_ref()
+                            .map_or(true, |owned| core::ptr::eq(&**owned, program)),
+                        "a pointer would be handed out carrying a program this frame is not running"
+                    );
+                    let typ = self
+                        .callbacks
+                        .as_ref()
+                        .and_then(|owned| callback::pointer(owned, index, name))
+                        .unwrap_or(FnPtrType::Normal);
+                    push_word!(
+                        self,
+                        frame,
+                        FnPtr {
+                            name: name.into(),
+                            curry: Default::default(),
+                            #[cfg(not(feature = "no_function"))]
+                            env: None,
+                            typ,
+                        }
+                        .into()
+                    );
+                }
+            }
+
+            #[cfg(not(feature = "no_closure"))]
+            code::tag::IS_SHARED => {
+                let value = pop_word!(self, frame)?;
+                push_word!(self, frame, value.is_shared().into());
+            }
+
+            code::tag::MAKE_FN_PTR => {
+                let name = pop_word!(self, frame)?;
+                let name = match name.into_immutable_string() {
+                    Ok(name) => name,
+                    Err(actual) => {
+                        return Err(self.mismatch::<ImmutableString>(actual, pos!()));
+                    }
+                };
+                // Validates that the name is an identifier, as Rhai's own
+                // `Fn(..)` does (`func/call.rs:1215`).
+                let pointer = match FnPtr::new(name) {
+                    Ok(pointer) => pointer,
+                    Err(mut err) => {
+                        if err.position().is_none() {
+                            err.set_position(pos!());
+                        }
+                        return Err(err);
+                    }
+                };
+                push_word!(self, frame, pointer.into());
+            }
+
+            code::tag::CURRY => {
+                let argc = byte!(1) as usize;
+                let at = or_raise!(
+                    depth!().checked_sub(argc + 1),
+                    malformed("curry is missing its target".into())
+                );
+                let mut pointer = or_raise!(
+                    clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
+                    self.mismatch::<FnPtr>(operand_ref(&self.stack[at]).type_name(), pos!())
+                );
+                self.depth = depth!();
+                for value in self.take_values_from(at + 1) {
+                    pointer.add_curry(value);
+                }
+                depth!(self.depth);
+                truncate_stack!(at);
+                push_word!(self, frame, pointer.into());
+            }
+
+            code::tag::CALL_FN_PTR
+            | code::tag::CALL_FN_PTR_METHOD
+            | code::tag::CALL_FN_PTR_ON_LOCAL
+            | code::tag::CALL_FN_PTR_ON_NAMED
+            | code::tag::CALL_FN_PTR_ON_THIS => {
+                let argc = byte!(1) as usize;
+                let method = tag != code::tag::CALL_FN_PTR;
+                let receiver = match tag {
+                    code::tag::CALL_FN_PTR_ON_LOCAL => Some(Receiver::Local(small!(2))),
+                    code::tag::CALL_FN_PTR_ON_NAMED => {
+                        Some(Receiver::Named(u32::from(small!(2))))
+                    }
+                    code::tag::CALL_FN_PTR_ON_THIS => Some(Receiver::This),
+                    _ => None,
+                };
+                self.depth = depth!();
+                let value =
+                    self.call_fn_ptr(program, argc, method, receiver, scope, base, pos!())?;
+                depth!(self.depth);
+                push_word!(self, frame, value);
+            }
+
+            code::tag::INTERPOLATE_START => {
+                push_word!(self, frame, self.engine.const_empty_string().into());
+            }
+
+            code::tag::INTERPOLATE_APPEND => {
+                let segment = pop_word!(self, frame)?;
+                self.append_segment(segment, pos!())?;
+            }
+
+            code::tag::INTERPOLATE_END => {
+                let buffer = pop_word!(self, frame)?;
+                let Ok(text) = buffer.into_immutable_string() else {
+                    return Err(malformed("interpolation lost its buffer".into()));
+                };
+                // Interned, as Rhai does: the same rendered string in ten
+                // places is one allocation, which is the whole reason the
+                // engine keeps an interner.
+                let value = self.engine.get_interned_string(text.as_str());
+                push_word!(self, frame, value.into());
+            }
+
+            code::tag::CHAIN | code::tag::CHAIN_DISCARD => {
+                let index = u32::from(small!(1));
+                let chain = or_raise!(
+                    program_entry!(program_chain, chain, program, index),
+                    malformed(format!("no chain {index}"))
+                );
+                // An assignment is not an expression here: what it
+                // evaluates to is the `Op::Unit` beside it, emitted only
+                // where something reads it. A read in statement position
+                // has nothing behind it to take its value off again, and
+                // says so in its tag; the walk itself is the same either
+                // way, so a chain that raises raises identically.
+                let keeps = chain_tail(chain) == TAIL_READ && tag != code::tag::CHAIN_DISCARD;
+                eval_chain!(chain, index, keeps);
+            }
+            code::tag::ITER_INIT => {
+                #[cfg(feature = "grain-jit")]
+                {
+                    // The range `Dynamic` stays inside the residual.
+                    // Tracing `stack_take` of it is the exhaust bridge's
+                    // `BC_ABORT` in `stack_take`.
+                    if let Some(err) = jit::iter_init_from_top(self, jit::position_bits(pos!()))
+                    {
+                        return Err(err);
+                    }
+                    // `valuestackdepth += 1` after the iterator push.
+                    // `iterators.len()` is `dont_look_inside_cannot_raise`
+                    // and CSE-folds across the pop, leaving dest peeking
+                    // the inner index after that iterator is gone.
+                    frame.iter_depth += 1;
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let iterable = self.pop()?;
+                    depth!(self.depth);
+                    self.iter_init(iterable, pos!())?;
+                }
+            }
+
+            code::tag::ITER_DROP => {
+                self.iterators.pop();
+                #[cfg(feature = "grain-jit")]
+                {
+                    frame.iter_depth -= 1;
+                }
+            }
+
+            code::tag::ITER_NEXT
+            | code::tag::ITER_NEXT_INDEXED
+            | code::tag::ITER_NEXT_STORE => {
+                let body = wide!(1) as usize;
+                #[cfg(feature = "grain-jit")]
+                if tag == code::tag::ITER_NEXT_STORE {
+                    // Integer `for i in 0..n` walks `Items::IntRange` in
+                    // the portal: `next`/`end` stay machine integers, so
+                    // the turn never builds a `Dynamic` (that store is
+                    // `__deref_write`). A boxed iterator stays behind
+                    // [`iter_next_store`].
+                    let slot = small!(5);
+                    let index = base + slot as usize;
+                    if index >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    // `FOR_ITER` / `peekvalue`: `scope` and `vm` stay
+                    // live together at the peek so dest cannot colour
+                    // the Vm loc as `scope`. Depth is a vable int.
+                    let dest_depth = frame.iter_depth;
+                    let iteration = or_raise!(
+                        jit::dest_iteration_at(self, scope, dest_depth.wrapping_sub(1)),
+                        malformed("no iterator to advance".to_string())
+                    );
+                    let range_next = match &iteration.items {
+                        Items::IntRange { next, end } => {
+                            if *next >= *end {
+                                None
+                            } else {
+                                Some(*next)
+                            }
+                        }
+                        Items::IntStepRange { next, end, step } => {
+                            if *step > 0 {
+                                if *next >= *end {
+                                    None
+                                } else {
+                                    Some(*next)
+                                }
+                            } else if *step < 0 {
+                                if *next <= *end {
+                                    None
+                                } else {
+                                    Some(*next)
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        _ => {
+                            if let Some(err) = jit::iter_next_store(
+                                self,
+                                scope,
+                                index,
+                                jit::position_bits(pos!()),
+                            ) {
+                                return Err(err);
+                            }
+                            if jit::iter_next_produced() == 0 {
+                                frame.iter_depth -= 1;
+                                // `FOR_ITER` exhaust: `next_instr += jumpby`.
+                                transfer!(pc + width);
+                                *pc_slot = pc;
+                                return Ok(true);
+                            }
+                            transfer!(body);
+                            *pc_slot = pc;
+                            return Ok(true);
+                        }
+                    };
+                    if let Some(n) = range_next {
+                        let next = match &iteration.items {
+                            Items::IntStepRange { step, .. } => n.wrapping_add(*step),
+                            _ => n.wrapping_add(1),
+                        };
+                        jit::store_int_range_next(&mut iteration.items, next);
+                        if iteration.count == INT::MAX {
+                            return Err(Box::new(EvalAltResult::ErrorArithmetic(
+                                format!("for-loop counter overflow: {}", iteration.count),
+                                pos!(),
+                            )));
+                        }
+                        jit::store_iteration_count(iteration, iteration.count.wrapping_add(1));
+                        let entry = scope_entry!(index);
+                        if let Union::Int(..) = &entry.0 {
+                            jit::dynamic_store_int(entry, n);
+                        } else {
+                            // Packed bits. The store builds the Position.
+                            jit::store_scope_int(
+                                scope,
+                                index,
+                                n,
+                                jit::code_position_bits(program, pc),
+                            );
+                        }
+                        transfer!(body);
+                        *pc_slot = pc;
+                        return Ok(true);
+                    }
+                    // `FOR_ITER` exhaust is `next_instr += jumpby`,
+                    // not fall-through. A compiled dest loop that
+                    // JUMP dest here re-enters dest and peeks the
+                    // outer iterator.
+                    jit::iterators_pop(self);
+                    frame.iter_depth -= 1;
+                    transfer!(pc + width);
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+                {
+                    let iteration = or_raise!(
+                        {
+                            #[cfg(feature = "grain-jit")]
+                            {
+                                let dest_depth = frame.iter_depth;
+                                jit::dest_iteration_at(self, scope, dest_depth.wrapping_sub(1))
+                            }
+                            #[cfg(not(feature = "grain-jit"))]
+                            {
+                                self.iterators.last_mut()
+                            }
+                        },
+                        malformed("no iterator to advance".to_string())
+                    );
+                    let Some(item) = iteration.items.next() else {
+                        // `FOR_ITER` exhaust: `next_instr += jumpby`.
+                        self.iterators.pop();
+                        #[cfg(feature = "grain-jit")]
+                        {
+                            frame.iter_depth -= 1;
+                        }
+                        transfer!(pc + width);
+                        *pc_slot = pc;
+                        return Ok(true);
+                    };
+
+                    // Counted before the item is unwrapped, as Rhai does, so a
+                    // loop long enough to wrap the counter is an error rather
+                    // than a wrap.
+                    // Spelled as the equality rather than as `checked_add`:
+                    // adding one overflows exactly at the maximum, and the
+                    // `Option` that spelling returns is consumed by an arm
+                    // that returns rather than rejoining — a shape the signed
+                    // overflow lowering declines, leaving a residual call
+                    // whose `core` target the build cannot address.
+                    if iteration.count == INT::MAX {
+                        return Err(Box::new(EvalAltResult::ErrorArithmetic(
+                            format!("for-loop counter overflow: {}", iteration.count),
+                            pos!(),
+                        )));
+                    }
+                    iteration.count += 1;
+                    let count = iteration.count;
+
+                    // A fallible iterator's error is positioned at the
+                    // iterable, and only if it brought none of its own
+                    // (`eval/stmt.rs:749`).
+                    let value = match item {
+                        Ok(value) => value,
+                        Err(mut err) => {
+                            if err.position().is_none() {
+                                err.set_position(pos!());
+                            }
+                            return Err(err);
+                        }
+                    };
+
+                    #[cfg(not(feature = "grain-jit"))]
+                    if tag == code::tag::ITER_NEXT_STORE {
+                        // The `Op::StoreShared` this swallowed, which is where
+                        // the loop variable is written on every turn. The
+                        // grain-jit build handles this tag before
+                        // `items.next()`.
+                        let slot = small!(5);
+                        let index = base + slot as usize;
+                        if index >= scope_len!() {
+                            return Err(malformed(format!(
+                                "local slot {slot} is out of scope"
+                            )));
+                        }
+                        store_shared(scope_entry!(index), value.flatten(), pos!())?;
+                    } else {
+                        if tag == code::tag::ITER_NEXT_INDEXED {
+                            push_word!(self, frame, Dynamic::from(count));
+                        }
+                        push_word!(self, frame, value.flatten());
+                    }
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        if tag == code::tag::ITER_NEXT_INDEXED {
+                            push_word!(self, frame, Dynamic::from(count));
+                        }
+                        push_word!(self, frame, value.flatten());
+                    }
+
+                    // The back edge, so the turn is metered and the JIT driver
+                    // is consulted here rather than at a jump of the body's.
+                    transfer!(body);
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+            }
+            _ => unreachable!("cold tag"),
+        }
+        *pc_slot = pc;
+        Ok(false)
+    }
+
+    #[cfg_attr(feature = "grain-jit", majit_macros::unroll_safe)]
+    #[inline(never)]
+    fn dispatch_tail(
+        &mut self,
+        frame: &mut GrainFrame<'_, '_>,
+        program: &Program<'_>,
+        pc_slot: &mut usize,
+        base: usize,
+        width: usize,
+        jitted: bool,
+        generation: u64,
+        form: u16,
+        named_is_local: bool,
+        typed: bool,
+        branching: bool,
+        taken_when: bool,
+        unary: bool,
+        #[cfg(feature = "grain-jit")] jit_driver: &jit::GrainJitDriver,
+    ) -> Result<bool, Box<EvalAltResult>> {
+        let mut pc = *pc_slot;
+        let scope = &mut *frame.scope;
+        #[cfg(feature = "grain-jit")]
+        macro_rules! depth {
+            () => {
+                frame.operand_depth
+            };
+            ($new:expr) => {{
+                frame.operand_depth = $new;
+            }};
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        macro_rules! depth {
+            () => {
+                self.depth
+            };
+            ($new:expr) => {{
+                self.depth = $new;
+            }};
+        }
+
+        macro_rules! scope_len {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::scope_len(scope) as usize
+                    } else {
+                        scope.len()
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    scope.len()
+                }
+            }};
+        }
+
+        macro_rules! scope_entry {
+            ($index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::scope_entry(scope, $index)
+                    } else {
+                        scope.get_mut_by_index($index)
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    scope.get_mut_by_index($index)
+                }
+            }};
+        }
+
+        macro_rules! program_entry {
+            ($jit:ident, $plain:ident, $program:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::$jit($program, $index)
+                    } else {
+                        $program.$plain($index)
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    $program.$plain($index)
+                }
+            }};
+        }
+
+        macro_rules! array_entry_mut {
+            ($array:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::array_entry_mut($array, $index)
+                    } else {
+                        &mut $array[$index]
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    &mut $array[$index]
+                }
+            }};
+        }
+
+        macro_rules! array_entry {
+            ($array:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::array_entry($array, $index)
+                    } else {
+                        &$array[$index]
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    &$array[$index]
+                }
+            }};
+        }
+
+        macro_rules! truncate_stack {
+            ($depth:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    let new_depth = $depth;
+                    let old_depth = depth!();
+                    if new_depth < old_depth {
+                        let end = old_depth.min(STACK_WORDS);
+                        let start = new_depth.min(end);
+                        let mut slot = start;
+                        while slot < end {
+                            frame.operand_tags[slot] = 0;
+                            slot += 1;
+                        }
+                    }
+                    self.depth = depth!();
+                    if jitted {
+                        jit::truncate_stack(self, new_depth);
+                    } else {
+                        self.truncate_stack(new_depth);
+                    }
+                    depth!(new_depth);
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    self.truncate_stack($depth);
+                    depth!(self.depth);
+                }
+            }};
+        }
+
+        macro_rules! take_residual_push {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    // The residual wrote `Vm.stack` and did not update the
+                    // scalar tag. Popping through the tag would replay the
+                    // previous word.
+                    depth!(jit::vm_depth(self) as usize);
+                    let depth = or_raise!(
+                        depth!().checked_sub(1),
+                        malformed("operand stack underflow".to_string())
+                    );
+                    depth!(depth);
+                    if depth < STACK_WORDS {
+                        frame.operand_tags[depth] = 0;
+                        let cleared = 0i64;
+                        frame.operand_words[depth] = cleared;
+                    }
+                    stack_take(self, depth)
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    pop_unit_word!(self, frame)
+                }
+            }};
+        }
+
+        macro_rules! eval_chain {
+            ($chain:expr, $index:expr, $keeps:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if let Some(err) = jit::run_chain_abi(
+                        self,
+                        program,
+                        $chain,
+                        $index,
+                        scope,
+                        base,
+                        jit::position_bits(pos!()),
+                    ) {
+                        return Err(err);
+                    }
+                    depth!(jit::vm_depth(self) as usize);
+                    if !$keeps {
+                        let floor = depth!().saturating_sub(1);
+                        truncate_stack!(floor);
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let value =
+                        self.run_chain_inner(program, $chain, $index, scope, base, pos!())?;
+                    if $keeps {
+                        self.push(value);
+                        depth!(self.depth);
+                    } else {
+                        drop(value);
+                    }
+                }
+            }};
+        }
+
+        macro_rules! small {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_u16(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u16,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match code::u16_at(program.code(), pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! wide {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_u32(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u32,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match code::u32_at(program.code(), pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! pos {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    jit::code_position(program, pc)
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    program.position(pc)
+                }
+            }};
+        }
+
+        macro_rules! byte {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_byte(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u8,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match program.code().get(pc + $offset) {
+                        Some(operand) => *operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! fast_operators {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    // Keep the merge-point Vm in its reserved register
+                    // across this deopt. Without the pin, the colourer
+                    // reuses that slot for `scope` and the compiled
+                    // guard's failargs drop the Vm; resume then bakes
+                    // `ConstPtr(this eval's stack)` and the next
+                    // `Vm::new` fails the guard every time.
+                    let _ = jit::pin_scope_with_vm(self, scope);
+                    jit::fast_operators(self) != 0
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    self.engine.fast_operators()
+                }
+            }};
+        }
+
+        macro_rules! index_is_local {
+            () => {{
+                matches!(
+                    tag,
+                    code::tag::INDEX_GET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                )
+            }};
+        }
+
+        macro_rules! indexed_int {
+            ($offset:expr, $under:expr) => {{
+                let mut found = None;
+                if index_is_local!() {
+                    let at = base + small!($offset) as usize;
+                    if at < scope_len!() {
+                        if let Union::Int(i, ..) = scope_entry!(at).0 {
+                            found = Some(i);
+                        }
+                    }
+                } else if matches!(
+                    tag,
+                    code::tag::INDEX_GET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
+                ) {
+                    let index = u32::from(small!($offset));
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    if let Some(Union::Int(i, ..)) = constant.map(|value| &value.0) {
+                        found = Some(*i);
+                    }
+                } else if let Some(under) = $under {
+                    if let Union::Int(i, ..) = stack_ref(self, under).0 {
+                        found = Some(i);
+                    }
+                }
+                found
+            }};
+        }
+
+        macro_rules! operand_value {
+            ($offset:expr, $is_local:expr) => {{
+                if $is_local {
+                    let slot = small!($offset);
+                    let at = base + slot as usize;
+                    if at >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    let cell = scope_entry!(at);
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        // `flatten_clone_value` / `from_cell` are their
+                        // own jitcodes. The bound `dynamic_as_fast`
+                        // residual is the one-word owner.
+                        match jit::dynamic_as_fast(cell) {
+                            1 => Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite)),
+                            2 => Dynamic(Union::Bool(
+                                jit::fast_bool() != 0,
+                                0,
+                                AccessMode::ReadWrite,
+                            )),
+                            #[cfg(not(feature = "no_float"))]
+                            3 => Dynamic::from(jit::fast_float()),
+                            4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                            // A pooled range or other `Variant` is a real
+                            // cell. Cloning it is what the non-jit path
+                            // does; aborting here drops the exhaust bridge
+                            // that re-enters `for j in 0..end`.
+                            _ => {
+                                if jit::live_dynamic_ptr(cell) {
+                                    flatten_clone_value(cell)
+                                } else {
+                                    jit::request_walk_abort_abi();
+                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        flatten_clone_value(cell)
+                    }
+                } else {
+                    let index = u32::from(small!($offset));
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    let value = or_raise!(constant, malformed(format!("no constant {index}")));
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        match jit::dynamic_as_fast(value) {
+                            1 => Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite)),
+                            2 => Dynamic(Union::Bool(
+                                jit::fast_bool() != 0,
+                                0,
+                                AccessMode::ReadWrite,
+                            )),
+                            #[cfg(not(feature = "no_float"))]
+                            3 => Dynamic::from(jit::fast_float()),
+                            4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                            _ => {
+                                if jit::live_dynamic_ptr(value) {
+                                    clone_value(value)
+                                } else {
+                                    jit::request_walk_abort_abi();
+                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        clone_value(value)
+                    }
+                }
+            }};
+        }
+
+        macro_rules! indexed_value {
+            ($offset:expr) => {{
+                operand_value!($offset, index_is_local!())
+            }};
+        }
+
+        macro_rules! named_fast {
+            ($offset:expr, $is_local:expr) => {{
+                if $is_local {
+                    let slot = small!($offset);
+                    let at = base + slot as usize;
+                    if at >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    fast_from_cell!(scope_entry!(at))
+                } else {
+                    let index = u32::from(small!($offset));
+                    match jit::program_constant(program, index) {
+                        Some(value) => fast_from_cell!(value),
+                        None => {
+                            return Err(malformed(format!("no constant {index}")));
+                        }
+                    }
+                }
+            }};
+        }
+
+        macro_rules! assigned_value {
+            () => {{
+                operand_value!(7, false)
+            }};
+        }
+
+        macro_rules! transfer {
+            ($target:expr) => {{
+                let target: usize = $target;
+                let mut land = target;
+                if target <= pc {
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::track_operation_error(self, program, pc);
+                        jit_driver.can_enter_jit(
+                            target,
+                            program.jit_identity(),
+                            program,
+                            frame,
+                            self,
+                        );
+                        // The next iteration clears `jit_resume_pc_plus_one`
+                        // before reading it. Apply the exit merge point here,
+                        // where `can_enter_jit` just published it.
+                        if frame.jit_return_kind != 0 {
+                            *pc_slot = pc;
+                            return Ok(true);
+                        }
+                        if frame.jit_resume_pc_plus_one != 0 {
+                            land = frame.jit_resume_pc_plus_one - 1;
+                            frame.jit_resume_pc_plus_one = 0;
+                        }
+                    }
+                    // The position is a table lookup keyed on the
+                    // address, and metering only reports one when it
+                    // stops the run — so it is asked for behind the
+                    // check rather than in front of it.
+                    #[cfg(not(feature = "grain-jit"))]
+                    self.engine
+                        .track_operation_at(&mut self.global, || pos!())?;
+                }
+                pc = land;
+            }};
+        }
+
+
+        macro_rules! deliver {
+            ($floor:expr, $value:expr) => {{
+                let value = $value;
+                truncate_stack!($floor);
+                if !branching {
+                    push_word!(self, frame, value);
+                } else {
+                    let holds = self.guard_holds(&value, pos!())?;
+                    release(value);
+                    if holds == taken_when {
+                        transfer!(wide!(width - 4) as usize);
+                        *pc_slot = pc;
+                        return Ok(true);
+                    }
+                }
+            }};
+        }
+        let name_index = u32::from(small!(1));
+        #[cfg(feature = "grain-jit")]
+        if jit::program_name(program, name_index) == 0 {
+            return Err(malformed(format!("no name {name_index}")));
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        let name = or_raise!(
+            program_name!(program, name_index),
+            malformed(format!("no name {name_index}"))
+        );
+        let capture = form & code::form::CAPTURES != 0;
+        // The kind byte sits where an argument count would, because
+        // an operator's count is always two — or, for `UN_OP`, one.
+        let argc = if typed {
+            2
+        } else if unary {
+            1
+        } else {
+            byte!(3) as usize
+        };
+        let op = if form & code::form::POOLED_OP != 0 {
+            let index = u32::from(small!(4));
+            Some(or_raise!(
+                program_entry!(program_token, token, program, index),
+                malformed(format!("no operator {index}"))
+            ))
+        } else {
+            None
+        };
+
+        let first = or_raise!(
+            depth!().checked_sub(argc),
+            malformed("call with too few arguments".to_string())
+        );
+
+        // Reach the same built-in the walker reaches. Gated on
+        // Rhai's own `fast_operators()` rather than a guard of our
+        // own, so an engine that turns it off gets the dispatch
+        // path on both sides, and one that leaves it on gets the
+        // same answer — including for a user-registered operator
+        // on a primitive, which Rhai's fast path also bypasses
+        // (`func/call.rs:1775-1799`).
+        #[cfg(feature = "grain-jit")]
+        if let (Some(token), 2) = (op, argc) {
+            if self.stack.len() < depth!() {
+                self.grow_stack(depth!() - self.stack.len());
+            }
+            let mut slot = first;
+            let top_slot = depth!().min(STACK_WORDS);
+            while slot < top_slot {
+                let tag = frame.operand_tags[slot];
+                if tag != 0 {
+                    let word = frame.operand_words[slot];
+                    *operand_mut(&mut self.stack[slot]) = dynamic_from_word(tag, word);
+                }
+                slot += 1;
+            }
+            if let Some(err) = jit::operator_builtin_abi(
+                self,
+                program,
+                token,
+                name_index,
+                first,
+                generation,
+                pc,
+                jit::position_bits(pos!()),
+            ) {
+                return Err(err);
+            }
+            if jit::operator_builtin_handled() != 0 {
+                let value = take_residual_push!();
+                deliver!(first, value);
+                pc += width;
+                *pc_slot = pc;
+                return Ok(true);
+            }
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        if let (Some(token), 2, true) = (op, argc, fast_operators!()) {
+            // Flattened first, as Rhai flattens both operands
+            // before it looks for a built-in
+            // (`func/call.rs:1890-1898`). A shared cell reaches
+            // `get_builtin_binary_op_fn` as `Union::Shared`, which
+            // its variant match has no arm for; the type-id
+            // comparison after that match reads through the cell,
+            // finds two equal numeric types and answers "same type
+            // but no built-in" — so the operator resolves to
+            // nothing and the dispatch reports a function that was
+            // never missing. An operand the instruction named
+            // arrives flattened already, because `operand_value!`
+            // reads it out with `flatten_clone`; this is the one
+            // that came off the stack, where a native's return
+            // value is the only thing that puts a cell.
+            for slot in first..depth!() {
+                if is_shared!(*stack_ref(self, slot)) {
+                    let held = mem::replace(stack_mut(self, slot), unit_value());
+                    store_value(stack_mut(self, slot), held.flatten());
+                }
+            }
+            let memo = &mut self.operator_memo;
+            let top = depth!();
+            let (lhs, rhs) = self.stack[..top].split_at_mut(first + 1);
+            let lhs = &mut lhs[first];
+            let rhs = &mut rhs[0];
+
+            // Custom types go to dispatch first, so a registered
+            // function still wins for them.
+            let builtin = (!lhs.is_variant() && !rhs.is_variant())
+                .then(|| resolve_operator(memo, generation, pc, token, lhs, rhs))
+                .flatten();
+            if let Some((func, need_context)) = builtin {
+                let context = need_context
+                    .then(|| (self.engine, name, None, &self.global, pos!()).into());
+                let value = func(context, &mut [lhs, rhs])?;
+                deliver!(first, value);
+                pc += width;
+                *pc_slot = pc;
+                return Ok(true);
+            }
+        }
+
+        // Check if it is a built-in syntactic function.
+        let value = {
+            #[cfg(feature = "grain-jit")]
+            {
+                if argc == 2
+                    && fast_operators!()
+                    && jit::compiled_fn_is_plain_add(program, name_index, argc) != 0
+                {
+                    if let Some(err) = jit::call_plain_add_abi(self, first) {
+                        return Err(err);
+                    }
+                    if jit::plain_add_handled() != 0 {
+                        let value = take_residual_push!();
+                        deliver!(first, value);
+                        pc += width;
+                        *pc_slot = pc;
+                        return Ok(true);
+                    }
+                }
+                if argc == 1 && jit::name_is_abs(program, name_index) != 0 {
+                    if let Some(err) = jit::unary_builtin_abi(
+                        self,
+                        program,
+                        name_index,
+                        first,
+                        jit::position_bits(pos!()),
+                    ) {
+                        return Err(err);
+                    }
+                    if jit::unary_builtin_handled() != 0 {
+                        let value = take_residual_push!();
+                        deliver!(first, value);
+                        pc += width;
+                        *pc_slot = pc;
+                        return Ok(true);
+                    }
+                }
+                if let Some(err) = jit::call_syntactic_or_stacked_abi(
+                    self,
+                    program,
+                    name_index,
+                    argc,
+                    first,
+                    scope,
+                    i64::from(capture),
+                    jit::position_bits(pos!()),
+                ) {
+                    return Err(err);
+                }
+                depth!(jit::vm_depth(self) as usize);
+                if !branching && jit::reseat_top_to_floor(self, first) != 0 {
+                    depth!(jit::vm_depth(self) as usize);
+                    pc += width;
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+                take_residual_push!()
+            }
+            #[cfg(not(feature = "grain-jit"))]
+            {
+                self.call_syntactic_or_stacked(
+                    program,
+                    name_index,
+                    name,
+                    argc,
+                    first,
+                    scope,
+                    capture,
+                    pos!(),
+                )?
+            }
+        };
+        deliver!(first, value);
+        *pc_slot = pc;
+        Ok(false)
+    }
+
     #[inline(always)]
     fn run_frame(
         &mut self,
@@ -8156,74 +10329,53 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
-                    let index = u32::from(small!(1));
-                    let flatten = tag == code::tag::LOAD_NAMED;
-                    #[cfg(feature = "grain-jit")]
-                    {
-                        if let Some(err) = jit::load_named_abi(
-                            self,
-                            program,
-                            scope,
-                            index,
-                            i64::from(flatten),
-                            jit::position_bits(pos!()),
-                        ) {
-                            return Err(err);
-                        }
-                    }
                     #[cfg(not(feature = "grain-jit"))]
-                    {
-                        let name = or_raise!(
-                            program_name!(program, index),
-                            malformed(format!("no name {index}"))
-                        );
-                        let value = self.load_named(name, scope, flatten, pos!())?;
-                        self.push(value);
-                        depth!(self.depth);
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
                 }
 
-                code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
-                    let index = u32::from(small!(1));
-                    let op = if tag == code::tag::ASSIGN_NAMED_OP {
-                        let index = u32::from(small!(3));
-                        #[cfg(feature = "grain-jit")]
-                        let assign_op = jit::program_assign_op(program, index);
-                        #[cfg(not(feature = "grain-jit"))]
-                        let assign_op = program.assign_op(index);
-                        Some(or_raise!(
-                            assign_op,
-                            malformed(format!("no op-assignment {index}"))
-                        ))
-                    } else {
-                        None
-                    };
 
-                    #[cfg(feature = "grain-jit")]
-                    {
-                        if let Some(err) = jit::assign_named_abi(
-                            self,
-                            program,
-                            scope,
-                            index,
-                            op,
-                            jit::position_bits(pos!()),
-                        ) {
-                            return Err(err);
-                        }
-                    }
+                code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
                     #[cfg(not(feature = "grain-jit"))]
-                    {
-                        let name = or_raise!(
-                            program_name!(program, index),
-                            malformed(format!("no name {index}"))
-                        );
-                        // Flattened before assigning, as Rhai does, so a shared
-                        // cell is copied out rather than aliased into the target.
-                        let rhs = self.pop()?.flatten();
-                        depth!(self.depth);
-                        self.assign_named(program, op, name, rhs, scope, pos!())?;
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
+
                 }
 
                 code::tag::DECLARE_LOCAL | code::tag::DECLARE_CONST => {
@@ -8412,77 +10564,79 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::LOAD_THIS | code::tag::LOAD_THIS_SHARED => {
-                    let value = or_raise!(
-                        self.this.as_ref(),
-                        Box::new(EvalAltResult::ErrorUnboundThis(pos!()))
-                    );
-                    // Rhai's read is `this_ptr.cloned()` and does not flatten
-                    // (`eval/expr.rs:272`); its consumers do. Which tag this is
-                    // is which consumer asked.
-                    push_word!(
-                        self,
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
                         frame,
-                        if tag == code::tag::LOAD_THIS {
-                            flatten_clone_value(value)
-                        } else {
-                            clone_value(value)
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                    );
-                }
-
-                code::tag::REQUIRE_THIS => {
-                    if self.this.is_none() {
-                        return Err(Box::new(EvalAltResult::ErrorUnboundThis(pos!())));
+                        continue;
                     }
                 }
 
-                code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
-                    let op = if tag == code::tag::ASSIGN_THIS_OP {
-                        let index = u32::from(small!(1));
+
+                code::tag::REQUIRE_THIS => {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
                         #[cfg(feature = "grain-jit")]
-                        let assign_op = jit::program_assign_op(program, index);
-                        #[cfg(not(feature = "grain-jit"))]
-                        let assign_op = program.assign_op(index);
-                        Some(or_raise!(
-                            assign_op,
-                            malformed(format!("no op-assignment {index}"))
-                        ))
-                    } else {
-                        None
-                    };
-
-                    // Flattened before assigning, as everywhere else.
-                    let rhs = pop_word!(self, frame)?.flatten();
-
-                    // Taken out of the register rather than borrowed from it:
-                    // `store` wants the whole `Vm`, and a write lock into the
-                    // field could not outlive that borrow. Put back on both
-                    // paths — Rhai's mutation survives an error, and a frame
-                    // that lost its receiver would answer `ErrorUnboundThis` to
-                    // every read after this one.
-                    let mut this = or_raise!(
-                        self.this.take(),
-                        Box::new(EvalAltResult::ErrorUnboundThis(pos!()))
-                    );
-
-                    let outcome = if this.is_read_only() {
-                        // Named for an expression that has no name, which is
-                        // what Rhai reports too (`eval/stmt.rs:118-122`).
-                        Err(Box::new(EvalAltResult::ErrorAssignmentToConstant(
-                            String::new(),
-                            pos!(),
-                        )))
-                    } else {
-                        // Written through, not over: a shared receiver has to
-                        // keep its cell, as a captured local does.
-                        match place(&mut this, "", pos!()) {
-                            Ok(mut target) => self.store(program, op, &mut target, rhs, pos!()),
-                            Err(err) => Err(err),
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                    };
+                        continue;
+                    }
 
-                    self.this = Some(this);
-                    outcome?;
+                }
+
+
+                code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
 
                 code::tag::POP => {
@@ -8490,45 +10644,27 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
-                    let index = u32::from(small!(1));
-                    let expr = or_raise!(
-                        program_entry!(program_residual, residual, program, index),
-                        malformed(format!("no residual {index}"))
-                    );
-                    let rewind_scope = tag == code::tag::EVAL_AST;
-
-                    // Straight to the walker's own entry points rather than
-                    // through `EvalContext::eval_expression_tree_raw`, which
-                    // is the same two calls behind a shim that only exists
-                    // under `custom_syntax`. Total language coverage rests on
-                    // this, so it must not depend on a feature.
-                    //
-                    // The frame's receiver goes with it, by reference. A body
-                    // that uses `this` can still hold a fragment — `this?.x`,
-                    // or a `this` body containing an `import` — and the walker
-                    // has to read and write the same receiver the surrounding
-                    // instructions do. The engine is copied out first so the
-                    // four borrows below are of disjoint fields.
-                    let engine = self.engine;
-                    let value = match expr {
-                        Expr::Stmt(block) => engine.eval_stmt_block(
-                            &mut self.global,
-                            &mut self.caches,
-                            scope,
-                            self.this.as_mut(),
-                            block.statements(),
-                            rewind_scope,
-                        ),
-                        expr => engine.eval_expr(
-                            &mut self.global,
-                            &mut self.caches,
-                            scope,
-                            self.this.as_mut(),
-                            expr,
-                        ),
-                    }?;
-
-                    push_word!(self, frame, value);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
                 }
 
                 code::tag::JUMP => {
@@ -8963,195 +11099,31 @@ impl<'e> Vm<'e> {
                         }
                     }
 
-                    let name_index = u32::from(small!(1));
-                    #[cfg(feature = "grain-jit")]
-                    if jit::program_name(program, name_index) == 0 {
-                        return Err(malformed(format!("no name {name_index}")));
-                    }
                     #[cfg(not(feature = "grain-jit"))]
-                    let name = or_raise!(
-                        program_name!(program, name_index),
-                        malformed(format!("no name {name_index}"))
-                    );
-                    let capture = form & code::form::CAPTURES != 0;
-                    // The kind byte sits where an argument count would, because
-                    // an operator's count is always two — or, for `UN_OP`, one.
-                    let argc = if typed {
-                        2
-                    } else if unary {
-                        1
-                    } else {
-                        byte!(3) as usize
-                    };
-                    let op = if form & code::form::POOLED_OP != 0 {
-                        let index = u32::from(small!(4));
-                        Some(or_raise!(
-                            program_entry!(program_token, token, program, index),
-                            malformed(format!("no operator {index}"))
-                        ))
-                    } else {
-                        None
-                    };
-
-                    let first = or_raise!(
-                        depth!().checked_sub(argc),
-                        malformed("call with too few arguments".to_string())
-                    );
-
-                    // Reach the same built-in the walker reaches. Gated on
-                    // Rhai's own `fast_operators()` rather than a guard of our
-                    // own, so an engine that turns it off gets the dispatch
-                    // path on both sides, and one that leaves it on gets the
-                    // same answer — including for a user-registered operator
-                    // on a primitive, which Rhai's fast path also bypasses
-                    // (`func/call.rs:1775-1799`).
-                    #[cfg(feature = "grain-jit")]
-                    if let (Some(token), 2) = (op, argc) {
-                        if self.stack.len() < depth!() {
-                            self.grow_stack(depth!() - self.stack.len());
-                        }
-                        let mut slot = first;
-                        let top_slot = depth!().min(STACK_WORDS);
-                        while slot < top_slot {
-                            let tag = frame.operand_tags[slot];
-                            if tag != 0 {
-                                let word = frame.operand_words[slot];
-                                *operand_mut(&mut self.stack[slot]) = dynamic_from_word(tag, word);
-                            }
-                            slot += 1;
-                        }
-                        if let Some(err) = jit::operator_builtin_abi(
-                            self,
-                            program,
-                            token,
-                            name_index,
-                            first,
-                            generation,
-                            pc,
-                            jit::position_bits(pos!()),
-                        ) {
-                            return Err(err);
-                        }
-                        if jit::operator_builtin_handled() != 0 {
-                            let value = take_residual_push!();
-                            deliver!(first, value);
-                            pc += width;
-                            continue;
-                        }
-                    }
-                    #[cfg(not(feature = "grain-jit"))]
-                    if let (Some(token), 2, true) = (op, argc, fast_operators!()) {
-                        // Flattened first, as Rhai flattens both operands
-                        // before it looks for a built-in
-                        // (`func/call.rs:1890-1898`). A shared cell reaches
-                        // `get_builtin_binary_op_fn` as `Union::Shared`, which
-                        // its variant match has no arm for; the type-id
-                        // comparison after that match reads through the cell,
-                        // finds two equal numeric types and answers "same type
-                        // but no built-in" — so the operator resolves to
-                        // nothing and the dispatch reports a function that was
-                        // never missing. An operand the instruction named
-                        // arrives flattened already, because `operand_value!`
-                        // reads it out with `flatten_clone`; this is the one
-                        // that came off the stack, where a native's return
-                        // value is the only thing that puts a cell.
-                        for slot in first..depth!() {
-                            if is_shared!(*stack_ref(self, slot)) {
-                                let held = mem::replace(stack_mut(self, slot), unit_value());
-                                store_value(stack_mut(self, slot), held.flatten());
-                            }
-                        }
-                        let memo = &mut self.operator_memo;
-                        let top = depth!();
-                        let (lhs, rhs) = self.stack[..top].split_at_mut(first + 1);
-                        let lhs = &mut lhs[first];
-                        let rhs = &mut rhs[0];
-
-                        // Custom types go to dispatch first, so a registered
-                        // function still wins for them.
-                        let builtin = (!lhs.is_variant() && !rhs.is_variant())
-                            .then(|| resolve_operator(memo, generation, pc, token, lhs, rhs))
-                            .flatten();
-                        if let Some((func, need_context)) = builtin {
-                            let context = need_context
-                                .then(|| (self.engine, name, None, &self.global, pos!()).into());
-                            let value = func(context, &mut [lhs, rhs])?;
-                            deliver!(first, value);
-                            pc += width;
-                            continue;
-                        }
-                    }
-
-                    // Check if it is a built-in syntactic function.
-                    let value = {
+                    let jitted = false;
+                    if self.dispatch_tail(
+                        frame,
+                        program,
+                        &mut pc,
+                        base,
+                        width,
+                        jitted,
+                        generation,
+                        form,
+                        named_is_local,
+                        typed,
+                        branching,
+                        taken_when,
+                        unary,
                         #[cfg(feature = "grain-jit")]
-                        {
-                            if argc == 2
-                                && fast_operators!()
-                                && jit::compiled_fn_is_plain_add(program, name_index, argc) != 0
-                            {
-                                if let Some(err) = jit::call_plain_add_abi(self, first) {
-                                    return Err(err);
-                                }
-                                if jit::plain_add_handled() != 0 {
-                                    let value = take_residual_push!();
-                                    deliver!(first, value);
-                                    pc += width;
-                                    continue;
-                                }
-                            }
-                            if argc == 1 && jit::name_is_abs(program, name_index) != 0 {
-                                if let Some(err) = jit::unary_builtin_abi(
-                                    self,
-                                    program,
-                                    name_index,
-                                    first,
-                                    jit::position_bits(pos!()),
-                                ) {
-                                    return Err(err);
-                                }
-                                if jit::unary_builtin_handled() != 0 {
-                                    let value = take_residual_push!();
-                                    deliver!(first, value);
-                                    pc += width;
-                                    continue;
-                                }
-                            }
-                            if let Some(err) = jit::call_syntactic_or_stacked_abi(
-                                self,
-                                program,
-                                name_index,
-                                argc,
-                                first,
-                                scope,
-                                i64::from(capture),
-                                jit::position_bits(pos!()),
-                            ) {
-                                return Err(err);
-                            }
-                            depth!(jit::vm_depth(self) as usize);
-                            if !branching && jit::reseat_top_to_floor(self, first) != 0 {
-                                depth!(jit::vm_depth(self) as usize);
-                                pc += width;
-                                continue;
-                            }
-                            take_residual_push!()
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                        #[cfg(not(feature = "grain-jit"))]
-                        {
-                            self.call_syntactic_or_stacked(
-                                program,
-                                name_index,
-                                name,
-                                argc,
-                                first,
-                                scope,
-                                capture,
-                                pos!(),
-                            )?
-                        }
-                    };
-                    deliver!(first, value);
+                        continue;
+                    }
                 }
 
                 code::tag::CALL_LOCAL_REF
@@ -9160,505 +11132,455 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_NAMED_REF_CAPTURE
                 | code::tag::CALL_THIS_REF
                 | code::tag::CALL_THIS_REF_CAPTURE => {
-                    let name_index = u32::from(small!(1));
-                    #[cfg(feature = "grain-jit")]
-                    if jit::program_name(program, name_index) == 0 {
-                        return Err(malformed(format!("no name {name_index}")));
-                    }
                     #[cfg(not(feature = "grain-jit"))]
-                    let name = or_raise!(
-                        program_name!(program, name_index),
-                        malformed(format!("no name {name_index}"))
-                    );
-                    let argc = byte!(3) as usize;
-                    // `this` is a register, so this one carries no operand for
-                    // the receiver and is two bytes shorter.
-                    let receiver = match tag {
-                        code::tag::CALL_LOCAL_REF | code::tag::CALL_LOCAL_REF_CAPTURE => {
-                            Receiver::Local(small!(4))
-                        }
-                        code::tag::CALL_NAMED_REF | code::tag::CALL_NAMED_REF_CAPTURE => {
-                            Receiver::Named(u32::from(small!(4)))
-                        }
-                        code::tag::CALL_THIS_REF | code::tag::CALL_THIS_REF_CAPTURE => {
-                            Receiver::This
-                        }
-                        _ => unreachable!(),
-                    };
-                    let capture = matches!(
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
                         tag,
-                        code::tag::CALL_LOCAL_REF_CAPTURE
-                            | code::tag::CALL_NAMED_REF_CAPTURE
-                            | code::tag::CALL_THIS_REF_CAPTURE
-                    );
-
-                    let value = {
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
                         #[cfg(feature = "grain-jit")]
-                        {
-                            let mut used_plain_add = false;
-                            if !capture
-                                && argc == 0
-                                && fast_operators!()
-                                && jit::name_is_abs(program, name_index) != 0
-                            {
-                                if let Receiver::Local(slot) = receiver {
-                                    if let Some(err) = jit::call_plain_abs_ref_abi(
-                                        self,
-                                        scope,
-                                        base,
-                                        slot,
-                                        jit::position_bits(pos!()),
-                                    ) {
-                                        return Err(err);
-                                    }
-                                    used_plain_add = jit::unary_builtin_handled() != 0;
-                                }
-                            }
-                            if !used_plain_add
-                                && !capture
-                                && argc == 1
-                                && fast_operators!()
-                                && jit::compiled_fn_is_plain_add(program, name_index, 2) != 0
-                            {
-                                if let (Receiver::Local(slot), Some(first)) =
-                                    (receiver, depth!().checked_sub(1))
-                                {
-                                    if let Some(err) =
-                                        jit::call_plain_add_ref_abi(self, scope, base, slot, first)
-                                    {
-                                        return Err(err);
-                                    }
-                                    used_plain_add = jit::plain_add_handled() != 0;
-                                }
-                            }
-                            if !used_plain_add {
-                                let (receiver_kind, receiver_payload) = match receiver {
-                                    Receiver::Local(slot) => (0, u32::from(slot)),
-                                    Receiver::Named(index) => (1, index),
-                                    Receiver::This => (2, 0),
-                                };
-                                if let Some(err) = jit::call_by_reference_abi(
-                                    self,
-                                    program,
-                                    name_index,
-                                    argc,
-                                    receiver_kind,
-                                    receiver_payload,
-                                    scope,
-                                    base,
-                                    i64::from(capture),
-                                    jit::position_bits(pos!()),
-                                ) {
-                                    return Err(err);
-                                }
-                            }
-                            take_residual_push!()
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                        #[cfg(not(feature = "grain-jit"))]
-                        {
-                            self.call_by_reference(
-                                program,
-                                name_index,
-                                name,
-                                argc,
-                                receiver,
-                                scope,
-                                base,
-                                capture,
-                                pos!(),
-                            )?
-                        }
-                    };
-                    push_word!(self, frame, value);
+                        continue;
+                    }
                 }
+
 
                 code::tag::ROTATE => {
-                    let under = byte!(1) as usize;
-                    let top = or_raise!(
-                        depth!().checked_sub(1),
-                        malformed("rotate on an empty stack".to_string())
-                    );
-                    let to = or_raise!(
-                        top.checked_sub(under),
-                        malformed("rotate past the bottom".to_string())
-                    );
-                    self.values_mut()[to..].rotate_right(1);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
+
 
                 // Emitted only for a literal, which is not syntax under the
                 // feature that removes the type.
                 #[cfg(not(feature = "no_index"))]
                 code::tag::MAKE_ARRAY => {
-                    let len = small!(1) as usize;
-                    let first = or_raise!(
-                        depth!().checked_sub(len),
-                        malformed("array with too few elements".to_string())
-                    );
-
-                    // The running total belongs to this literal and goes with
-                    // it. `Op::CheckSize` is what filled it in, one element at
-                    // a time, and what raised `ErrorDataTooLarge` against the
-                    // element that tipped it over (`eval/expr.rs:307-330`).
-                    //
-                    // Only if there was one: an empty literal emits no
-                    // `CheckSize` and pushed nothing, so popping here would
-                    // take the *enclosing* literal's total — `[a, [], b]`.
-                    if len > 0 {
-                        self.sizes.pop();
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
 
-                    // Flattened, as Rhai does, so a shared cell is copied in
-                    // rather than aliased.
-                    self.depth = depth!();
-                    let array: Array = self
-                        .take_values_from(first)
-                        .into_iter()
-                        .map(Dynamic::flatten)
-                        .collect();
-                    depth!(self.depth);
-                    push_word!(self, frame, Dynamic::from_array(array));
                 }
+
 
                 #[cfg(not(feature = "no_object"))]
                 code::tag::MAKE_MAP => {
-                    let len = small!(1) as usize;
-                    let first = or_raise!(
-                        depth!().checked_sub(2 * len + 1),
-                        malformed("map with too few operands".to_string())
-                    );
-                    // As for `MakeArray`: nothing was pushed for a literal
-                    // with no computed entries, so nothing may be popped.
-                    if len > 0 {
-                        self.sizes.pop();
-                    }
-
-                    self.depth = depth!();
-                    let mut parts = self.take_values_from(first).into_iter();
-                    depth!(self.depth);
-                    let template = parts.next().expect("checked above");
-                    let mut map = or_raise!(
-                        template.try_cast::<Map>(),
-                        malformed("map literal without a template".to_string())
-                    );
-                    while let Some(key) = parts.next() {
-                        let value = parts.next().expect("pairs, checked above");
-                        let key = match key.into_immutable_string() {
-                            Ok(key) => key,
-                            Err(actual) => {
-                                return Err(malformed(format!(
-                                    "map key is a {actual}, not a string"
-                                )));
-                            }
-                        };
-                        // Flattened as Rhai does, so a shared cell is copied
-                        // in rather than aliased.
-                        map.insert(key.as_str().into(), value.flatten());
-                    }
-                    drop(parts);
-                    push_word!(self, frame, Dynamic::from_map(map));
-                }
-
-                code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
-                    let index = small!(1);
-                    let map = tag == code::tag::CHECK_MAP_SIZE;
-                    self.check_size(index, map, pos!())?;
-                }
-
-                code::tag::SWITCH => {
-                    let index = u32::from(small!(1));
-                    let table = or_raise!(
-                        program_entry!(program_switch, switch, program, index),
-                        malformed(format!("no switch {index}"))
-                    );
-                    // Always a jump: an arm that matched nothing still has the
-                    // default to go to.
-                    #[cfg(feature = "grain-jit")]
-                    {
-                        // Hasher seed stays behind the residual. Integer arms
-                        // compare the subject against recovered case keys so
-                        // a taken arm is a guard in this loop.
-                        if let Some(err) = jit::switch_pop_subject(self, table) {
-                            return Err(err);
-                        }
-                        if jit::switch_subject_kind() == 1 {
-                            let value = jit::fast_int();
-                            let n = jit::switch_case_count(table);
-                            let mut i = 0i64;
-                            while i < n {
-                                if jit::switch_case_has_int(table, i) != 0
-                                    && value == jit::switch_case_int_key(table, i)
-                                {
-                                    let target = majit_metainterp::jit::promote(
-                                        jit::switch_case_target(table, i) as usize,
-                                    );
-                                    transfer!(target);
-                                    continue 'dispatch;
-                                }
-                                i += 1;
-                            }
-                            let ranges = jit::switch_range_count(table);
-                            let mut j = 0i64;
-                            while j < ranges {
-                                let from = jit::switch_range_from(table, j);
-                                let to = jit::switch_range_to(table, j);
-                                let hits = if jit::switch_range_inclusive(table, j) != 0 {
-                                    value >= from && value <= to
-                                } else {
-                                    value >= from && value < to
-                                };
-                                if hits {
-                                    let target = majit_metainterp::jit::promote(
-                                        jit::switch_range_target(table, j) as usize,
-                                    );
-                                    transfer!(target);
-                                    continue 'dispatch;
-                                }
-                                j += 1;
-                            }
-                            let target =
-                                majit_metainterp::jit::promote(jit::switch_default(table) as usize);
-                            transfer!(target);
-                            continue 'dispatch;
-                        }
-                        let target = jit::switch_target() as usize;
-                        let n = jit::switch_case_count(table);
-                        let mut i = 0i64;
-                        while i < n {
-                            let arm = jit::switch_case_target(table, i) as usize;
-                            if target == arm {
-                                transfer!(majit_metainterp::jit::promote(arm));
-                                continue 'dispatch;
-                            }
-                            i += 1;
-                        }
-                        let ranges = jit::switch_range_count(table);
-                        let mut j = 0i64;
-                        while j < ranges {
-                            let arm = jit::switch_range_target(table, j) as usize;
-                            if target == arm {
-                                transfer!(majit_metainterp::jit::promote(arm));
-                                continue 'dispatch;
-                            }
-                            j += 1;
-                        }
-                        transfer!(majit_metainterp::jit::promote(
-                            jit::switch_default(table) as usize,
-                        ));
-                        continue 'dispatch;
-                    }
                     #[cfg(not(feature = "grain-jit"))]
-                    {
-                        let subject = self.pop()?;
-                        depth!(self.depth);
-                        let target = table.dispatch(&subject) as usize;
-                        release(subject);
-                        transfer!(target);
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
                         continue;
                     }
+
                 }
 
-                code::tag::LOAD_SHARED => {
-                    let slot = small!(1);
-                    let index = base + slot as usize;
-                    if index >= scope_len!() {
-                        return Err(malformed(format!("local slot {slot} is out of scope")));
+
+                code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
-                    // Cloned, not flattened: cloning a shared `Dynamic` clones
-                    // the `Rc`, which is the capture.
-                    push_word!(self, frame, clone_value(scope_entry!(index)));
+
                 }
+
+
+                code::tag::SWITCH => {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
+                }
+
+
+                code::tag::LOAD_SHARED => {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
+                }
+
 
                 // Emitted only for a closure capture, which cannot be parsed
                 // under `no_closure`.
                 #[cfg(not(feature = "no_closure"))]
                 code::tag::SHARE | code::tag::SHARE_NAMED => {
-                    if tag == code::tag::SHARE_NAMED {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
                         #[cfg(feature = "grain-jit")]
-                        {
-                            let name_index = u32::from(small!(1));
-                            if let Some(err) = jit::share_named_abi(
-                                self,
-                                program,
-                                scope,
-                                name_index,
-                                jit::position_bits(pos!()),
-                            ) {
-                                return Err(err);
-                            }
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                        #[cfg(not(feature = "grain-jit"))]
-                        {
-                            let name_index = u32::from(small!(1));
-                            self.share_named(program, scope, name_index, pos!())?;
-                        }
-                    } else {
-                        let slot = small!(1);
-                        let index = base + slot as usize;
-                        if index >= scope_len!() {
-                            return Err(malformed(format!("local slot {slot} is out of scope")));
-                        }
-                        let value = scope_entry!(index);
-                        if !value.is_shared() {
-                            let shared = value.take().into_shared();
-                            store_value(value, shared);
-                        }
+                        continue;
                     }
+
                 }
 
+
                 code::tag::MAKE_CLOSURE => {
-                    let index = u32::from(small!(1));
-                    #[cfg(feature = "grain-jit")]
-                    {
-                        if let Some(err) =
-                            jit::make_closure_abi(self, program, index, jit::position_bits(pos!()))
-                        {
-                            return Err(err);
-                        }
-                    }
                     #[cfg(not(feature = "grain-jit"))]
-                    {
-                        let name = or_raise!(
-                            program_name!(program, index),
-                            malformed(format!("no name {index}"))
-                        );
-                        // Non-validated, because `anon$…` is not a name a script could
-                        // have written and the validating constructors refuse it.
-                        // Nothing unsound rides on that check — a name that will
-                        // not resolve simply fails when the pointer is called.
-                        //
-                        // Carrying the body where there is a share of the program
-                        // to carry, which is what spares a native the lookup on
-                        // every element. See [`callback::pointer`].
-                        debug_assert!(
-                            self.callbacks
-                                .as_ref()
-                                .map_or(true, |owned| core::ptr::eq(&**owned, program)),
-                            "a pointer would be handed out carrying a program this frame is not running"
-                        );
-                        let typ = self
-                            .callbacks
-                            .as_ref()
-                            .and_then(|owned| callback::pointer(owned, index, name))
-                            .unwrap_or(FnPtrType::Normal);
-                        push_word!(
-                            self,
-                            frame,
-                            FnPtr {
-                                name: name.into(),
-                                curry: Default::default(),
-                                #[cfg(not(feature = "no_function"))]
-                                env: None,
-                                typ,
-                            }
-                            .into()
-                        );
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
+
                 }
+
 
                 #[cfg(not(feature = "no_closure"))]
                 code::tag::IS_SHARED => {
-                    let value = pop_word!(self, frame)?;
-                    push_word!(self, frame, value.is_shared().into());
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
+
 
                 code::tag::MAKE_FN_PTR => {
-                    let name = pop_word!(self, frame)?;
-                    let name = match name.into_immutable_string() {
-                        Ok(name) => name,
-                        Err(actual) => {
-                            return Err(self.mismatch::<ImmutableString>(actual, pos!()));
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                    };
-                    // Validates that the name is an identifier, as Rhai's own
-                    // `Fn(..)` does (`func/call.rs:1215`).
-                    let pointer = match FnPtr::new(name) {
-                        Ok(pointer) => pointer,
-                        Err(mut err) => {
-                            if err.position().is_none() {
-                                err.set_position(pos!());
-                            }
-                            return Err(err);
-                        }
-                    };
-                    push_word!(self, frame, pointer.into());
+                        continue;
+                    }
+
                 }
 
+
                 code::tag::CURRY => {
-                    let argc = byte!(1) as usize;
-                    let at = or_raise!(
-                        depth!().checked_sub(argc + 1),
-                        malformed("curry is missing its target".into())
-                    );
-                    let mut pointer = or_raise!(
-                        clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
-                        self.mismatch::<FnPtr>(operand_ref(&self.stack[at]).type_name(), pos!())
-                    );
-                    self.depth = depth!();
-                    for value in self.take_values_from(at + 1) {
-                        pointer.add_curry(value);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
-                    depth!(self.depth);
-                    truncate_stack!(at);
-                    push_word!(self, frame, pointer.into());
+
                 }
+
 
                 code::tag::CALL_FN_PTR
                 | code::tag::CALL_FN_PTR_METHOD
                 | code::tag::CALL_FN_PTR_ON_LOCAL
                 | code::tag::CALL_FN_PTR_ON_NAMED
                 | code::tag::CALL_FN_PTR_ON_THIS => {
-                    let argc = byte!(1) as usize;
-                    let method = tag != code::tag::CALL_FN_PTR;
-                    let receiver = match tag {
-                        code::tag::CALL_FN_PTR_ON_LOCAL => Some(Receiver::Local(small!(2))),
-                        code::tag::CALL_FN_PTR_ON_NAMED => {
-                            Some(Receiver::Named(u32::from(small!(2))))
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-                        code::tag::CALL_FN_PTR_ON_THIS => Some(Receiver::This),
-                        _ => None,
-                    };
-                    self.depth = depth!();
-                    let value =
-                        self.call_fn_ptr(program, argc, method, receiver, scope, base, pos!())?;
-                    depth!(self.depth);
-                    push_word!(self, frame, value);
+                        continue;
+                    }
+
                 }
+
 
                 code::tag::INTERPOLATE_START => {
-                    push_word!(self, frame, self.engine.const_empty_string().into());
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
+
 
                 code::tag::INTERPOLATE_APPEND => {
-                    let segment = pop_word!(self, frame)?;
-                    self.append_segment(segment, pos!())?;
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
+
 
                 code::tag::INTERPOLATE_END => {
-                    let buffer = pop_word!(self, frame)?;
-                    let Ok(text) = buffer.into_immutable_string() else {
-                        return Err(malformed("interpolation lost its buffer".into()));
-                    };
-                    // Interned, as Rhai does: the same rendered string in ten
-                    // places is one allocation, which is the whole reason the
-                    // engine keeps an interner.
-                    let value = self.engine.get_interned_string(text.as_str());
-                    push_word!(self, frame, value.into());
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
 
+
                 code::tag::CHAIN | code::tag::CHAIN_DISCARD => {
-                    let index = u32::from(small!(1));
-                    let chain = or_raise!(
-                        program_entry!(program_chain, chain, program, index),
-                        malformed(format!("no chain {index}"))
-                    );
-                    // An assignment is not an expression here: what it
-                    // evaluates to is the `Op::Unit` beside it, emitted only
-                    // where something reads it. A read in statement position
-                    // has nothing behind it to take its value off again, and
-                    // says so in its tag; the walk itself is the same either
-                    // way, so a chain that raises raises identically.
-                    let keeps = chain_tail(chain) == TAIL_READ && tag != code::tag::CHAIN_DISCARD;
-                    eval_chain!(chain, index, keeps);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
+                    }
+
                 }
 
                 code::tag::INDEX_SET
@@ -9691,232 +11613,81 @@ impl<'e> Vm<'e> {
                 }
 
                 code::tag::ITER_INIT => {
-                    #[cfg(feature = "grain-jit")]
-                    {
-                        // The range `Dynamic` stays inside the residual.
-                        // Tracing `stack_take` of it is the exhaust bridge's
-                        // `BC_ABORT` in `stack_take`.
-                        if let Some(err) = jit::iter_init_from_top(self, jit::position_bits(pos!()))
-                        {
-                            return Err(err);
-                        }
-                        // `valuestackdepth += 1` after the iterator push.
-                        // `iterators.len()` is `dont_look_inside_cannot_raise`
-                        // and CSE-folds across the pop, leaving dest peeking
-                        // the inner index after that iterator is gone.
-                        frame.iter_depth += 1;
-                    }
                     #[cfg(not(feature = "grain-jit"))]
-                    {
-                        let iterable = self.pop()?;
-                        depth!(self.depth);
-                        self.iter_init(iterable, pos!())?;
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
                 }
 
+
                 code::tag::ITER_DROP => {
-                    self.iterators.pop();
-                    #[cfg(feature = "grain-jit")]
-                    {
-                        frame.iter_depth -= 1;
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
+                        #[cfg(feature = "grain-jit")]
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
+                        }
+                        continue;
                     }
+
                 }
+
 
                 code::tag::ITER_NEXT
                 | code::tag::ITER_NEXT_INDEXED
                 | code::tag::ITER_NEXT_STORE => {
-                    let body = wide!(1) as usize;
-                    #[cfg(feature = "grain-jit")]
-                    if tag == code::tag::ITER_NEXT_STORE {
-                        // Integer `for i in 0..n` walks `Items::IntRange` in
-                        // the portal: `next`/`end` stay machine integers, so
-                        // the turn never builds a `Dynamic` (that store is
-                        // `__deref_write`). A boxed iterator stays behind
-                        // [`iter_next_store`].
-                        let slot = small!(5);
-                        let index = base + slot as usize;
-                        if index >= scope_len!() {
-                            return Err(malformed(format!("local slot {slot} is out of scope")));
-                        }
-                        // `FOR_ITER` / `peekvalue`: `scope` and `vm` stay
-                        // live together at the peek so dest cannot colour
-                        // the Vm loc as `scope`. Depth is a vable int.
-                        let dest_depth = frame.iter_depth;
-                        let iteration = or_raise!(
-                            jit::dest_iteration_at(self, scope, dest_depth.wrapping_sub(1)),
-                            malformed("no iterator to advance".to_string())
-                        );
-                        let range_next = match &iteration.items {
-                            Items::IntRange { next, end } => {
-                                if *next >= *end {
-                                    None
-                                } else {
-                                    Some(*next)
-                                }
-                            }
-                            Items::IntStepRange { next, end, step } => {
-                                if *step > 0 {
-                                    if *next >= *end {
-                                        None
-                                    } else {
-                                        Some(*next)
-                                    }
-                                } else if *step < 0 {
-                                    if *next <= *end {
-                                        None
-                                    } else {
-                                        Some(*next)
-                                    }
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => {
-                                if let Some(err) = jit::iter_next_store(
-                                    self,
-                                    scope,
-                                    index,
-                                    jit::position_bits(pos!()),
-                                ) {
-                                    return Err(err);
-                                }
-                                if jit::iter_next_produced() == 0 {
-                                    frame.iter_depth -= 1;
-                                    // `FOR_ITER` exhaust: `next_instr += jumpby`.
-                                    transfer!(pc + width);
-                                    continue;
-                                }
-                                transfer!(body);
-                                continue;
-                            }
-                        };
-                        if let Some(n) = range_next {
-                            let next = match &iteration.items {
-                                Items::IntStepRange { step, .. } => n.wrapping_add(*step),
-                                _ => n.wrapping_add(1),
-                            };
-                            jit::store_int_range_next(&mut iteration.items, next);
-                            if iteration.count == INT::MAX {
-                                return Err(Box::new(EvalAltResult::ErrorArithmetic(
-                                    format!("for-loop counter overflow: {}", iteration.count),
-                                    pos!(),
-                                )));
-                            }
-                            jit::store_iteration_count(iteration, iteration.count.wrapping_add(1));
-                            let entry = scope_entry!(index);
-                            if let Union::Int(..) = &entry.0 {
-                                jit::dynamic_store_int(entry, n);
-                            } else {
-                                // Packed bits. The store builds the Position.
-                                jit::store_scope_int(
-                                    scope,
-                                    index,
-                                    n,
-                                    jit::code_position_bits(program, pc),
-                                );
-                            }
-                            transfer!(body);
-                            continue;
-                        }
-                        // `FOR_ITER` exhaust is `next_instr += jumpby`,
-                        // not fall-through. A compiled dest loop that
-                        // JUMP dest here re-enters dest and peeks the
-                        // outer iterator.
-                        jit::iterators_pop(self);
-                        frame.iter_depth -= 1;
-                        transfer!(pc + width);
-                        continue;
-                    }
-                    {
-                        let iteration = or_raise!(
-                            {
-                                #[cfg(feature = "grain-jit")]
-                                {
-                                    let dest_depth = frame.iter_depth;
-                                    jit::dest_iteration_at(self, scope, dest_depth.wrapping_sub(1))
-                                }
-                                #[cfg(not(feature = "grain-jit"))]
-                                {
-                                    self.iterators.last_mut()
-                                }
-                            },
-                            malformed("no iterator to advance".to_string())
-                        );
-                        let Some(item) = iteration.items.next() else {
-                            // `FOR_ITER` exhaust: `next_instr += jumpby`.
-                            self.iterators.pop();
-                            #[cfg(feature = "grain-jit")]
-                            {
-                                frame.iter_depth -= 1;
-                            }
-                            transfer!(pc + width);
-                            continue;
-                        };
-
-                        // Counted before the item is unwrapped, as Rhai does, so a
-                        // loop long enough to wrap the counter is an error rather
-                        // than a wrap.
-                        // Spelled as the equality rather than as `checked_add`:
-                        // adding one overflows exactly at the maximum, and the
-                        // `Option` that spelling returns is consumed by an arm
-                        // that returns rather than rejoining — a shape the signed
-                        // overflow lowering declines, leaving a residual call
-                        // whose `core` target the build cannot address.
-                        if iteration.count == INT::MAX {
-                            return Err(Box::new(EvalAltResult::ErrorArithmetic(
-                                format!("for-loop counter overflow: {}", iteration.count),
-                                pos!(),
-                            )));
-                        }
-                        iteration.count += 1;
-                        let count = iteration.count;
-
-                        // A fallible iterator's error is positioned at the
-                        // iterable, and only if it brought none of its own
-                        // (`eval/stmt.rs:749`).
-                        let value = match item {
-                            Ok(value) => value,
-                            Err(mut err) => {
-                                if err.position().is_none() {
-                                    err.set_position(pos!());
-                                }
-                                return Err(err);
-                            }
-                        };
-
-                        #[cfg(not(feature = "grain-jit"))]
-                        if tag == code::tag::ITER_NEXT_STORE {
-                            // The `Op::StoreShared` this swallowed, which is where
-                            // the loop variable is written on every turn. The
-                            // grain-jit build handles this tag before
-                            // `items.next()`.
-                            let slot = small!(5);
-                            let index = base + slot as usize;
-                            if index >= scope_len!() {
-                                return Err(malformed(format!(
-                                    "local slot {slot} is out of scope"
-                                )));
-                            }
-                            store_shared(scope_entry!(index), value.flatten(), pos!())?;
-                        } else {
-                            if tag == code::tag::ITER_NEXT_INDEXED {
-                                push_word!(self, frame, Dynamic::from(count));
-                            }
-                            push_word!(self, frame, value.flatten());
-                        }
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_cold(
+                        frame,
+                        program,
+                        &mut pc,
+                        tag,
+                        base,
+                        stack_base,
+                        width,
+                        jitted,
+                        generation,
                         #[cfg(feature = "grain-jit")]
-                        {
-                            if tag == code::tag::ITER_NEXT_INDEXED {
-                                push_word!(self, frame, Dynamic::from(count));
-                            }
-                            push_word!(self, frame, value.flatten());
+                        &jit_driver,
+                    )? {
+                        #[cfg(feature = "grain-jit")]
+                        if frame.jit_return_kind != 0 {
+                            return self.finished_frame_value(frame);
                         }
-
-                        // The back edge, so the turn is metered and the JIT driver
-                        // is consulted here rather than at a jump of the body's.
-                        transfer!(body);
                         continue;
                     }
+
                 }
 
                 code::tag::STORE_SHARED => {
@@ -9955,7 +11726,7 @@ impl<'e> Vm<'e> {
             pc += width;
         }
     }
-}
+                }
 
 /// The `this` register, reached by hand-built chunks.
 ///
