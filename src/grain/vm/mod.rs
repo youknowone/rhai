@@ -1498,15 +1498,20 @@ fn dynamic_from_word(tag: u8, value: i64) -> Dynamic {
 }
 
 /// Copy this frame's scalar locals into the array above the operand prefix.
+///
+/// `pyframe.py` `locals2fast`: the frame array is the copy the opcode reads.
+/// One residual on the frame, after the virtualizable has been forced.
 #[cfg(feature = "grain-jit")]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub(super) fn import_local_words(frame: &mut GrainFrame) {
-    let scope_len = frame.scope.len();
+    let frame = majit_metainterp::jit::hint_force_virtualizable(frame);
+    let scope_len = jit::scope_len(frame.scope) as usize;
     let mut index = frame.base;
     let mut slot = 0usize;
     while index < scope_len && LOCAL_BASE + slot < OPERAND_WORDS {
         let at = LOCAL_BASE + slot;
         let (word, tag) = {
-            let entry = frame.scope.get_mut_by_index(index);
+            let entry = jit::scope_entry(frame.scope, index);
             let (word, mut tag) = scalar_word(entry);
             if entry.is_read_only() {
                 tag = 0;
@@ -1528,24 +1533,40 @@ pub(super) fn import_local_words(frame: &mut GrainFrame) {
 
 /// Write the array's int locals back into the host `Scope`.
 ///
-/// Only the mask bits are ints. The tag vector is not read here: indexing
-/// it from a residual walk faults. Non-int locals stay in `Scope`.
+/// `pyframe.py` `fast2locals`. Only the mask bits are ints. The tag vector
+/// is not read here: indexing it from a residual walk faults. Non-int
+/// locals stay in `Scope`.
 #[cfg(feature = "grain-jit")]
+#[majit_macros::dont_look_inside_cannot_raise]
 pub(super) fn flush_local_words(frame: &mut GrainFrame) {
-    let scope_len = frame.scope.len();
+    let frame = majit_metainterp::jit::hint_force_virtualizable(frame);
+    let scope_len = jit::scope_len(frame.scope) as usize;
     let mask = frame.local_int_mask;
     let mut index = frame.base;
     let mut slot = 0usize;
     while index < scope_len && slot < 32 {
         if mask & (1i64 << slot) != 0 {
             let word = frame.operand_words[LOCAL_BASE + slot];
-            let entry = frame.scope.get_mut_by_index(index);
-            if let Union::Int(held, ..) = &mut entry.0 {
-                *held = word as crate::INT;
-            }
+            let entry = jit::scope_entry(frame.scope, index);
+            jit::dynamic_store_int(entry, word as crate::INT);
         }
         index += 1;
         slot += 1;
+    }
+}
+
+/// The exit merge point `can_enter_jit` just published, or `target` when
+/// the compiled loop did not leave. Kept out of the portal body: inlining
+/// it pushes that jitcode past the u16 label range.
+#[cfg(feature = "grain-jit")]
+#[inline(never)]
+fn compiled_edge_land(frame: &mut GrainFrame, target: usize) -> usize {
+    if frame.jit_resume_pc_plus_one != 0 {
+        let land = frame.jit_resume_pc_plus_one - 1;
+        frame.jit_resume_pc_plus_one = 0;
+        land
+    } else {
+        target
     }
 }
 
@@ -1780,11 +1801,6 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// Tag beside [`Self::operand_words`]: 1 int, 2 bool, 3 float, 4 unit, 0 heap.
     #[cfg(feature = "grain-jit")]
     pub(super) operand_tags: Vec<u8>,
-    /// Set when a compiled guard just handed control back. The next merge
-    /// point writes the loop values; if the bottom test is already false,
-    /// the body must not run again.
-    #[cfg(feature = "grain-jit")]
-    resume_check: u8,
 }
 
 #[cfg(feature = "grain-jit")]
@@ -6012,8 +6028,6 @@ impl<'e> Vm<'e> {
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
-            #[cfg(feature = "grain-jit")]
-            resume_check: 0,
         };
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
@@ -6489,8 +6503,8 @@ impl<'e> Vm<'e> {
             #[cfg(feature = "grain-jit")]
             {
                 if frame.local_sync != 0 {
-                    import_local_words(frame);
                     frame.local_sync = 0;
+                    import_local_words(frame);
                 }
                 match frame_local_step(self, program, frame, pc) {
                     Ok(Some(target)) => {
@@ -6503,13 +6517,16 @@ impl<'e> Vm<'e> {
                                 frame,
                                 self,
                             );
+                            // The next iteration clears the exit pc before
+                            // reading it, so apply it before continuing.
+                            pc = compiled_edge_land(frame, target);
+                            continue;
                         }
                         pc = target;
                         continue;
                     }
                     Ok(None) => {
                         flush_local_words(frame);
-                        frame.local_sync = 1;
                     }
                     Err(err) => {
                         flush_local_words(frame);
@@ -9391,8 +9408,6 @@ mod tests {
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
-            #[cfg(feature = "grain-jit")]
-            resume_check: 0,
         };
         let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;

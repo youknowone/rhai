@@ -111,6 +111,14 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::program_constant_int as *const () as usize as i64,
         ),
         (
+            "rhai::grain::vm::import_local_words",
+            super::import_local_words as *const () as usize as i64,
+        ),
+        (
+            "rhai::grain::vm::flush_local_words",
+            super::flush_local_words as *const () as usize as i64,
+        ),
+        (
             "rhai::grain::vm::jit::program_assign_op",
             super::jit::program_assign_op as *const () as usize as i64,
         ),
