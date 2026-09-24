@@ -6457,15 +6457,14 @@ impl<'e> Vm<'e> {
         &mut self,
         frame: &mut GrainFrame<'_, '_>,
         program: &Program<'_>,
-        pc_slot: &mut usize,
+        mut pc: usize,
         tag: u8,
         base: usize,
         stack_base: usize,
         width: usize,
         jitted: bool,
         generation: u64,
-    ) -> Result<bool, Box<EvalAltResult>> {
-        let mut pc = *pc_slot;
+    ) -> Result<(usize, bool), Box<EvalAltResult>> {
         let scope = &mut *frame.scope;
         #[cfg(feature = "grain-jit")]
         macro_rules! depth {
@@ -7117,8 +7116,7 @@ impl<'e> Vm<'e> {
                 }
                 if assigned {
                     pc += width;
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
 
                 // Declined, so the walk runs — and it reads its operands
@@ -7211,8 +7209,7 @@ impl<'e> Vm<'e> {
                 }
                 if read {
                     pc += width;
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
 
                 // Declined, so the walk runs — and it reads its one
@@ -7298,8 +7295,7 @@ impl<'e> Vm<'e> {
 
             _ => unreachable!("late tag"),
         }
-        *pc_slot = pc;
-        Ok(false)
+        Ok((pc, false))
     }
 
     #[cfg(feature = "grain-jit")]
@@ -7317,7 +7313,7 @@ impl<'e> Vm<'e> {
         &mut self,
         frame: &mut GrainFrame<'_, '_>,
         program: &Program<'_>,
-        pc_slot: &mut usize,
+        mut pc: usize,
         tag: u8,
         base: usize,
         stack_base: usize,
@@ -7325,8 +7321,7 @@ impl<'e> Vm<'e> {
         jitted: bool,
         generation: u64,
         #[cfg(feature = "grain-jit")] jit_driver: &jit::GrainJitDriver,
-    ) -> Result<bool, Box<EvalAltResult>> {
-        let mut pc = *pc_slot;
+    ) -> Result<(usize, bool), Box<EvalAltResult>> {
         let scope = &mut *frame.scope;
         #[cfg(feature = "grain-jit")]
         macro_rules! depth {
@@ -7794,8 +7789,7 @@ impl<'e> Vm<'e> {
                         // before reading it. Apply the exit merge point here,
                         // where `can_enter_jit` just published it.
                         if frame.jit_return_kind != 0 {
-                            *pc_slot = pc;
-                            return Ok(true);
+                            return Ok((pc, true));
                         }
                         if frame.jit_resume_pc_plus_one != 0 {
                             land = frame.jit_resume_pc_plus_one - 1;
@@ -8237,8 +8231,7 @@ impl<'e> Vm<'e> {
                                     jit::switch_case_target(table, i) as usize,
                                 );
                                 transfer!(target);
-                                *pc_slot = pc;
-                                return Ok(true);
+                                return Ok((pc, true));
                             }
                             i += 1;
                         }
@@ -8257,16 +8250,14 @@ impl<'e> Vm<'e> {
                                     jit::switch_range_target(table, j) as usize,
                                 );
                                 transfer!(target);
-                                *pc_slot = pc;
-                                return Ok(true);
+                                return Ok((pc, true));
                             }
                             j += 1;
                         }
                         let target =
                             majit_metainterp::jit::promote(jit::switch_default(table) as usize);
                         transfer!(target);
-                        *pc_slot = pc;
-                        return Ok(true);
+                        return Ok((pc, true));
                     }
                     let target = jit::switch_target() as usize;
                     let n = jit::switch_case_count(table);
@@ -8275,8 +8266,7 @@ impl<'e> Vm<'e> {
                         let arm = jit::switch_case_target(table, i) as usize;
                         if target == arm {
                             transfer!(majit_metainterp::jit::promote(arm));
-                            *pc_slot = pc;
-                            return Ok(true);
+                            return Ok((pc, true));
                         }
                         i += 1;
                     }
@@ -8286,16 +8276,14 @@ impl<'e> Vm<'e> {
                         let arm = jit::switch_range_target(table, j) as usize;
                         if target == arm {
                             transfer!(majit_metainterp::jit::promote(arm));
-                            *pc_slot = pc;
-                            return Ok(true);
+                            return Ok((pc, true));
                         }
                         j += 1;
                     }
                     transfer!(majit_metainterp::jit::promote(
                         jit::switch_default(table) as usize,
                     ));
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
                 #[cfg(not(feature = "grain-jit"))]
                 {
@@ -8304,8 +8292,7 @@ impl<'e> Vm<'e> {
                     let target = table.dispatch(&subject) as usize;
                     release(subject);
                     transfer!(target);
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
             }
 
@@ -8606,12 +8593,10 @@ impl<'e> Vm<'e> {
                                 frame.iter_depth -= 1;
                                 // `FOR_ITER` exhaust: `next_instr += jumpby`.
                                 transfer!(pc + width);
-                                *pc_slot = pc;
-                                return Ok(true);
+                                return Ok((pc, true));
                             }
                             transfer!(body);
-                            *pc_slot = pc;
-                            return Ok(true);
+                            return Ok((pc, true));
                         }
                     };
                     if let Some(n) = range_next {
@@ -8640,8 +8625,7 @@ impl<'e> Vm<'e> {
                             );
                         }
                         transfer!(body);
-                        *pc_slot = pc;
-                        return Ok(true);
+                        return Ok((pc, true));
                     }
                     // `FOR_ITER` exhaust is `next_instr += jumpby`,
                     // not fall-through. A compiled dest loop that
@@ -8650,8 +8634,7 @@ impl<'e> Vm<'e> {
                     jit::iterators_pop(self);
                     frame.iter_depth -= 1;
                     transfer!(pc + width);
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
                 {
                     let iteration = or_raise!(
@@ -8676,8 +8659,7 @@ impl<'e> Vm<'e> {
                             frame.iter_depth -= 1;
                         }
                         transfer!(pc + width);
-                        *pc_slot = pc;
-                        return Ok(true);
+                        return Ok((pc, true));
                     };
 
                     // Counted before the item is unwrapped, as Rhai does, so a
@@ -8742,14 +8724,12 @@ impl<'e> Vm<'e> {
                     // The back edge, so the turn is metered and the JIT driver
                     // is consulted here rather than at a jump of the body's.
                     transfer!(body);
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
             }
             _ => unreachable!("cold tag"),
         }
-        *pc_slot = pc;
-        Ok(false)
+        Ok((pc, false))
     }
 
     #[cfg_attr(feature = "grain-jit", majit_macros::unroll_safe)]
@@ -8758,7 +8738,7 @@ impl<'e> Vm<'e> {
         &mut self,
         frame: &mut GrainFrame<'_, '_>,
         program: &Program<'_>,
-        pc_slot: &mut usize,
+        mut pc: usize,
         base: usize,
         width: usize,
         jitted: bool,
@@ -8770,8 +8750,7 @@ impl<'e> Vm<'e> {
         taken_when: bool,
         unary: bool,
         #[cfg(feature = "grain-jit")] jit_driver: &jit::GrainJitDriver,
-    ) -> Result<bool, Box<EvalAltResult>> {
-        let mut pc = *pc_slot;
+    ) -> Result<(usize, bool), Box<EvalAltResult>> {
         let scope = &mut *frame.scope;
         #[cfg(feature = "grain-jit")]
         macro_rules! depth {
@@ -9239,8 +9218,7 @@ impl<'e> Vm<'e> {
                         // before reading it. Apply the exit merge point here,
                         // where `can_enter_jit` just published it.
                         if frame.jit_return_kind != 0 {
-                            *pc_slot = pc;
-                            return Ok(true);
+                            return Ok((pc, true));
                         }
                         if frame.jit_resume_pc_plus_one != 0 {
                             land = frame.jit_resume_pc_plus_one - 1;
@@ -9271,8 +9249,7 @@ impl<'e> Vm<'e> {
                     release(value);
                     if holds == taken_when {
                         transfer!(wide!(width - 4) as usize);
-                        *pc_slot = pc;
-                        return Ok(true);
+                        return Ok((pc, true));
                     }
                 }
             }};
@@ -9350,8 +9327,7 @@ impl<'e> Vm<'e> {
                 let value = take_residual_push!();
                 deliver!(first, value);
                 pc += width;
-                *pc_slot = pc;
-                return Ok(true);
+                return Ok((pc, true));
             }
         }
         #[cfg(not(feature = "grain-jit"))]
@@ -9393,8 +9369,7 @@ impl<'e> Vm<'e> {
                 let value = func(context, &mut [lhs, rhs])?;
                 deliver!(first, value);
                 pc += width;
-                *pc_slot = pc;
-                return Ok(true);
+                return Ok((pc, true));
             }
         }
 
@@ -9413,8 +9388,7 @@ impl<'e> Vm<'e> {
                         let value = take_residual_push!();
                         deliver!(first, value);
                         pc += width;
-                        *pc_slot = pc;
-                        return Ok(true);
+                        return Ok((pc, true));
                     }
                 }
                 if argc == 1 && jit::name_is_abs(program, name_index) != 0 {
@@ -9431,8 +9405,7 @@ impl<'e> Vm<'e> {
                         let value = take_residual_push!();
                         deliver!(first, value);
                         pc += width;
-                        *pc_slot = pc;
-                        return Ok(true);
+                        return Ok((pc, true));
                     }
                 }
                 if let Some(err) = jit::call_syntactic_or_stacked_abi(
@@ -9451,8 +9424,7 @@ impl<'e> Vm<'e> {
                 if !branching && jit::reseat_top_to_floor(self, first) != 0 {
                     depth!(jit::vm_depth(self) as usize);
                     pc += width;
-                    *pc_slot = pc;
-                    return Ok(true);
+                    return Ok((pc, true));
                 }
                 take_residual_push!()
             }
@@ -9471,8 +9443,7 @@ impl<'e> Vm<'e> {
             }
         };
         deliver!(first, value);
-        *pc_slot = pc;
-        Ok(false)
+        Ok((pc, false))
     }
 
     #[inline(always)]
@@ -10331,10 +10302,10 @@ impl<'e> Vm<'e> {
                 code::tag::LOAD_NAMED | code::tag::LOAD_SHARED_NAMED => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -10343,7 +10314,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -10356,10 +10329,10 @@ impl<'e> Vm<'e> {
                 code::tag::ASSIGN_NAMED | code::tag::ASSIGN_NAMED_OP => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -10368,7 +10341,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -10566,10 +10541,10 @@ impl<'e> Vm<'e> {
                 code::tag::LOAD_THIS | code::tag::LOAD_THIS_SHARED => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -10578,7 +10553,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -10591,10 +10568,10 @@ impl<'e> Vm<'e> {
                 code::tag::REQUIRE_THIS => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -10603,7 +10580,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -10617,10 +10596,10 @@ impl<'e> Vm<'e> {
                 code::tag::ASSIGN_THIS | code::tag::ASSIGN_THIS_OP => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -10629,7 +10608,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -10646,10 +10627,10 @@ impl<'e> Vm<'e> {
                 code::tag::EVAL_AST | code::tag::EVAL_AST_KEEP => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -10658,7 +10639,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11101,10 +11084,10 @@ impl<'e> Vm<'e> {
 
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_tail(
+                    let (next_pc, jump) = self.dispatch_tail(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         base,
                         width,
                         jitted,
@@ -11117,7 +11100,9 @@ impl<'e> Vm<'e> {
                         unary,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11134,10 +11119,10 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_THIS_REF_CAPTURE => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11146,7 +11131,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11159,10 +11146,10 @@ impl<'e> Vm<'e> {
                 code::tag::ROTATE => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11171,7 +11158,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11188,10 +11177,10 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_ARRAY => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11200,7 +11189,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11215,10 +11206,10 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_MAP => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11227,7 +11218,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11241,10 +11234,10 @@ impl<'e> Vm<'e> {
                 code::tag::CHECK_ARRAY_SIZE | code::tag::CHECK_MAP_SIZE => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11253,7 +11246,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11267,10 +11262,10 @@ impl<'e> Vm<'e> {
                 code::tag::SWITCH => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11279,7 +11274,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11293,10 +11290,10 @@ impl<'e> Vm<'e> {
                 code::tag::LOAD_SHARED => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11305,7 +11302,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11322,10 +11321,10 @@ impl<'e> Vm<'e> {
                 code::tag::SHARE | code::tag::SHARE_NAMED => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11334,7 +11333,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11348,10 +11349,10 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_CLOSURE => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11360,7 +11361,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11375,10 +11378,10 @@ impl<'e> Vm<'e> {
                 code::tag::IS_SHARED => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11387,7 +11390,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11401,10 +11406,10 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_FN_PTR => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11413,7 +11418,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11427,10 +11434,10 @@ impl<'e> Vm<'e> {
                 code::tag::CURRY => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11439,7 +11446,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11457,10 +11466,10 @@ impl<'e> Vm<'e> {
                 | code::tag::CALL_FN_PTR_ON_THIS => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11469,7 +11478,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11483,10 +11494,10 @@ impl<'e> Vm<'e> {
                 code::tag::INTERPOLATE_START => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11495,7 +11506,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11509,10 +11522,10 @@ impl<'e> Vm<'e> {
                 code::tag::INTERPOLATE_APPEND => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11521,7 +11534,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11535,10 +11550,10 @@ impl<'e> Vm<'e> {
                 code::tag::INTERPOLATE_END => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11547,7 +11562,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11561,10 +11578,10 @@ impl<'e> Vm<'e> {
                 code::tag::CHAIN | code::tag::CHAIN_DISCARD => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11573,7 +11590,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11605,9 +11624,11 @@ impl<'e> Vm<'e> {
                 | code::tag::POP_HANDLER => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_late(
-                        frame, program, &mut pc, tag, base, stack_base, width, jitted, generation,
-                    )? {
+                    let (next_pc, jump) = self.dispatch_late(
+                        frame, program, pc, tag, base, stack_base, width, jitted, generation,
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         continue;
                     }
                 }
@@ -11615,10 +11636,10 @@ impl<'e> Vm<'e> {
                 code::tag::ITER_INIT => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11627,7 +11648,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11640,10 +11663,10 @@ impl<'e> Vm<'e> {
                 code::tag::ITER_DROP => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11652,7 +11675,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
@@ -11668,10 +11693,10 @@ impl<'e> Vm<'e> {
                 | code::tag::ITER_NEXT_STORE => {
                     #[cfg(not(feature = "grain-jit"))]
                     let jitted = false;
-                    if self.dispatch_cold(
+                    let (next_pc, jump) = self.dispatch_cold(
                         frame,
                         program,
-                        &mut pc,
+                        pc,
                         tag,
                         base,
                         stack_base,
@@ -11680,7 +11705,9 @@ impl<'e> Vm<'e> {
                         generation,
                         #[cfg(feature = "grain-jit")]
                         &jit_driver,
-                    )? {
+                    )?;
+                    pc = next_pc;
+                    if jump {
                         #[cfg(feature = "grain-jit")]
                         if frame.jit_return_kind != 0 {
                             return self.finished_frame_value(frame);
