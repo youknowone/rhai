@@ -64,10 +64,19 @@ fn the_lowered_tables_round_trip_and_name_their_portal() {
 
     // Printed in both arms, because "passed" alone does not say which one ran
     // and the empty arm asserts almost nothing.
+    let mut sizes: Vec<(usize, String)> = jitcodes::all()
+        .iter()
+        .map(|jc| (jc.code.len(), jc.name.clone()))
+        .collect();
+    sizes.sort_by(|a, b| b.0.cmp(&a.0));
     eprintln!(
         "loaded {count} jitcodes; the driver names portal {portal}, whose merge \
-         point opcode {opcode} sits at offset {offset}"
+         point opcode {opcode} sits at offset {offset}; portal bytes {}",
+        jitcodes::all().get(portal).map(|jc| jc.code.len()).unwrap_or(0)
     );
+    for (len, name) in sizes.iter().take(8) {
+        eprintln!("jitcode {len} bytes {name}");
+    }
 }
 
 /// The two halves a driver has to be handed for a body lowered ahead of time.

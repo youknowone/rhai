@@ -1443,7 +1443,7 @@ pub(super) const OPERAND_WORDS: usize = LOCAL_BASE + 32;
 
 #[cfg(feature = "grain-jit")]
 fn import_operand_words(frame: &mut GrainFrame, vm: &Vm) {
-    let live = vm.depth.min(STACK_WORDS).min(vm.stack.len());
+    let live = frame.operand_depth.min(STACK_WORDS).min(vm.stack.len());
     for index in 0..STACK_WORDS {
         if index >= live {
             let zero = 0i64;
@@ -1459,7 +1459,8 @@ fn import_operand_words(frame: &mut GrainFrame, vm: &Vm) {
 
 #[cfg(feature = "grain-jit")]
 fn flush_operand_words(frame: &mut GrainFrame, vm: &mut Vm) {
-    let live = vm.depth.min(STACK_WORDS);
+    vm.depth = frame.operand_depth;
+    let live = frame.operand_depth.min(STACK_WORDS);
     if vm.stack.len() < live {
         vm.grow_stack(live - vm.stack.len());
     }
@@ -1793,7 +1794,11 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// A vable int, so the hot path does not index the side `Vec<u8>`.
     #[cfg(feature = "grain-jit")]
     local_int_mask: i64,
-    /// Scalar operand prefix. Item `i` is the payload at `Vm.depth == i`.
+    /// One past the top operand. Resume writes this static field with the
+    /// operand array; the dispatch loop reads it here.
+    #[cfg(feature = "grain-jit")]
+    operand_depth: usize,
+    /// Scalar operand prefix. Item `i` is the payload at `operand_depth == i`.
     /// The `Box` is the container the virtualizable array descriptor loads:
     /// length at 0, data pointer at 8.
     #[cfg(feature = "grain-jit")]
@@ -1813,7 +1818,7 @@ impl GrainFrame<'_, '_> {
     /// here instead of through those offsets keeps this module free of
     /// `unsafe`; what pairs the two is the order, which the export asserts the
     /// length of.
-    pub(super) fn jit_vable_words(&self) -> [i64; 10] {
+    pub(super) fn jit_vable_words(&self) -> [i64; 11] {
         [
             &*self.scope as *const Scope<'_> as usize as i64,
             self.base as i64,
@@ -1827,6 +1832,7 @@ impl GrainFrame<'_, '_> {
             self.iter_depth as i64,
             self.local_sync,
             self.local_int_mask,
+            self.operand_depth as i64,
         ]
     }
 
@@ -1860,6 +1866,9 @@ impl GrainFrame<'_, '_> {
         }
         if let Some(&mask) = values.get(11) {
             self.local_int_mask = mask;
+        }
+        if let Some(&depth) = values.get(12) {
+            self.operand_depth = depth as usize;
         }
     }
 }
@@ -2307,16 +2316,19 @@ macro_rules! pop_unit_word {
 #[cfg(feature = "grain-jit")]
 macro_rules! push_scalar {
     ($me:tt, $frame:ident, $tag:expr, $value:expr) => {{
-        let depth = $me.depth;
+        let depth = $frame.operand_depth;
         if depth < STACK_WORDS {
             $frame.operand_words[depth] = $value;
             $frame.operand_tags[depth] = $tag;
             if depth == $me.stack.len() {
+                $me.depth = depth;
                 $me.grow_stack(1);
             }
             *operand_mut(&mut $me.stack[depth]) = dynamic_from_word($tag, $value);
-            $me.depth = depth + 1;
+            $frame.operand_depth = depth + 1;
+            $me.depth = $frame.operand_depth;
         } else {
+            $me.depth = depth;
             match $tag {
                 1 => jit::push_fast_int($me, $value as crate::INT),
                 2 => jit::push_fast_bool($me, $value),
@@ -2324,6 +2336,7 @@ macro_rules! push_scalar {
                 3 => jit::push_fast_float($me, crate::FLOAT::from_bits($value as _)),
                 _ => jit::push_fast_unit($me),
             }
+            $frame.operand_depth = $me.depth;
         }
     }};
 }
@@ -2356,11 +2369,13 @@ macro_rules! push_word {
                 push_scalar!($me, $frame, 4, zero)
             }
             _ => {
-                let depth = $me.depth;
+                let depth = $frame.operand_depth;
+                $me.depth = depth;
                 if depth < STACK_WORDS {
                     $frame.operand_tags[depth] = 0;
                 }
-                $me.push(value)
+                $me.push(value);
+                $frame.operand_depth = $me.depth;
             }
         }
     }};
@@ -2369,9 +2384,10 @@ macro_rules! push_word {
 macro_rules! pop_word {
     ($me:tt, $frame:ident) => {{
         let depth = or_raise!(
-            $me.depth.checked_sub(1),
+            $frame.operand_depth.checked_sub(1),
             malformed("operand stack underflow".to_string())
         );
+        $frame.operand_depth = depth;
         $me.depth = depth;
         if depth < STACK_WORDS && $frame.operand_tags[depth] != 0 {
             let tag = $frame.operand_tags[depth];
@@ -2391,8 +2407,9 @@ macro_rules! pop_word {
 #[cfg(feature = "grain-jit")]
 macro_rules! pop_unit_word {
     ($me:tt, $frame:ident) => {{
-        match $me.depth.checked_sub(1) {
+        match $frame.operand_depth.checked_sub(1) {
             Some(depth) => {
+                $frame.operand_depth = depth;
                 $me.depth = depth;
                 if depth < STACK_WORDS && $frame.operand_tags[depth] != 0 {
                     let tag = $frame.operand_tags[depth];
@@ -6025,6 +6042,8 @@ impl<'e> Vm<'e> {
             #[cfg(feature = "grain-jit")]
             local_int_mask: 0,
             #[cfg(feature = "grain-jit")]
+            operand_depth: self.depth,
+            #[cfg(feature = "grain-jit")]
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
@@ -6432,6 +6451,857 @@ impl<'e> Vm<'e> {
     /// caught outside it cost 1.55x to 1.40x on the tight-loop benchmark until
     /// this was here.
 
+    #[cfg_attr(feature = "grain-jit", majit_macros::unroll_safe)]
+    #[inline(never)]
+    fn dispatch_late(
+        &mut self,
+        frame: &mut GrainFrame<'_, '_>,
+        program: &Program<'_>,
+        pc_slot: &mut usize,
+        tag: u8,
+        base: usize,
+        stack_base: usize,
+        width: usize,
+        jitted: bool,
+        generation: u64,
+    ) -> Result<bool, Box<EvalAltResult>> {
+        let mut pc = *pc_slot;
+        let scope = &mut *frame.scope;
+        #[cfg(feature = "grain-jit")]
+        macro_rules! depth {
+            () => {
+                frame.operand_depth
+            };
+            ($new:expr) => {{
+                frame.operand_depth = $new;
+            }};
+        }
+        #[cfg(not(feature = "grain-jit"))]
+        macro_rules! depth {
+            () => {
+                self.depth
+            };
+            ($new:expr) => {{
+                self.depth = $new;
+            }};
+        }
+
+        macro_rules! scope_len {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::scope_len(scope) as usize
+                    } else {
+                        scope.len()
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    scope.len()
+                }
+            }};
+        }
+
+        macro_rules! scope_entry {
+            ($index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::scope_entry(scope, $index)
+                    } else {
+                        scope.get_mut_by_index($index)
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    scope.get_mut_by_index($index)
+                }
+            }};
+        }
+
+        macro_rules! program_entry {
+            ($jit:ident, $plain:ident, $program:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::$jit($program, $index)
+                    } else {
+                        $program.$plain($index)
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    $program.$plain($index)
+                }
+            }};
+        }
+
+        macro_rules! array_entry_mut {
+            ($array:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::array_entry_mut($array, $index)
+                    } else {
+                        &mut $array[$index]
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    &mut $array[$index]
+                }
+            }};
+        }
+
+        macro_rules! array_entry {
+            ($array:expr, $index:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if jitted {
+                        jit::array_entry($array, $index)
+                    } else {
+                        &$array[$index]
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    &$array[$index]
+                }
+            }};
+        }
+
+        macro_rules! truncate_stack {
+            ($depth:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    let new_depth = $depth;
+                    let old_depth = depth!();
+                    if new_depth < old_depth {
+                        let end = old_depth.min(STACK_WORDS);
+                        let start = new_depth.min(end);
+                        let mut slot = start;
+                        while slot < end {
+                            frame.operand_tags[slot] = 0;
+                            slot += 1;
+                        }
+                    }
+                    self.depth = depth!();
+                    if jitted {
+                        jit::truncate_stack(self, new_depth);
+                    } else {
+                        self.truncate_stack(new_depth);
+                    }
+                    depth!(new_depth);
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    self.truncate_stack($depth);
+                    depth!(self.depth);
+                }
+            }};
+        }
+
+        macro_rules! take_residual_push {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    // The residual wrote `Vm.stack` and did not update the
+                    // scalar tag. Popping through the tag would replay the
+                    // previous word.
+                    depth!(jit::vm_depth(self) as usize);
+                    let depth = or_raise!(
+                        depth!().checked_sub(1),
+                        malformed("operand stack underflow".to_string())
+                    );
+                    depth!(depth);
+                    if depth < STACK_WORDS {
+                        frame.operand_tags[depth] = 0;
+                        let cleared = 0i64;
+                        frame.operand_words[depth] = cleared;
+                    }
+                    stack_take(self, depth)
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    pop_unit_word!(self, frame)
+                }
+            }};
+        }
+
+        macro_rules! eval_chain {
+            ($chain:expr, $index:expr, $keeps:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    if let Some(err) = jit::run_chain_abi(
+                        self,
+                        program,
+                        $chain,
+                        $index,
+                        scope,
+                        base,
+                        jit::position_bits(pos!()),
+                    ) {
+                        return Err(err);
+                    }
+                    depth!(jit::vm_depth(self) as usize);
+                    if !$keeps {
+                        let floor = depth!().saturating_sub(1);
+                        truncate_stack!(floor);
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    let value =
+                        self.run_chain_inner(program, $chain, $index, scope, base, pos!())?;
+                    if $keeps {
+                        self.push(value);
+                        depth!(self.depth);
+                    } else {
+                        drop(value);
+                    }
+                }
+            }};
+        }
+
+        macro_rules! small {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_u16(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u16,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match code::u16_at(program.code(), pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! wide {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_u32(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u32,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match code::u32_at(program.code(), pc + $offset) {
+                        Some(operand) => operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! pos {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    jit::code_position(program, pc)
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    program.position(pc)
+                }
+            }};
+        }
+
+        macro_rules! byte {
+            ($offset:expr) => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    match jit::code_byte(program, pc + $offset) {
+                        -1 => return Err(malformed("truncated operand".to_string())),
+                        operand => operand as u8,
+                    }
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    match program.code().get(pc + $offset) {
+                        Some(operand) => *operand,
+                        None => return Err(malformed("truncated operand".to_string())),
+                    }
+                }
+            }};
+        }
+
+        macro_rules! fast_operators {
+            () => {{
+                #[cfg(feature = "grain-jit")]
+                {
+                    // Keep the merge-point Vm in its reserved register
+                    // across this deopt. Without the pin, the colourer
+                    // reuses that slot for `scope` and the compiled
+                    // guard's failargs drop the Vm; resume then bakes
+                    // `ConstPtr(this eval's stack)` and the next
+                    // `Vm::new` fails the guard every time.
+                    let _ = jit::pin_scope_with_vm(self, scope);
+                    jit::fast_operators(self) != 0
+                }
+                #[cfg(not(feature = "grain-jit"))]
+                {
+                    self.engine.fast_operators()
+                }
+            }};
+        }
+
+        macro_rules! index_is_local {
+            () => {{
+                matches!(
+                    tag,
+                    code::tag::INDEX_GET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL
+                        | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                )
+            }};
+        }
+
+        macro_rules! indexed_int {
+            ($offset:expr, $under:expr) => {{
+                let mut found = None;
+                if index_is_local!() {
+                    let at = base + small!($offset) as usize;
+                    if at < scope_len!() {
+                        if let Union::Int(i, ..) = scope_entry!(at).0 {
+                            found = Some(i);
+                        }
+                    }
+                } else if matches!(
+                    tag,
+                    code::tag::INDEX_GET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST
+                        | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
+                ) {
+                    let index = u32::from(small!($offset));
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    if let Some(Union::Int(i, ..)) = constant.map(|value| &value.0) {
+                        found = Some(*i);
+                    }
+                } else if let Some(under) = $under {
+                    if let Union::Int(i, ..) = stack_ref(self, under).0 {
+                        found = Some(i);
+                    }
+                }
+                found
+            }};
+        }
+
+        macro_rules! operand_value {
+            ($offset:expr, $is_local:expr) => {{
+                if $is_local {
+                    let slot = small!($offset);
+                    let at = base + slot as usize;
+                    if at >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    let cell = scope_entry!(at);
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        // `flatten_clone_value` / `from_cell` are their
+                        // own jitcodes. The bound `dynamic_as_fast`
+                        // residual is the one-word owner.
+                        match jit::dynamic_as_fast(cell) {
+                            1 => Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite)),
+                            2 => Dynamic(Union::Bool(
+                                jit::fast_bool() != 0,
+                                0,
+                                AccessMode::ReadWrite,
+                            )),
+                            #[cfg(not(feature = "no_float"))]
+                            3 => Dynamic::from(jit::fast_float()),
+                            4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                            // A pooled range or other `Variant` is a real
+                            // cell. Cloning it is what the non-jit path
+                            // does; aborting here drops the exhaust bridge
+                            // that re-enters `for j in 0..end`.
+                            _ => {
+                                if jit::live_dynamic_ptr(cell) {
+                                    flatten_clone_value(cell)
+                                } else {
+                                    jit::request_walk_abort_abi();
+                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        flatten_clone_value(cell)
+                    }
+                } else {
+                    let index = u32::from(small!($offset));
+                    #[cfg(feature = "grain-jit")]
+                    let constant = jit::program_constant(program, index);
+                    #[cfg(not(feature = "grain-jit"))]
+                    let constant = program.constant(index);
+                    let value = or_raise!(constant, malformed(format!("no constant {index}")));
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        match jit::dynamic_as_fast(value) {
+                            1 => Dynamic(Union::Int(jit::fast_int(), 0, AccessMode::ReadWrite)),
+                            2 => Dynamic(Union::Bool(
+                                jit::fast_bool() != 0,
+                                0,
+                                AccessMode::ReadWrite,
+                            )),
+                            #[cfg(not(feature = "no_float"))]
+                            3 => Dynamic::from(jit::fast_float()),
+                            4 => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+                            _ => {
+                                if jit::live_dynamic_ptr(value) {
+                                    clone_value(value)
+                                } else {
+                                    jit::request_walk_abort_abi();
+                                    Dynamic(Union::Unit((), 0, AccessMode::ReadWrite))
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "grain-jit"))]
+                    {
+                        clone_value(value)
+                    }
+                }
+            }};
+        }
+
+        macro_rules! indexed_value {
+            ($offset:expr) => {{
+                operand_value!($offset, index_is_local!())
+            }};
+        }
+
+        macro_rules! named_fast {
+            ($offset:expr, $is_local:expr) => {{
+                if $is_local {
+                    let slot = small!($offset);
+                    let at = base + slot as usize;
+                    if at >= scope_len!() {
+                        return Err(malformed(format!("local slot {slot} is out of scope")));
+                    }
+                    fast_from_cell!(scope_entry!(at))
+                } else {
+                    let index = u32::from(small!($offset));
+                    match jit::program_constant(program, index) {
+                        Some(value) => fast_from_cell!(value),
+                        None => {
+                            return Err(malformed(format!("no constant {index}")));
+                        }
+                    }
+                }
+            }};
+        }
+
+        macro_rules! assigned_value {
+            () => {{
+                operand_value!(7, false)
+            }};
+        }
+
+        macro_rules! transfer {
+            ($target:expr) => {{
+                let target: usize = $target;
+                let mut land = target;
+                if target <= pc {
+                    #[cfg(feature = "grain-jit")]
+                    {
+                        jit::track_operation_error(self, program, pc);
+                        jit_driver.can_enter_jit(
+                            target,
+                            program.jit_identity(),
+                            program,
+                            frame,
+                            self,
+                        );
+                        // The next iteration clears `jit_resume_pc_plus_one`
+                        // before reading it. Apply the exit merge point here,
+                        // where `can_enter_jit` just published it.
+                        if frame.jit_return_kind != 0 {
+                            let mut value = unit_value();
+                            if let Some(err) = jit::take_finished_result(frame, &mut value) {
+                                return Err(err);
+                            }
+                            return Ok(value);
+                        }
+                        if frame.jit_resume_pc_plus_one != 0 {
+                            land = frame.jit_resume_pc_plus_one - 1;
+                            frame.jit_resume_pc_plus_one = 0;
+                        }
+                    }
+                    // The position is a table lookup keyed on the
+                    // address, and metering only reports one when it
+                    // stops the run — so it is asked for behind the
+                    // check rather than in front of it.
+                    #[cfg(not(feature = "grain-jit"))]
+                    self.engine
+                        .track_operation_at(&mut self.global, || pos!())?;
+                }
+                pc = land;
+            }};
+        }
+
+        match tag {
+            code::tag::INDEX_SET
+            | code::tag::INDEX_SET_FROM_LOCAL
+            | code::tag::INDEX_SET_FROM_CONST
+            | code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+            | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+            | code::tag::INDEX_SET_OP
+            | code::tag::INDEX_SET_OP_FROM_LOCAL
+            | code::tag::INDEX_SET_OP_FROM_CONST
+            | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+            | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
+                // The compiler has already decided the shape, so what is
+                // left to test is the types — which it could not know. A
+                // slot holding a writable, unshared `Array` and an index
+                // that is a non-negative integer inside it runs here; a
+                // map, a shared cell, a host type with an indexer or an
+                // out-of-range index breaks out and is answered by the
+                // chain below, reporting exactly what it reports.
+                //
+                // The operands are the chain's own: the value is on top,
+                // the index under it or named by the instruction, and an
+                // assigning chain leaves nothing behind. Only an `Array`
+                // reaches the fast path, and `no_index` takes the arm it
+                // destructures with the rest of indexing — so there is
+                // nothing left here to be fast about, and the compiler
+                // emits no `IndexSet` on that build either.
+                let named = !matches!(tag, code::tag::INDEX_SET | code::tag::INDEX_SET_OP);
+                // A named value was never pushed, so the index it would
+                // have sat on top of is the top of the stack instead.
+                let valued = matches!(
+                    tag,
+                    code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
+                        | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
+                );
+                #[cfg_attr(feature = "no_index", allow(unused_mut))]
+                let mut assigned = false;
+                #[cfg(not(feature = "no_index"))]
+                'fast: {
+                    let under = depth!().checked_sub(if valued { 1 } else { 2 });
+                    let Some(i) = indexed_int!(5, under) else {
+                        break 'fast;
+                    };
+                    // A negative index counts from the end, which is
+                    // `get_indexed_mut`'s rule and not worth restating.
+                    //
+                    // Spelled as integer operations rather than as
+                    // `usize::try_from`: that conversion reaches the
+                    // lowering as a callee with no host address, and one
+                    // such callee anywhere the portal can reach refuses
+                    // every trace, arm taken or not.
+                    if i < 0 {
+                        break 'fast;
+                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    let index = i as usize;
+                    // The cast loses information only where `usize` is
+                    // narrower than `INT`; re-widening rejects that case
+                    // and no other.
+                    #[allow(clippy::cast_possible_wrap)]
+                    if index as INT != i {
+                        break 'fast;
+                    }
+                    let i = index;
+                    let at = base + small!(3) as usize;
+                    if at >= scope_len!() {
+                        break 'fast;
+                    }
+                    // The operator an op-assignment applies, which is the
+                    // kind byte the instruction ends with. Gated on
+                    // `fast_operators()` for the reason every typed arm is:
+                    // with it off the walk resolves a function, and a
+                    // host-registered `+=` on integers wins on both sides.
+                    let kind = match tag {
+                        code::tag::INDEX_SET_OP
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL
+                        | code::tag::INDEX_SET_OP_FROM_CONST
+                        | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
+                        | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
+                            if !fast_operators!() {
+                                break 'fast;
+                            }
+                            // A byte naming no operator is not an error:
+                            // the walk reads the operator out of the
+                            // chain's pool entry and answers whatever it
+                            // answers, which is what a verified program's
+                            // byte can never make it do.
+                            let Some(kind) = BinOpKind::from_byte(byte!(width - 1)) else {
+                                break 'fast;
+                            };
+                            Some(kind)
+                        }
+                        _ => None,
+                    };
+                    // Read before the array is borrowed out of the same
+                    // scope, which a named value may be read from too.
+                    let named_value = if valued {
+                        Some(assigned_value!())
+                    } else {
+                        None
+                    };
+                    let Union::Array(array, _, AccessMode::ReadWrite) = &mut scope_entry!(at).0
+                    else {
+                        break 'fast;
+                    };
+                    // The bound is tested here rather than left to the
+                    // element read, so what crosses the boundary below is
+                    // an index already known to name an element.
+                    if i >= array_len(array) {
+                        break 'fast;
+                    }
+                    let cell = array_entry_mut!(array, i);
+                    match kind {
+                        // The operator applied to the element where it
+                        // lies, which is the whole of what this spelling
+                        // buys: an element reached as a `&mut Dynamic`
+                        // needs no `Target` to read through, no copy of it
+                        // to apply to and no second walk to write back.
+                        //
+                        // Nothing is consumed until it has answered. A
+                        // pair the arm has no entry for — a string, a
+                        // shared cell, an integer element under a float
+                        // operand — and an operator that fails both leave
+                        // every operand where the walk expects it, and the
+                        // walk is what answers, error included.
+                        Some(kind) => {
+                            let rhs = match named_value.as_ref() {
+                                Some(value) => value,
+                                None => {
+                                    let Some(top) = depth!().checked_sub(1) else {
+                                        break 'fast;
+                                    };
+                                    stack_ref(self, top)
+                                }
+                            };
+                            match apply_assign(kind, cell, rhs) {
+                                Ok(Some(())) => {}
+                                Ok(None) | Err(..) => break 'fast,
+                            }
+                            match named_value {
+                                Some(value) => release(value),
+                                None => release(pop_unit_word!(self, frame)),
+                            }
+                        }
+                        None => {
+                            let value = match named_value {
+                                Some(value) => value,
+                                None => pop_unit_word!(self, frame),
+                            };
+                            store_value(cell, value);
+                        }
+                    }
+                    if !named {
+                        // The index operand, done with.
+                        release(pop_unit_word!(self, frame));
+                    }
+                    assigned = true;
+                }
+                if assigned {
+                    pc += width;
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+
+                // Declined, so the walk runs — and it reads its operands
+                // off the stack, where the index belongs under the value.
+                if named || valued {
+                    let value = if valued {
+                        assigned_value!()
+                    } else {
+                        pop_unit_word!(self, frame)
+                    };
+                    if named {
+                        let index = indexed_value!(5);
+                        push_word!(self, frame, index);
+                    }
+                    push_word!(self, frame, value);
+                }
+
+                let index = u32::from(small!(1));
+                let chain = or_raise!(
+                    program_entry!(program_chain, chain, program, index),
+                    malformed(format!("no chain {index}"))
+                );
+                // Always an assigning tail — that is what `indexed_slot`
+                // selects on — so the walk leaves nothing here either.
+                eval_chain!(chain, index, false);
+            }
+
+            code::tag::INDEX_GET
+            | code::tag::INDEX_GET_FROM_LOCAL
+            | code::tag::INDEX_GET_FROM_CONST => {
+                // `Op::IndexSet`'s speculation, read side: the compiler
+                // decided the shape and what is left to test is the types.
+                // A shared root or a shared element breaks out, because the
+                // walk reaches either through a `Target` that takes a write
+                // lock and this does not.
+                //
+                // The element takes the index's place —
+                // `Target::take_or_clone` clones what it referenced, so a
+                // clone is what the walk produces too. Where the
+                // instruction names its index that place is one above the
+                // stack it arrived on, and the two naming tags reach the
+                // scope entry and the constant themselves rather than
+                // spending an instruction pushing what the next one takes
+                // straight off again.
+                let named = tag != code::tag::INDEX_GET;
+                #[cfg_attr(feature = "no_index", allow(unused_mut))]
+                let mut read = false;
+                #[cfg(not(feature = "no_index"))]
+                'fast: {
+                    let Some(i) = indexed_int!(5, depth!().checked_sub(1)) else {
+                        break 'fast;
+                    };
+                    // A negative index counts from the end, which is
+                    // `get_indexed_mut`'s rule and not worth restating.
+                    // See the write side above for why this is spelled in
+                    // integer operations.
+                    if i < 0 {
+                        break 'fast;
+                    }
+                    #[allow(clippy::cast_sign_loss)]
+                    let index = i as usize;
+                    #[allow(clippy::cast_possible_wrap)]
+                    if index as INT != i {
+                        break 'fast;
+                    }
+                    let at = base + small!(3) as usize;
+                    if at >= scope_len!() {
+                        break 'fast;
+                    }
+                    let Union::Array(array, ..) = &scope_entry!(at).0 else {
+                        break 'fast;
+                    };
+                    // The bound is tested here rather than left to the
+                    // element read, so what crosses the boundary below is
+                    // an index already known to name an element.
+                    if index >= array_len(array) {
+                        break 'fast;
+                    }
+                    let cell = array_entry!(array, index);
+                    if is_shared!(*cell) {
+                        break 'fast;
+                    }
+                    let value = clone_value(cell);
+                    if named {
+                        push_word!(self, frame, value);
+                    } else {
+                        store_value(stack_mut(self, depth!() - 1), value);
+                    }
+                    read = true;
+                }
+                if read {
+                    pc += width;
+                    *pc_slot = pc;
+                    return Ok(true);
+                }
+
+                // Declined, so the walk runs — and it reads its one
+                // operand off the stack, where a named index has never
+                // been.
+                if named {
+                    let index = indexed_value!(5);
+                    push_word!(self, frame, index);
+                }
+
+                let index = u32::from(small!(1));
+                let chain = or_raise!(
+                    program_entry!(program_chain, chain, program, index),
+                    malformed(format!("no chain {index}"))
+                );
+                eval_chain!(chain, index, true);
+            }
+
+            code::tag::UNWIND_TO => {
+                let depth = small!(1);
+                let target = base + depth as usize;
+                if target > scope_len!() {
+                    return Err(malformed(format!(
+                        "unwind to {target} past a scope of {}",
+                        scope_len!()
+                    )));
+                }
+                #[cfg(feature = "grain-jit")]
+                jit::scope_rewind(scope, target);
+                #[cfg(not(feature = "grain-jit"))]
+                scope.rewind(target);
+            }
+
+            code::tag::TICK => {
+                #[cfg(feature = "grain-jit")]
+                jit::track_operation_error(self, program, pc);
+                #[cfg(not(feature = "grain-jit"))]
+                self.engine.track_operation(&mut self.global, pos!())?;
+            }
+
+            code::tag::CHECKPOINT => self.unwind_floor = scope_len!(),
+
+            code::tag::STATEMENT => {
+                // Nothing to stop for without the interface to stop at, and
+                // no marker in the code at all unless it was compiled by a
+                // build that has one.
+                #[cfg(feature = "debugging")]
+                {
+                    let depth = small!(1);
+                    self.at_statement(scope, depth, pos!())?;
+                }
+            }
+
+            code::tag::PUSH_HANDLER | code::tag::PUSH_HANDLER_VAR => {
+                let target = wide!(1) as usize;
+                let catch_var = if tag == code::tag::PUSH_HANDLER_VAR {
+                    Some(u32::from(small!(5)))
+                } else {
+                    None
+                };
+                self.handlers.push(Handler {
+                    target,
+                    catch_var,
+                    operands: depth!(),
+                    scope_len: scope_len!(),
+                    iters: {
+                        #[cfg(feature = "grain-jit")]
+                        {
+                            jit::iterators_len(self) as usize
+                        }
+                        #[cfg(not(feature = "grain-jit"))]
+                        {
+                            self.iterators.len()
+                        }
+                    },
+                    caught: None,
+                });
+            }
+
+            code::tag::POP_HANDLER => {
+                self.handlers.pop();
+            }
+
+            _ => unreachable!("late tag"),
+        }
+        *pc_slot = pc;
+        Ok(false)
+    }
+
     #[inline(always)]
     fn run_frame(
         &mut self,
@@ -6465,6 +7335,27 @@ impl<'e> Vm<'e> {
         let jit_driver = jit::GrainJitDriver;
 
         'dispatch: loop {
+            // The operand depth lives on the frame. Resume writes that
+            // field back with the operand array.
+            #[cfg(feature = "grain-jit")]
+            macro_rules! depth {
+                () => {
+                    frame.operand_depth
+                };
+                ($new:expr) => {{
+                    frame.operand_depth = $new;
+                }};
+            }
+            #[cfg(not(feature = "grain-jit"))]
+            macro_rules! depth {
+                () => {
+                    self.depth
+                };
+                ($new:expr) => {{
+                    self.depth = $new;
+                }};
+            }
+
             // Nothing inside an iteration moves `pc` except a jump, and a jump
             // only happens after the instruction succeeded — so recording it
             // here names whichever instruction fails.
@@ -6675,7 +7566,7 @@ impl<'e> Vm<'e> {
                     #[cfg(feature = "grain-jit")]
                     {
                         let new_depth = $depth;
-                        let old_depth = self.depth;
+                        let old_depth = depth!();
                         if new_depth < old_depth {
                             let end = old_depth.min(STACK_WORDS);
                             let start = new_depth.min(end);
@@ -6685,15 +7576,18 @@ impl<'e> Vm<'e> {
                                 slot += 1;
                             }
                         }
+                        self.depth = depth!();
                         if jitted {
                             jit::truncate_stack(self, new_depth);
                         } else {
                             self.truncate_stack(new_depth);
                         }
+                        depth!(new_depth);
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
                         self.truncate_stack($depth);
+                        depth!(self.depth);
                     }
                 }};
             }
@@ -6708,12 +7602,12 @@ impl<'e> Vm<'e> {
                         // The residual wrote `Vm.stack` and did not update the
                         // scalar tag. Popping through the tag would replay the
                         // previous word.
-                        self.depth = jit::vm_depth(self) as usize;
+                        depth!(jit::vm_depth(self) as usize);
                         let depth = or_raise!(
-                            self.depth.checked_sub(1),
+                            depth!().checked_sub(1),
                             malformed("operand stack underflow".to_string())
                         );
-                        self.depth = depth;
+                        depth!(depth);
                         if depth < STACK_WORDS {
                             frame.operand_tags[depth] = 0;
                             let cleared = 0i64;
@@ -6746,9 +7640,9 @@ impl<'e> Vm<'e> {
                         ) {
                             return Err(err);
                         }
-                        self.depth = jit::vm_depth(self) as usize;
+                        depth!(jit::vm_depth(self) as usize);
                         if !$keeps {
-                            let floor = self.depth.saturating_sub(1);
+                            let floor = depth!().saturating_sub(1);
                             truncate_stack!(floor);
                         }
                     }
@@ -6758,6 +7652,7 @@ impl<'e> Vm<'e> {
                             self.run_chain_inner(program, $chain, $index, scope, base, pos!())?;
                         if $keeps {
                             self.push(value);
+                            depth!(self.depth);
                         } else {
                             drop(value);
                         }
@@ -7176,10 +8071,12 @@ impl<'e> Vm<'e> {
                         {
                             // A scalar push leaves a tag. A later non-scalar
                             // at the same depth must not be popped as that tag.
-                            if self.depth < STACK_WORDS {
-                                frame.operand_tags[self.depth] = 0;
+                            if depth!() < STACK_WORDS {
+                                frame.operand_tags[depth!()] = 0;
                             }
+                            self.depth = depth!();
                             jit::push_from_cell(self, value);
+                            depth!(jit::vm_depth(self) as usize);
                         }
                         #[cfg(not(feature = "grain-jit"))]
                         push_word!(self, frame, clone_value(value));
@@ -7214,10 +8111,12 @@ impl<'e> Vm<'e> {
                     } else {
                         #[cfg(feature = "grain-jit")]
                         {
-                            if self.depth < STACK_WORDS {
-                                frame.operand_tags[self.depth] = 0;
+                            if depth!() < STACK_WORDS {
+                                frame.operand_tags[depth!()] = 0;
                             }
+                            self.depth = depth!();
                             jit::push_from_cell(self, cell);
+                            depth!(jit::vm_depth(self) as usize);
                         }
                         #[cfg(not(feature = "grain-jit"))]
                         push_word!(self, frame, flatten_clone_value(cell));
@@ -7244,6 +8143,7 @@ impl<'e> Vm<'e> {
                     #[cfg(not(feature = "grain-jit"))]
                     {
                         let mut value = self.pop()?;
+                        depth!(self.depth);
                         value.set_access_mode(if tag == code::tag::STORE_CONST {
                             AccessMode::ReadOnly
                         } else {
@@ -7279,6 +8179,7 @@ impl<'e> Vm<'e> {
                         );
                         let value = self.load_named(name, scope, flatten, pos!())?;
                         self.push(value);
+                        depth!(self.depth);
                     }
                 }
 
@@ -7320,6 +8221,7 @@ impl<'e> Vm<'e> {
                         // Flattened before assigning, as Rhai does, so a shared
                         // cell is copied out rather than aliased into the target.
                         let rhs = self.pop()?.flatten();
+                        depth!(self.depth);
                         self.assign_named(program, op, name, rhs, scope, pos!())?;
                     }
                 }
@@ -7356,6 +8258,7 @@ impl<'e> Vm<'e> {
                         // already shared, and sharing must stop at the `let` rather
                         // than becoming a property of the new local.
                         let value = self.pop()?.flatten();
+                        depth!(self.depth);
                         if tag == code::tag::DECLARE_CONST {
                             scope.push_constant_dynamic(name, value);
                         } else {
@@ -7425,7 +8328,7 @@ impl<'e> Vm<'e> {
                                     fast_from_cell!(value)
                                 }
                                 None => {
-                                    let top = or_raise!(self.depth.checked_sub(1), {
+                                    let top = or_raise!(depth!().checked_sub(1), {
                                         malformed("operand stack underflow".to_string())
                                     });
                                     fast_from_cell!(stack_ref(self, top))
@@ -7445,7 +8348,7 @@ impl<'e> Vm<'e> {
                                         .is_some()
                                     {
                                         if from.is_none() {
-                                            let top = self.depth - 1;
+                                            let top = depth!() - 1;
                                             truncate_stack!(top);
                                         }
                                         pc += width;
@@ -7818,9 +8721,9 @@ impl<'e> Vm<'e> {
                             // one the typed arm below makes after its pushes,
                             // and reports the same corrupt artifact.
                             let floor = if names_from {
-                                self.depth
+                                depth!()
                             } else {
-                                or_raise!(self.depth.checked_sub(1), {
+                                or_raise!(depth!().checked_sub(1), {
                                     malformed("operator with too few operands".to_string())
                                 })
                             };
@@ -7876,9 +8779,9 @@ impl<'e> Vm<'e> {
                             && fast_operators!()
                         {
                             let floor = if names_from {
-                                self.depth
+                                depth!()
                             } else {
-                                or_raise!(self.depth.checked_sub(1), {
+                                or_raise!(depth!().checked_sub(1), {
                                     malformed("operator with too few operands".to_string())
                                 })
                             };
@@ -7940,8 +8843,11 @@ impl<'e> Vm<'e> {
                                     push_fast_word!(self, frame, rhs);
                                 }
                                 _ => {
+                                    self.depth = depth!();
                                     self.push(operand_value!(6, true));
+                                    depth!(self.depth);
                                     self.push(operand_value!(8, named_is_local));
+                                    depth!(self.depth);
                                 }
                             }
                         }
@@ -7950,7 +8856,9 @@ impl<'e> Vm<'e> {
                             let lhs = operand_value!(6, true);
                             let rhs = operand_value!(8, named_is_local);
                             self.push(lhs);
+                            depth!(self.depth);
                             self.push(rhs);
+                            depth!(self.depth);
                         }
                     } else if form & code::form::NAMES_RHS != 0 {
                         // Only the right operand is named here; the left is
@@ -7960,12 +8868,15 @@ impl<'e> Vm<'e> {
                         if let Some(rhs) = named_fast!(6, named_is_local) {
                             push_fast_word!(self, frame, rhs);
                         } else {
+                            self.depth = depth!();
                             self.push(operand_value!(6, named_is_local));
+                            depth!(self.depth);
                         }
                         #[cfg(not(feature = "grain-jit"))]
                         {
                             let rhs = operand_value!(6, named_is_local);
                             self.push(rhs);
+                            depth!(self.depth);
                         }
                     }
 
@@ -7983,7 +8894,7 @@ impl<'e> Vm<'e> {
                     // is answered by it. See
                     // [`Op::BinOp`](crate::grain::bytecode::Op::BinOp).
                     if typed && !typed_asked && fast_operators!() {
-                        let top = self.depth;
+                        let top = depth!();
                         let under = or_raise!(top.checked_sub(2), {
                             malformed("operator with too few operands".to_string())
                         });
@@ -8033,7 +8944,7 @@ impl<'e> Vm<'e> {
                     // leaves nothing behind at all.
                     let unary = form & code::form::UNARY != 0;
                     if unary && fast_operators!() {
-                        let under = or_raise!(self.depth.checked_sub(1), {
+                        let under = or_raise!(depth!().checked_sub(1), {
                             malformed("operator with too few operands".to_string())
                         });
                         // An unknown kind byte is not an error here, as above:
@@ -8083,7 +8994,7 @@ impl<'e> Vm<'e> {
                     };
 
                     let first = or_raise!(
-                        self.depth.checked_sub(argc),
+                        depth!().checked_sub(argc),
                         malformed("call with too few arguments".to_string())
                     );
 
@@ -8096,11 +9007,11 @@ impl<'e> Vm<'e> {
                     // (`func/call.rs:1775-1799`).
                     #[cfg(feature = "grain-jit")]
                     if let (Some(token), 2) = (op, argc) {
-                        if self.stack.len() < self.depth {
-                            self.grow_stack(self.depth - self.stack.len());
+                        if self.stack.len() < depth!() {
+                            self.grow_stack(depth!() - self.stack.len());
                         }
                         let mut slot = first;
-                        let top_slot = self.depth.min(STACK_WORDS);
+                        let top_slot = depth!().min(STACK_WORDS);
                         while slot < top_slot {
                             let tag = frame.operand_tags[slot];
                             if tag != 0 {
@@ -8144,14 +9055,14 @@ impl<'e> Vm<'e> {
                         // reads it out with `flatten_clone`; this is the one
                         // that came off the stack, where a native's return
                         // value is the only thing that puts a cell.
-                        for slot in first..self.depth {
+                        for slot in first..depth!() {
                             if is_shared!(*stack_ref(self, slot)) {
                                 let held = mem::replace(stack_mut(self, slot), unit_value());
                                 store_value(stack_mut(self, slot), held.flatten());
                             }
                         }
                         let memo = &mut self.operator_memo;
-                        let top = self.depth;
+                        let top = depth!();
                         let (lhs, rhs) = self.stack[..top].split_at_mut(first + 1);
                         let lhs = &mut lhs[first];
                         let rhs = &mut rhs[0];
@@ -8218,8 +9129,9 @@ impl<'e> Vm<'e> {
                             ) {
                                 return Err(err);
                             }
-                            self.depth = jit::vm_depth(self) as usize;
+                            depth!(jit::vm_depth(self) as usize);
                             if !branching && jit::reseat_top_to_floor(self, first) != 0 {
+                                depth!(jit::vm_depth(self) as usize);
                                 pc += width;
                                 continue;
                             }
@@ -8309,7 +9221,7 @@ impl<'e> Vm<'e> {
                                 && jit::compiled_fn_is_plain_add(program, name_index, 2) != 0
                             {
                                 if let (Receiver::Local(slot), Some(first)) =
-                                    (receiver, self.depth.checked_sub(1))
+                                    (receiver, depth!().checked_sub(1))
                                 {
                                     if let Some(err) =
                                         jit::call_plain_add_ref_abi(self, scope, base, slot, first)
@@ -8363,7 +9275,7 @@ impl<'e> Vm<'e> {
                 code::tag::ROTATE => {
                     let under = byte!(1) as usize;
                     let top = or_raise!(
-                        self.depth.checked_sub(1),
+                        depth!().checked_sub(1),
                         malformed("rotate on an empty stack".to_string())
                     );
                     let to = or_raise!(
@@ -8379,7 +9291,7 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_ARRAY => {
                     let len = small!(1) as usize;
                     let first = or_raise!(
-                        self.depth.checked_sub(len),
+                        depth!().checked_sub(len),
                         malformed("array with too few elements".to_string())
                     );
 
@@ -8397,11 +9309,13 @@ impl<'e> Vm<'e> {
 
                     // Flattened, as Rhai does, so a shared cell is copied in
                     // rather than aliased.
+                    self.depth = depth!();
                     let array: Array = self
                         .take_values_from(first)
                         .into_iter()
                         .map(Dynamic::flatten)
                         .collect();
+                    depth!(self.depth);
                     push_word!(self, frame, Dynamic::from_array(array));
                 }
 
@@ -8409,7 +9323,7 @@ impl<'e> Vm<'e> {
                 code::tag::MAKE_MAP => {
                     let len = small!(1) as usize;
                     let first = or_raise!(
-                        self.depth.checked_sub(2 * len + 1),
+                        depth!().checked_sub(2 * len + 1),
                         malformed("map with too few operands".to_string())
                     );
                     // As for `MakeArray`: nothing was pushed for a literal
@@ -8418,7 +9332,9 @@ impl<'e> Vm<'e> {
                         self.sizes.pop();
                     }
 
+                    self.depth = depth!();
                     let mut parts = self.take_values_from(first).into_iter();
+                    depth!(self.depth);
                     let template = parts.next().expect("checked above");
                     let mut map = or_raise!(
                         template.try_cast::<Map>(),
@@ -8533,6 +9449,7 @@ impl<'e> Vm<'e> {
                     #[cfg(not(feature = "grain-jit"))]
                     {
                         let subject = self.pop()?;
+                        depth!(self.depth);
                         let target = table.dispatch(&subject) as usize;
                         release(subject);
                         transfer!(target);
@@ -8669,16 +9586,18 @@ impl<'e> Vm<'e> {
                 code::tag::CURRY => {
                     let argc = byte!(1) as usize;
                     let at = or_raise!(
-                        self.depth.checked_sub(argc + 1),
+                        depth!().checked_sub(argc + 1),
                         malformed("curry is missing its target".into())
                     );
                     let mut pointer = or_raise!(
                         clone_operand(&self.stack[at]).try_cast::<FnPtr>(),
                         self.mismatch::<FnPtr>(operand_ref(&self.stack[at]).type_name(), pos!())
                     );
+                    self.depth = depth!();
                     for value in self.take_values_from(at + 1) {
                         pointer.add_curry(value);
                     }
+                    depth!(self.depth);
                     truncate_stack!(at);
                     push_word!(self, frame, pointer.into());
                 }
@@ -8698,8 +9617,10 @@ impl<'e> Vm<'e> {
                         code::tag::CALL_FN_PTR_ON_THIS => Some(Receiver::This),
                         _ => None,
                     };
+                    self.depth = depth!();
                     let value =
                         self.call_fn_ptr(program, argc, method, receiver, scope, base, pos!())?;
+                    depth!(self.depth);
                     push_word!(self, frame, value);
                 }
 
@@ -8749,332 +9670,24 @@ impl<'e> Vm<'e> {
                 | code::tag::INDEX_SET_OP_FROM_LOCAL
                 | code::tag::INDEX_SET_OP_FROM_CONST
                 | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
-                | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
-                    // The compiler has already decided the shape, so what is
-                    // left to test is the types — which it could not know. A
-                    // slot holding a writable, unshared `Array` and an index
-                    // that is a non-negative integer inside it runs here; a
-                    // map, a shared cell, a host type with an indexer or an
-                    // out-of-range index breaks out and is answered by the
-                    // chain below, reporting exactly what it reports.
-                    //
-                    // The operands are the chain's own: the value is on top,
-                    // the index under it or named by the instruction, and an
-                    // assigning chain leaves nothing behind. Only an `Array`
-                    // reaches the fast path, and `no_index` takes the arm it
-                    // destructures with the rest of indexing — so there is
-                    // nothing left here to be fast about, and the compiler
-                    // emits no `IndexSet` on that build either.
-                    let named = !matches!(tag, code::tag::INDEX_SET | code::tag::INDEX_SET_OP);
-                    // A named value was never pushed, so the index it would
-                    // have sat on top of is the top of the stack instead.
-                    let valued = matches!(
-                        tag,
-                        code::tag::INDEX_SET_FROM_LOCAL_VALUE_CONST
-                            | code::tag::INDEX_SET_FROM_CONST_VALUE_CONST
-                            | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
-                            | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
-                    );
-                    #[cfg_attr(feature = "no_index", allow(unused_mut))]
-                    let mut assigned = false;
-                    #[cfg(not(feature = "no_index"))]
-                    'fast: {
-                        let under = self.depth.checked_sub(if valued { 1 } else { 2 });
-                        let Some(i) = indexed_int!(5, under) else {
-                            break 'fast;
-                        };
-                        // A negative index counts from the end, which is
-                        // `get_indexed_mut`'s rule and not worth restating.
-                        //
-                        // Spelled as integer operations rather than as
-                        // `usize::try_from`: that conversion reaches the
-                        // lowering as a callee with no host address, and one
-                        // such callee anywhere the portal can reach refuses
-                        // every trace, arm taken or not.
-                        if i < 0 {
-                            break 'fast;
-                        }
-                        #[allow(clippy::cast_sign_loss)]
-                        let index = i as usize;
-                        // The cast loses information only where `usize` is
-                        // narrower than `INT`; re-widening rejects that case
-                        // and no other.
-                        #[allow(clippy::cast_possible_wrap)]
-                        if index as INT != i {
-                            break 'fast;
-                        }
-                        let i = index;
-                        let at = base + small!(3) as usize;
-                        if at >= scope_len!() {
-                            break 'fast;
-                        }
-                        // The operator an op-assignment applies, which is the
-                        // kind byte the instruction ends with. Gated on
-                        // `fast_operators()` for the reason every typed arm is:
-                        // with it off the walk resolves a function, and a
-                        // host-registered `+=` on integers wins on both sides.
-                        let kind = match tag {
-                            code::tag::INDEX_SET_OP
-                            | code::tag::INDEX_SET_OP_FROM_LOCAL
-                            | code::tag::INDEX_SET_OP_FROM_CONST
-                            | code::tag::INDEX_SET_OP_FROM_LOCAL_VALUE_CONST
-                            | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST => {
-                                if !fast_operators!() {
-                                    break 'fast;
-                                }
-                                // A byte naming no operator is not an error:
-                                // the walk reads the operator out of the
-                                // chain's pool entry and answers whatever it
-                                // answers, which is what a verified program's
-                                // byte can never make it do.
-                                let Some(kind) = BinOpKind::from_byte(byte!(width - 1)) else {
-                                    break 'fast;
-                                };
-                                Some(kind)
-                            }
-                            _ => None,
-                        };
-                        // Read before the array is borrowed out of the same
-                        // scope, which a named value may be read from too.
-                        let named_value = if valued {
-                            Some(assigned_value!())
-                        } else {
-                            None
-                        };
-                        let Union::Array(array, _, AccessMode::ReadWrite) = &mut scope_entry!(at).0
-                        else {
-                            break 'fast;
-                        };
-                        // The bound is tested here rather than left to the
-                        // element read, so what crosses the boundary below is
-                        // an index already known to name an element.
-                        if i >= array_len(array) {
-                            break 'fast;
-                        }
-                        let cell = array_entry_mut!(array, i);
-                        match kind {
-                            // The operator applied to the element where it
-                            // lies, which is the whole of what this spelling
-                            // buys: an element reached as a `&mut Dynamic`
-                            // needs no `Target` to read through, no copy of it
-                            // to apply to and no second walk to write back.
-                            //
-                            // Nothing is consumed until it has answered. A
-                            // pair the arm has no entry for — a string, a
-                            // shared cell, an integer element under a float
-                            // operand — and an operator that fails both leave
-                            // every operand where the walk expects it, and the
-                            // walk is what answers, error included.
-                            Some(kind) => {
-                                let rhs = match named_value.as_ref() {
-                                    Some(value) => value,
-                                    None => {
-                                        let Some(top) = self.depth.checked_sub(1) else {
-                                            break 'fast;
-                                        };
-                                        stack_ref(self, top)
-                                    }
-                                };
-                                match apply_assign(kind, cell, rhs) {
-                                    Ok(Some(())) => {}
-                                    Ok(None) | Err(..) => break 'fast,
-                                }
-                                match named_value {
-                                    Some(value) => release(value),
-                                    None => release(pop_unit_word!(self, frame)),
-                                }
-                            }
-                            None => {
-                                let value = match named_value {
-                                    Some(value) => value,
-                                    None => pop_unit_word!(self, frame),
-                                };
-                                store_value(cell, value);
-                            }
-                        }
-                        if !named {
-                            // The index operand, done with.
-                            release(pop_unit_word!(self, frame));
-                        }
-                        assigned = true;
-                    }
-                    if assigned {
-                        pc += width;
-                        continue;
-                    }
-
-                    // Declined, so the walk runs — and it reads its operands
-                    // off the stack, where the index belongs under the value.
-                    if named || valued {
-                        let value = if valued {
-                            assigned_value!()
-                        } else {
-                            pop_unit_word!(self, frame)
-                        };
-                        if named {
-                            let index = indexed_value!(5);
-                            push_word!(self, frame, index);
-                        }
-                        push_word!(self, frame, value);
-                    }
-
-                    let index = u32::from(small!(1));
-                    let chain = or_raise!(
-                        program_entry!(program_chain, chain, program, index),
-                        malformed(format!("no chain {index}"))
-                    );
-                    // Always an assigning tail — that is what `indexed_slot`
-                    // selects on — so the walk leaves nothing here either.
-                    eval_chain!(chain, index, false);
-                }
-
-                code::tag::INDEX_GET
+                | code::tag::INDEX_SET_OP_FROM_CONST_VALUE_CONST
+                | code::tag::INDEX_GET
                 | code::tag::INDEX_GET_FROM_LOCAL
-                | code::tag::INDEX_GET_FROM_CONST => {
-                    // `Op::IndexSet`'s speculation, read side: the compiler
-                    // decided the shape and what is left to test is the types.
-                    // A shared root or a shared element breaks out, because the
-                    // walk reaches either through a `Target` that takes a write
-                    // lock and this does not.
-                    //
-                    // The element takes the index's place —
-                    // `Target::take_or_clone` clones what it referenced, so a
-                    // clone is what the walk produces too. Where the
-                    // instruction names its index that place is one above the
-                    // stack it arrived on, and the two naming tags reach the
-                    // scope entry and the constant themselves rather than
-                    // spending an instruction pushing what the next one takes
-                    // straight off again.
-                    let named = tag != code::tag::INDEX_GET;
-                    #[cfg_attr(feature = "no_index", allow(unused_mut))]
-                    let mut read = false;
-                    #[cfg(not(feature = "no_index"))]
-                    'fast: {
-                        let Some(i) = indexed_int!(5, self.depth.checked_sub(1)) else {
-                            break 'fast;
-                        };
-                        // A negative index counts from the end, which is
-                        // `get_indexed_mut`'s rule and not worth restating.
-                        // See the write side above for why this is spelled in
-                        // integer operations.
-                        if i < 0 {
-                            break 'fast;
-                        }
-                        #[allow(clippy::cast_sign_loss)]
-                        let index = i as usize;
-                        #[allow(clippy::cast_possible_wrap)]
-                        if index as INT != i {
-                            break 'fast;
-                        }
-                        let at = base + small!(3) as usize;
-                        if at >= scope_len!() {
-                            break 'fast;
-                        }
-                        let Union::Array(array, ..) = &scope_entry!(at).0 else {
-                            break 'fast;
-                        };
-                        // The bound is tested here rather than left to the
-                        // element read, so what crosses the boundary below is
-                        // an index already known to name an element.
-                        if index >= array_len(array) {
-                            break 'fast;
-                        }
-                        let cell = array_entry!(array, index);
-                        if is_shared!(*cell) {
-                            break 'fast;
-                        }
-                        let value = clone_value(cell);
-                        if named {
-                            push_word!(self, frame, value);
-                        } else {
-                            store_value(stack_mut(self, self.depth - 1), value);
-                        }
-                        read = true;
-                    }
-                    if read {
-                        pc += width;
+                | code::tag::INDEX_GET_FROM_CONST
+                | code::tag::UNWIND_TO
+                | code::tag::TICK
+                | code::tag::CHECKPOINT
+                | code::tag::STATEMENT
+                | code::tag::PUSH_HANDLER
+                | code::tag::PUSH_HANDLER_VAR
+                | code::tag::POP_HANDLER => {
+                    #[cfg(not(feature = "grain-jit"))]
+                    let jitted = false;
+                    if self.dispatch_late(
+                        frame, program, &mut pc, tag, base, stack_base, width, jitted, generation,
+                    )? {
                         continue;
                     }
-
-                    // Declined, so the walk runs — and it reads its one
-                    // operand off the stack, where a named index has never
-                    // been.
-                    if named {
-                        let index = indexed_value!(5);
-                        push_word!(self, frame, index);
-                    }
-
-                    let index = u32::from(small!(1));
-                    let chain = or_raise!(
-                        program_entry!(program_chain, chain, program, index),
-                        malformed(format!("no chain {index}"))
-                    );
-                    eval_chain!(chain, index, true);
-                }
-
-                code::tag::UNWIND_TO => {
-                    let depth = small!(1);
-                    let target = base + depth as usize;
-                    if target > scope_len!() {
-                        return Err(malformed(format!(
-                            "unwind to {target} past a scope of {}",
-                            scope_len!()
-                        )));
-                    }
-                    #[cfg(feature = "grain-jit")]
-                    jit::scope_rewind(scope, target);
-                    #[cfg(not(feature = "grain-jit"))]
-                    scope.rewind(target);
-                }
-
-                code::tag::TICK => {
-                    #[cfg(feature = "grain-jit")]
-                    jit::track_operation_error(self, program, pc);
-                    #[cfg(not(feature = "grain-jit"))]
-                    self.engine.track_operation(&mut self.global, pos!())?;
-                }
-
-                code::tag::CHECKPOINT => self.unwind_floor = scope_len!(),
-
-                code::tag::STATEMENT => {
-                    // Nothing to stop for without the interface to stop at, and
-                    // no marker in the code at all unless it was compiled by a
-                    // build that has one.
-                    #[cfg(feature = "debugging")]
-                    {
-                        let depth = small!(1);
-                        self.at_statement(scope, depth, pos!())?;
-                    }
-                }
-
-                code::tag::PUSH_HANDLER | code::tag::PUSH_HANDLER_VAR => {
-                    let target = wide!(1) as usize;
-                    let catch_var = if tag == code::tag::PUSH_HANDLER_VAR {
-                        Some(u32::from(small!(5)))
-                    } else {
-                        None
-                    };
-                    self.handlers.push(Handler {
-                        target,
-                        catch_var,
-                        operands: self.depth,
-                        scope_len: scope_len!(),
-                        iters: {
-                            #[cfg(feature = "grain-jit")]
-                            {
-                                jit::iterators_len(self) as usize
-                            }
-                            #[cfg(not(feature = "grain-jit"))]
-                            {
-                                self.iterators.len()
-                            }
-                        },
-                        caught: None,
-                    });
-                }
-
-                code::tag::POP_HANDLER => {
-                    self.handlers.pop();
                 }
 
                 code::tag::ITER_INIT => {
@@ -9083,8 +9696,7 @@ impl<'e> Vm<'e> {
                         // The range `Dynamic` stays inside the residual.
                         // Tracing `stack_take` of it is the exhaust bridge's
                         // `BC_ABORT` in `stack_take`.
-                        if let Some(err) =
-                            jit::iter_init_from_top(self, jit::position_bits(pos!()))
+                        if let Some(err) = jit::iter_init_from_top(self, jit::position_bits(pos!()))
                         {
                             return Err(err);
                         }
@@ -9097,6 +9709,7 @@ impl<'e> Vm<'e> {
                     #[cfg(not(feature = "grain-jit"))]
                     {
                         let iterable = self.pop()?;
+                        depth!(self.depth);
                         self.iter_init(iterable, pos!())?;
                     }
                 }
@@ -9404,6 +10017,8 @@ mod tests {
             local_sync: 1,
             #[cfg(feature = "grain-jit")]
             local_int_mask: 0,
+            #[cfg(feature = "grain-jit")]
+            operand_depth: 0,
             #[cfg(feature = "grain-jit")]
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]

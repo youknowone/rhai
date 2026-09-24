@@ -23,7 +23,7 @@
 use crate::grain::bytecode::BinOpKind;
 use crate::types::dynamic::AccessMode;
 use crate::types::dynamic::Union;
-use crate::{Dynamic, INT, RhaiResultOf};
+use crate::{Dynamic, RhaiResultOf, INT};
 #[cfg(feature = "no_std")]
 use std::prelude::v1::*;
 

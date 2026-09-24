@@ -402,7 +402,6 @@ pub(super) extern "C" fn program_constant_int(program: &Program<'_>, index: u32)
     }
 }
 
-
 /// Resolve an immutable assignment-operator descriptor without exposing its
 /// backing `Vec` and `slice::get` implementation to the trace.
 #[majit_macros::elidable_cannot_raise]
@@ -2853,7 +2852,9 @@ impl GrainJitDriver {
             // is the one object that outlives a single consultation, so the
             // image this merge point was handed has to be published there
             // before the door is asked anything.
-            runtime.state.publish_live(&env, &frame.jit_vable_words(), frame.operand_word_slice());
+            runtime
+                .state
+                .publish_live(&env, &frame.jit_vable_words(), frame.operand_word_slice());
 
             let was_tracing = runtime.driver.is_tracing();
             // The source pc, not the merge point's offset in the portal body.
