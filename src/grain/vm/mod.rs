@@ -2316,20 +2316,40 @@ macro_rules! pop_unit_word {
 #[cfg(feature = "grain-jit")]
 macro_rules! push_scalar {
     ($me:tt, $frame:ident, $tag:expr, $value:expr) => {{
+        // `pyframe.py` `pushvalue`: one depth, the frame field, and one
+        // store into the virtualizable array at that index.
         let depth = $frame.operand_depth;
-        // `operand_words[depth]` is `Vec::index_mut`. A trace that takes
-        // it aborts, and the `depth >= STACK_WORDS` arm then guards the
-        // second VM out of the loop. Count the push on the frame before
-        // the residual, so the vable shadow and the live field match.
-        $frame.operand_depth = depth + 1;
-        $me.depth = depth;
-        match $tag {
-            1 => jit::push_fast_int($me, $value as crate::INT),
-            2 => jit::push_fast_bool($me, $value),
-            #[cfg(not(feature = "no_float"))]
-            3 => jit::push_fast_float($me, crate::FLOAT::from_bits($value as _)),
-            _ => jit::push_fast_unit($me),
+        let value = $value;
+        let tag = $tag;
+        if depth < STACK_WORDS {
+            $frame.operand_words[depth] = value;
+            $frame.operand_tags[depth] = tag;
+            // The dynamic slot is a struct `index_mut`. That call stays a
+            // symbolic residual and aborts the trace. The word above is
+            // the virtualizable array store; this only mirrors it.
+            $me.depth = depth;
+            if depth == $me.stack.len() {
+                $me.grow_stack(1);
+            }
+            match tag {
+                1 => jit::operand_stack_store_int($me, depth, value as crate::INT),
+                2 => jit::operand_stack_store_bool($me, depth, value),
+                #[cfg(not(feature = "no_float"))]
+                3 => jit::operand_stack_store_float($me, depth, crate::FLOAT::from_bits(value as _)),
+                _ => jit::operand_stack_store_unit($me, depth),
+            }
+        } else {
+            $me.depth = depth;
+            match tag {
+                1 => jit::push_fast_int($me, value as crate::INT),
+                2 => jit::push_fast_bool($me, value),
+                #[cfg(not(feature = "no_float"))]
+                3 => jit::push_fast_float($me, crate::FLOAT::from_bits(value as _)),
+                _ => jit::push_fast_unit($me),
+            }
         }
+        $frame.operand_depth = depth + 1;
+        $me.depth = $frame.operand_depth;
     }};
 }
 #[cfg(feature = "grain-jit")]
@@ -2388,7 +2408,7 @@ macro_rules! pop_word {
             let cleared = 0i64;
             $frame.operand_words[depth] = cleared;
             if depth < $me.stack.len() {
-                *operand_mut(&mut $me.stack[depth]) = unit_value();
+                jit::operand_stack_store_unit($me, depth);
             }
             Ok::<Dynamic, Box<EvalAltResult>>(dynamic_from_word(tag, value))
         } else {
@@ -2410,7 +2430,7 @@ macro_rules! pop_unit_word {
                     let cleared = 0i64;
                     $frame.operand_words[depth] = cleared;
                     if depth < $me.stack.len() {
-                        *operand_mut(&mut $me.stack[depth]) = unit_value();
+                        jit::operand_stack_store_unit($me, depth);
                     }
                     dynamic_from_word(tag, value)
                 } else {
@@ -8205,17 +8225,14 @@ impl<'e> Vm<'e> {
                 // default to go to.
                 #[cfg(feature = "grain-jit")]
                 {
-                    // Hasher seed stays behind the residual. Integer arms
-                    // compare the subject against recovered case keys so
-                    // a taken arm is a guard in this loop.
+                    // Hashing stays inside this residual, so `HASHING_SEED`
+                    // is not a portal call. The new depth comes back as
+                    // the getter's result and is written once, onto the
+                    // frame field.
                     if let Some(err) = jit::switch_pop_subject(self, table) {
                         return Err(err);
                     }
-                    // `switch_pop_subject` pops the Vm stack only. The
-                    // operand depth is the frame field the tracer reads;
-                    // leaving it behind leaks one slot every iteration
-                    // and the trace then guards `depth >= 64`.
-                    frame.operand_depth = self.depth;
+                    frame.operand_depth = jit::vm_depth(self) as usize;
                     if jit::switch_subject_kind() == 1 {
                         let value = jit::fast_int();
                         let n = jit::switch_case_count(table);

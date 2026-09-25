@@ -179,6 +179,9 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
                     "jit_finished",
                     "jit_return_kind",
                     "iter_depth",
+                    "local_sync",
+                    "local_int_mask",
+                    "operand_depth",
                 ]
                 .into_iter()
                 .enumerate()
