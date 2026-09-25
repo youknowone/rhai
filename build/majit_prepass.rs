@@ -193,13 +193,22 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
                     )
                 })
                 .collect(),
-                vable_arrays: vec![majit_translate::VirtualizableFieldDescriptor::new_with_arraydescr(
-                    "operand_words",
-                    Some("GrainFrame".to_string()),
-                    0,
-                    8,
-                    true,
-                )],
+                vable_arrays: vec![
+                    majit_translate::VirtualizableFieldDescriptor::new_with_arraydescr(
+                        "operand_words",
+                        Some("GrainFrame".to_string()),
+                        0,
+                        8,
+                        true,
+                    ),
+                    majit_translate::VirtualizableFieldDescriptor::new_with_arraydescr(
+                        "operand_refs",
+                        Some("GrainFrame".to_string()),
+                        1,
+                        8,
+                        false,
+                    ),
+                ],
                 // The merge point is a method on this VM's own driver type, so
                 // the recogniser is pointed at it. Left at its default the
                 // marker is not recognised as a marker, the portal lowers with

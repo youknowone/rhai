@@ -281,6 +281,8 @@ pub struct GrainJitState {
     vable_statics: Vec<i64>,
     /// `operand_words` items, published with the static fields.
     operand_words: Vec<i64>,
+    /// `operand_refs` items, published with the static fields.
+    operand_refs: Vec<i64>,
 }
 
 /// Bind vinfo so `GETFIELD_VABLE` has field descrs when the resume stream
@@ -307,6 +309,7 @@ impl GrainJitState {
         env: &[i64],
         vable_statics: &[i64],
         operand_words: &[i64],
+        operand_refs: &[i64],
     ) {
         self.reds.clear();
         self.reds.extend_from_slice(env);
@@ -314,6 +317,8 @@ impl GrainJitState {
         self.vable_statics.extend_from_slice(vable_statics);
         self.operand_words.clear();
         self.operand_words.extend_from_slice(operand_words);
+        self.operand_refs.clear();
+        self.operand_refs.extend_from_slice(operand_refs);
     }
 
     /// The live frame, as the virtualizable identity red names it.
@@ -330,7 +335,7 @@ mod tests {
     fn live_values_come_from_this_entry_not_the_compiled_artifacts_meta() {
         let mut state = GrainJitState::default();
         let first = [0x1000, 0x2000];
-        state.publish_live(&first, &[], &[]);
+        state.publish_live(&first, &[], &[], &[]);
         let meta = state.build_meta(
             jitcodes::portal_merge_point_offset().expect("the lowered portal has a merge point"),
             &first,
@@ -338,7 +343,7 @@ mod tests {
         assert_eq!(state.extract_live(&meta), first);
 
         let next = [0x3000, 0x4000];
-        state.publish_live(&next, &[], &[]);
+        state.publish_live(&next, &[], &[], &[]);
         assert_eq!(state.extract_live(&meta), next);
         assert_eq!(meta.reds, first);
         let values = state.extract_live_values(&meta);
@@ -421,7 +426,7 @@ mod tests {
         };
         let vm_reg = slots[4][1] as u32;
         let mut state = GrainJitState::default();
-        state.publish_live(&[0x1111_0000, 0x2222_0000], &[], &[]);
+        state.publish_live(&[0x1111_0000, 0x2222_0000], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let other = 0xBEEF_0000;
         let mk = |index, value| GuardResumeReg {
@@ -474,7 +479,7 @@ mod tests {
         let vm_reg = slots[4][1] as u32;
         let mut state = GrainJitState::default();
         let live = 0x2222_0000;
-        state.publish_live(&[0x1111_0000, live], &[], &[]);
+        state.publish_live(&[0x1111_0000, live], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let vm_box = OpRef::input_arg_typed(3, Type::Ref);
         let mk = |index, opref, value| GuardResumeReg {
@@ -520,7 +525,7 @@ mod tests {
         let vm_reg = slots[4][1] as u32;
         let mut state = GrainJitState::default();
         let live = 0x2222_0000;
-        state.publish_live(&[0x1111_0000, live], &[], &[]);
+        state.publish_live(&[0x1111_0000, live], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let mk = |index, value| GuardResumeReg {
             bank: Type::Ref,
@@ -567,7 +572,7 @@ mod tests {
         let mut state = GrainJitState::default();
         let frame = 0x1111_0000;
         let live = 0x2222_0000;
-        state.publish_live(&[frame, live], &[], &[]);
+        state.publish_live(&[frame, live], &[], &[], &[]);
         let mk = |index, value| GuardResumeReg {
             bank: Type::Ref,
             index,
@@ -752,6 +757,9 @@ impl JitState for GrainJitState {
         let mut words = self.operand_words.clone();
         words.resize(super::OPERAND_WORDS, 0);
         arrays.push(words);
+        let mut refs = self.operand_refs.clone();
+        refs.resize(super::STACK_WORDS, 0);
+        arrays.push(refs);
         true
     }
 
@@ -835,6 +843,15 @@ impl JitState for GrainJitState {
             0,
             0,
             majit_ir::descr::make_array_descr(0, 8, Type::Int),
+        );
+        info.add_embedded_array_field(
+            "operand_refs",
+            Type::Ref,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, operand_refs),
+            8,
+            0,
+            0,
+            majit_ir::descr::make_array_descr(0, 8, Type::Ref),
         );
         Some(
             info.finalize_arc(majit_ir::descr::make_size_descr(core::mem::size_of::<

@@ -1806,6 +1806,11 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// Tag beside [`Self::operand_words`]: 1 int, 2 bool, 3 float, 4 unit, 0 heap.
     #[cfg(feature = "grain-jit")]
     pub(super) operand_tags: Vec<u8>,
+    /// Non-scalar operand slots. Item `i` is a pointer to the `Dynamic` at
+    /// depth `i` when [`Self::operand_tags`] is 0. A `Box<Vec<i64>>` so the
+    /// virtualizable array loads length at 0 and the data pointer at 8.
+    #[cfg(feature = "grain-jit")]
+    pub(super) operand_refs: Box<Vec<i64>>,
 }
 
 #[cfg(feature = "grain-jit")]
@@ -1838,6 +1843,10 @@ impl GrainFrame<'_, '_> {
 
     pub(super) fn operand_word_slice(&self) -> &[i64] {
         self.operand_words.as_slice()
+    }
+
+    pub(super) fn operand_ref_slice(&self) -> &[i64] {
+        self.operand_refs.as_slice()
     }
 
     /// Apply the canonical compiled-loop image while the merge point still
@@ -6059,6 +6068,8 @@ impl<'e> Vm<'e> {
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
+            #[cfg(feature = "grain-jit")]
+            operand_refs: Box::new(vec![0; STACK_WORDS]),
         };
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
@@ -11835,6 +11846,8 @@ mod tests {
             operand_words: Box::new(vec![0; OPERAND_WORDS]),
             #[cfg(feature = "grain-jit")]
             operand_tags: vec![0; OPERAND_WORDS],
+            #[cfg(feature = "grain-jit")]
+            operand_refs: Box::new(vec![0; STACK_WORDS]),
         };
         let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;

@@ -2859,7 +2859,12 @@ impl GrainJitDriver {
             // before the door is asked anything.
             runtime
                 .state
-                .publish_live(&env, &frame.jit_vable_words(), frame.operand_word_slice());
+                .publish_live(
+                    &env,
+                    &frame.jit_vable_words(),
+                    frame.operand_word_slice(),
+                    frame.operand_ref_slice(),
+                );
 
             let was_tracing = runtime.driver.is_tracing();
             // The source pc, not the merge point's offset in the portal body.
