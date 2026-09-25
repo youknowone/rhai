@@ -1458,6 +1458,40 @@ fn import_operand_words(frame: &mut GrainFrame, vm: &Vm) {
 }
 
 #[cfg(feature = "grain-jit")]
+/// Copy the frame's scalar operands onto `Vm::stack` for a residual that
+/// still reads the host slots. `tracing_before_residual_call` has already
+/// written the virtualizable back when this runs inside a trace.
+#[cfg(feature = "grain-jit")]
+fn adopt_host_depth(frame: &mut GrainFrame<'_, '_>, vm: &Vm<'_>) {
+    let new_depth = vm.depth;
+    let old = frame.operand_depth;
+    let mut slot = new_depth.min(old);
+    let end = new_depth.max(old).min(STACK_WORDS);
+    while slot < end {
+        frame.operand_tags[slot] = 0;
+        let cleared = 0i64;
+        frame.operand_words[slot] = cleared;
+        slot += 1;
+    }
+    frame.operand_depth = new_depth;
+}
+
+fn sync_host_operands(depth: usize, words: &[i64], tags: &[u8], vm: &mut Vm<'_>) {
+    vm.depth = depth;
+    let live = depth.min(STACK_WORDS);
+    if vm.stack.len() < live {
+        vm.grow_stack(live - vm.stack.len());
+    }
+    let mut index = 0;
+    while index < live {
+        let tag = tags[index];
+        if tag != 0 {
+            *operand_mut(&mut vm.stack[index]) = dynamic_from_word(tag, words[index]);
+        }
+        index += 1;
+    }
+}
+
 fn flush_operand_words(frame: &mut GrainFrame, vm: &mut Vm) {
     vm.depth = frame.operand_depth;
     let live = frame.operand_depth.min(STACK_WORDS);
@@ -2120,6 +2154,10 @@ pub struct Vm<'e> {
     /// would drop it.
     stack: Vec<OperandSlot>,
     /// One past the top operand — `pyframe.py:88 valuestackdepth`.
+    ///
+    /// Under `grain-jit` the frame's `operand_depth` is the depth. This
+    /// field is the host image a residual reads after
+    /// [`sync_host_operands`].
     depth: usize,
     /// Emptied `Scope`s that finished calls gave back. See [`Vm::take_scope`].
     ///
@@ -2333,9 +2371,6 @@ macro_rules! push_scalar {
         if depth < STACK_WORDS {
             $frame.operand_words[depth] = value;
             $frame.operand_tags[depth] = tag;
-            // The dynamic slot is a struct `index_mut`. That call stays a
-            // symbolic residual and aborts the trace. The word above is
-            // the virtualizable array store; this only mirrors it.
             $me.depth = depth;
             if depth == $me.stack.len() {
                 $me.grow_stack(1);
@@ -2416,9 +2451,6 @@ macro_rules! pop_word {
             $frame.operand_tags[depth] = 0;
             let cleared = 0i64;
             $frame.operand_words[depth] = cleared;
-            if depth < $me.stack.len() {
-                jit::operand_stack_store_unit($me, depth);
-            }
             Ok::<Dynamic, Box<EvalAltResult>>(dynamic_from_word(tag, value))
         } else {
             Ok::<Dynamic, Box<EvalAltResult>>(stack_take($me, depth))
@@ -2438,9 +2470,6 @@ macro_rules! pop_unit_word {
                     $frame.operand_tags[depth] = 0;
                     let cleared = 0i64;
                     $frame.operand_words[depth] = cleared;
-                    if depth < $me.stack.len() {
-                        jit::operand_stack_store_unit($me, depth);
-                    }
                     dynamic_from_word(tag, value)
                 } else {
                     stack_take($me, depth)
@@ -3199,23 +3228,23 @@ impl<'e> Vm<'e> {
     pub(super) fn push(&mut self, mut value: Dynamic) {
         #[cfg(feature = "grain-jit")]
         {
-            match jit::dynamic_as_fast(&value) {
+            let pushed_fast = match jit::dynamic_as_fast(&value) {
                 1 => {
                     jit::push_fast_int(self, jit::fast_int());
-                    return;
+                    true
                 }
                 2 => {
                     jit::push_fast_bool(self, jit::fast_bool());
-                    return;
+                    true
                 }
                 #[cfg(not(feature = "no_float"))]
                 3 => {
                     jit::push_fast_float(self, jit::fast_float());
-                    return;
+                    true
                 }
                 4 => {
                     jit::push_fast_unit(self);
-                    return;
+                    true
                 }
                 _ => {
                     // A machine int/bool/float/unit already left through
@@ -3228,7 +3257,11 @@ impl<'e> Vm<'e> {
                         jit::request_walk_abort_abi();
                         return;
                     }
+                    false
                 }
+            };
+            if pushed_fast {
+                return;
             }
         }
         let depth = self.depth;
@@ -8240,10 +8273,22 @@ impl<'e> Vm<'e> {
                     // is not a portal call. The new depth comes back as
                     // the getter's result and is written once, onto the
                     // frame field.
+                    sync_host_operands(
+                        frame.operand_depth,
+                        frame.operand_words.as_slice(),
+                        &frame.operand_tags,
+                        self,
+                    );
                     if let Some(err) = jit::switch_pop_subject(self, table) {
                         return Err(err);
                     }
                     frame.operand_depth = jit::vm_depth(self) as usize;
+                    let popped = frame.operand_depth;
+                    if popped < STACK_WORDS {
+                        frame.operand_tags[popped] = 0;
+                        let cleared = 0i64;
+                        frame.operand_words[popped] = cleared;
+                    }
                     if jit::switch_subject_kind() == 1 {
                         let value = jit::fast_int();
                         let n = jit::switch_case_count(table);
@@ -9323,6 +9368,7 @@ impl<'e> Vm<'e> {
         // (`func/call.rs:1775-1799`).
         #[cfg(feature = "grain-jit")]
         if let (Some(token), 2) = (op, argc) {
+            self.depth = depth!();
             if self.stack.len() < depth!() {
                 self.grow_stack(depth!() - self.stack.len());
             }
@@ -9406,6 +9452,12 @@ impl<'e> Vm<'e> {
                     && fast_operators!()
                     && jit::compiled_fn_is_plain_add(program, name_index, argc) != 0
                 {
+                    sync_host_operands(
+                        frame.operand_depth,
+                        frame.operand_words.as_slice(),
+                        &frame.operand_tags,
+                        self,
+                    );
                     if let Some(err) = jit::call_plain_add_abi(self, first) {
                         return Err(err);
                     }
@@ -9433,6 +9485,12 @@ impl<'e> Vm<'e> {
                         return Ok((pc, true));
                     }
                 }
+                sync_host_operands(
+                        frame.operand_depth,
+                        frame.operand_words.as_slice(),
+                        &frame.operand_tags,
+                        self,
+                    );
                 if let Some(err) = jit::call_syntactic_or_stacked_abi(
                     self,
                     program,
@@ -10388,6 +10446,12 @@ impl<'e> Vm<'e> {
                     // interned ahead of time for parameters only.
                     #[cfg(feature = "grain-jit")]
                     {
+                        sync_host_operands(
+                            frame.operand_depth,
+                            frame.operand_words.as_slice(),
+                            &frame.operand_tags,
+                            self,
+                        );
                         if let Some(err) = jit::declare_local_abi(
                             self,
                             program,
@@ -10398,6 +10462,7 @@ impl<'e> Vm<'e> {
                         ) {
                             return Err(err);
                         }
+                        adopt_host_depth(frame, self);
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
@@ -10533,6 +10598,12 @@ impl<'e> Vm<'e> {
                             Some(BinOperand::Const(index)) => (2, index),
                             None => (0, 0),
                         };
+                        sync_host_operands(
+                            frame.operand_depth,
+                            frame.operand_words.as_slice(),
+                            &frame.operand_tags,
+                            self,
+                        );
                         if let Some(err) = jit::assign_local_abi(
                             self,
                             program,
@@ -10547,6 +10618,7 @@ impl<'e> Vm<'e> {
                         ) {
                             return Err(err);
                         }
+                        adopt_host_depth(frame, self);
                     }
                     #[cfg(not(feature = "grain-jit"))]
                     {
