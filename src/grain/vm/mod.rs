@@ -2317,26 +2317,18 @@ macro_rules! pop_unit_word {
 macro_rules! push_scalar {
     ($me:tt, $frame:ident, $tag:expr, $value:expr) => {{
         let depth = $frame.operand_depth;
-        if depth < STACK_WORDS {
-            $frame.operand_words[depth] = $value;
-            $frame.operand_tags[depth] = $tag;
-            if depth == $me.stack.len() {
-                $me.depth = depth;
-                $me.grow_stack(1);
-            }
-            *operand_mut(&mut $me.stack[depth]) = dynamic_from_word($tag, $value);
-            $frame.operand_depth = depth + 1;
-            $me.depth = $frame.operand_depth;
-        } else {
-            $me.depth = depth;
-            match $tag {
-                1 => jit::push_fast_int($me, $value as crate::INT),
-                2 => jit::push_fast_bool($me, $value),
-                #[cfg(not(feature = "no_float"))]
-                3 => jit::push_fast_float($me, crate::FLOAT::from_bits($value as _)),
-                _ => jit::push_fast_unit($me),
-            }
-            $frame.operand_depth = $me.depth;
+        // `operand_words[depth]` is `Vec::index_mut`. A trace that takes
+        // it aborts, and the `depth >= STACK_WORDS` arm then guards the
+        // second VM out of the loop. Count the push on the frame before
+        // the residual, so the vable shadow and the live field match.
+        $frame.operand_depth = depth + 1;
+        $me.depth = depth;
+        match $tag {
+            1 => jit::push_fast_int($me, $value as crate::INT),
+            2 => jit::push_fast_bool($me, $value),
+            #[cfg(not(feature = "no_float"))]
+            3 => jit::push_fast_float($me, crate::FLOAT::from_bits($value as _)),
+            _ => jit::push_fast_unit($me),
         }
     }};
 }
@@ -8219,6 +8211,11 @@ impl<'e> Vm<'e> {
                     if let Some(err) = jit::switch_pop_subject(self, table) {
                         return Err(err);
                     }
+                    // `switch_pop_subject` pops the Vm stack only. The
+                    // operand depth is the frame field the tracer reads;
+                    // leaving it behind leaks one slot every iteration
+                    // and the trace then guards `depth >= 64`.
+                    frame.operand_depth = self.depth;
                     if jit::switch_subject_kind() == 1 {
                         let value = jit::fast_int();
                         let n = jit::switch_case_count(table);
