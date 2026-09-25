@@ -2507,6 +2507,11 @@ impl Runtime {
             .chain(green_types.iter().copied())
             .collect();
         let mut driver = JitDriver::with_descriptor(THRESHOLD, descriptor);
+        // `rlib/jit.py` `set_param(driver, 'enable_opts', ...)`. Absent env
+        // leaves the default `ENABLE_ALL_OPTS` chain.
+        if let Ok(value) = std::env::var("MAJIT_ENABLE_OPTS") {
+            driver.set_param_enable_opts(&value);
+        }
         driver.set_is_recursive(true);
         driver.ensure_descriptor_registered();
         // `with_descriptor` registers a clone built before
