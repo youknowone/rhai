@@ -215,6 +215,13 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
                 // no merge point at all, and the tables below describe a loop
                 // the tracer can never enter.
                 jitdriver_receiver_roots: vec!["GrainJitDriver".to_string()],
+                // Stack-resident frame: `Struct`, not `GcStruct`. An
+                // unregistered owner defaults to `_gckind='gc'`
+                // (`field_owner_is_gc`), and `rewrite_op_getsubstruct`
+                // refuses an interior address of a GC struct.
+                struct_storage: vec![majit_translate::StructStorageDescriptor::raw(
+                    "GrainFrame",
+                )],
                 // This VM has neither helper. Left at their defaults they name
                 // the other interpreter's externs, and every symbolic fnaddr on
                 // this side is still unbound, so such a call keeps the build's
