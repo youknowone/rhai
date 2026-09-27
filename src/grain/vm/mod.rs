@@ -1398,7 +1398,6 @@ fn take_detached(spare: &mut OperandSlot) -> Dynamic {
 /// its box with the frame's spare box. The `Dynamic` stays inside the
 /// box that leaves the array; only the two pointers move.
 #[cfg(feature = "grain-jit")]
-#[majit_macros::dont_look_inside_cannot_raise]
 pub(super) fn detach_operand(
     slots: &mut Vec<OperandSlot>,
     spare: &mut OperandSlot,
@@ -1816,7 +1815,7 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// never moves inside the virtualizable array; this box is the one
     /// that leaves. Not a second copy of a live operand.
     #[cfg(feature = "grain-jit")]
-    operand_spare: std::mem::ManuallyDrop<OperandSlot>,
+    operand_spare: OperandSlot,
     /// Scalar operand prefix. Item `i` is the payload at `operand_depth == i`.
     /// The `Box` is the container the virtualizable array descriptor loads:
     /// length at 0, data pointer at 8.
@@ -1860,7 +1859,7 @@ impl GrainFrame<'_, '_> {
             self.local_sync,
             self.local_int_mask,
             self.operand_depth as i64,
-            (&**self.operand_spare as *const Dynamic) as usize as i64,
+            (&*self.operand_spare as *const Dynamic) as usize as i64,
         ]
     }
 
@@ -6109,7 +6108,7 @@ impl<'e> Vm<'e> {
             #[cfg(feature = "grain-jit")]
             operand_refs: Box::new(operand_slots(floor + chunk.max_stack() as usize)),
             #[cfg(feature = "grain-jit")]
-            operand_spare: std::mem::ManuallyDrop::new(operand_slot(unit_value())),
+            operand_spare: operand_slot(unit_value()),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: operand_slots(floor + chunk.max_stack() as usize),
         };
@@ -11747,7 +11746,7 @@ mod tests {
             #[cfg(feature = "grain-jit")]
             operand_refs: Box::new(Vec::new()),
             #[cfg(feature = "grain-jit")]
-            operand_spare: std::mem::ManuallyDrop::new(operand_slot(unit_value())),
+            operand_spare: operand_slot(unit_value()),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: Vec::new(),
         };

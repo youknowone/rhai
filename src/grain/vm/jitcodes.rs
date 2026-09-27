@@ -517,10 +517,6 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::truncate_stack as *const () as usize as i64,
         ),
         (
-            "rhai::grain::vm::detach_operand",
-            super::detach_operand as *const () as usize as i64,
-        ),
-        (
             "rhai::grain::vm::jit::scope_rewind",
             super::jit::scope_rewind as *const () as usize as i64,
         ),
