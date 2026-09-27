@@ -330,7 +330,9 @@ fn verify_chunk(
         // `pyassem.py` `_do_stack_depth_walk`: the recorded depth is the
         // maximum after every push the opcode performs, including a push
         // that the next instruction never sees.
-        high_water = high_water.max(next_depth).max(stack_peak(&op, depth));
+        high_water = high_water
+            .max(next_depth)
+            .max(stack_peak(&op, pools, depth));
 
         let width = code::width(code, at).expect("decoded, so it has a width");
         let next = at + width;
@@ -632,8 +634,31 @@ fn opcode_temps(op: &Op) -> usize {
     }
 }
 
-fn stack_peak(op: &Op, depth: usize) -> usize {
-    depth + opcode_temps(op)
+fn stack_peak(op: &Op, pools: &Pools, depth: usize) -> usize {
+    depth + opcode_temps(op) + chain_method_repush(op, pools)
+}
+
+/// A chain method re-pushes its arguments onto the operand stack while the
+/// chain's own operands are still there (`walk_chain` `push_all`). The
+/// copies are dropped before the instruction's successor, so they are a
+/// peak, not a net.
+fn chain_method_repush(op: &Op, pools: &Pools) -> usize {
+    let index = match op {
+        Op::Chain { chain, .. } | Op::IndexGet { chain, .. } | Op::IndexSet { chain, .. } => {
+            *chain as usize
+        }
+        _ => return 0,
+    };
+    let Some(chain) = pools.chains.get(index) else {
+        return 0;
+    };
+    let mut extra = 0usize;
+    for step in &chain.steps {
+        if let Step::Method { argc, .. } = step {
+            extra = extra.max(*argc as usize);
+        }
+    }
+    extra
 }
 
 fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
