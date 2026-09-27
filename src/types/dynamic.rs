@@ -92,6 +92,11 @@ pub enum Union {
     #[cfg(not(feature = "no_time"))]
     TimeStamp(Box<Instant>, Tag, AccessMode),
 
+    /// A `for` iterator. It stays on the operand stack: a move is a box
+    /// swap and a peek is a pointer. Cloning one is an invariant violation.
+    #[cfg(feature = "grain")]
+    Iter(Box<super::iteration::Iteration>, Tag, AccessMode),
+
     /// Any type as a trait object.
     ///
     /// An extra level of redirection is used in order to avoid bloating the size of [`Dynamic`]
@@ -205,6 +210,8 @@ impl Dynamic {
             Union::Map(_, tag, _) => tag,
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(_, tag, _) => tag,
+            #[cfg(feature = "grain")]
+            Union::Iter(_, tag, _) => tag,
             #[cfg(not(feature = "no_closure"))]
             Union::Shared(_, tag, _) => tag,
         }
@@ -230,6 +237,8 @@ impl Dynamic {
             Union::Map(_, ref mut tag, _) => *tag = value,
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(_, ref mut tag, _) => *tag = value,
+            #[cfg(feature = "grain")]
+            Union::Iter(_, ref mut tag, _) => *tag = value,
             #[cfg(not(feature = "no_closure"))]
             Union::Shared(_, ref mut tag, _) => *tag = value,
         }
@@ -339,6 +348,8 @@ impl Dynamic {
             Union::FnPtr(..) => TypeId::of::<FnPtr>(),
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(..) => TypeId::of::<Instant>(),
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => TypeId::of::<super::iteration::Iteration>(),
 
             Union::Variant(ref v, ..) => (***v).type_id(),
 
@@ -373,6 +384,8 @@ impl Dynamic {
             Union::FnPtr(..) => "Fn",
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(..) => "timestamp",
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => "iterator",
 
             Union::Variant(ref v, ..) => (***v).type_name(),
 
@@ -481,6 +494,10 @@ impl Hash for Dynamic {
 
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(..) => unimplemented!("Timestamp cannot be hashed"),
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => {
+                unreachable!("an iterator never leaves the operand stack")
+            }
         }
     }
 }
@@ -506,6 +523,8 @@ impl fmt::Display for Dynamic {
             Union::FnPtr(ref v, ..) => fmt::Display::fmt(v, f),
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(..) => f.write_str("<timestamp>"),
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => f.write_str("<iterator>"),
 
             Union::Variant(ref v, ..) => {
                 let _value_any = (***v).as_any();
@@ -674,6 +693,8 @@ impl fmt::Debug for Dynamic {
             Union::FnPtr(ref v, ..) => fmt::Debug::fmt(v, f),
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(..) => write!(f, "<timestamp>"),
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => write!(f, "<iterator>"),
 
             Union::Variant(ref v, ..) => {
                 let _value_any = (***v).as_any();
@@ -856,6 +877,11 @@ impl Clone for Dynamic {
 
             #[cfg(not(feature = "no_closure"))]
             Union::Shared(ref cell, tag, ..) => Self(Union::Shared(cell.clone(), tag, ReadWrite)),
+
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => {
+                unreachable!("an iterator never leaves the operand stack")
+            }
         }
     }
 }
@@ -1106,6 +1132,8 @@ impl Dynamic {
             Union::Map(.., access) => access,
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(.., access) => access,
+            #[cfg(feature = "grain")]
+            Union::Iter(.., access) => access,
             #[cfg(not(feature = "no_closure"))]
             Union::Shared(.., access) => access,
         }
@@ -1143,6 +1171,8 @@ impl Dynamic {
             }
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(.., ref mut access) => *access = typ,
+            #[cfg(feature = "grain")]
+            Union::Iter(.., ref mut access) => *access = typ,
             #[cfg(not(feature = "no_closure"))]
             Union::Shared(.., ref mut access) => *access = typ,
         }
@@ -1231,6 +1261,8 @@ impl Dynamic {
             Union::FnPtr(ref f, ..) => f.curry().iter().all(Self::is_hashable),
             #[cfg(not(feature = "no_time"))]
             Union::TimeStamp(..) => false,
+            #[cfg(feature = "grain")]
+            Union::Iter(..) => false,
 
             Union::Variant(ref v, ..) => {
                 let _value_any = (***v).as_any();

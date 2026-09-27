@@ -3,6 +3,8 @@
 pub mod bloom_filter;
 pub mod custom_types;
 pub mod dynamic;
+#[cfg(feature = "grain")]
+pub mod iteration;
 pub mod error;
 pub mod float;
 pub mod fn_ptr;
