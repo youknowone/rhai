@@ -178,7 +178,6 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
                     "jit_resume_pc_plus_one",
                     "jit_finished",
                     "jit_return_kind",
-                    "iter_depth",
                     "local_sync",
                     "local_int_mask",
                     "operand_depth",
