@@ -277,7 +277,7 @@ fn run_pipeline() -> majit_translate::ProgramPipelineResult {
             // — `jit_merge_point/cIRFIRF` there, `jitmergepoint` here — so a
             // name matched verbatim reports a present op as absent. Compare
             // with the argcode suffix and the separators dropped.
-            majit_translate::codewriter::format::format_assembler(ssa)
+            majit_translate::jitcode::SsaReprDump::format_assembler(ssa.as_ref())
                 .lines()
                 .filter(|line| {
                     line.split_whitespace().any(|word| {

@@ -737,29 +737,31 @@ impl JitState for GrainJitState {
     /// supply them would be entering with fewer arguments than the artifact
     /// declares -- which is what the driver declines on.
     ///
-    /// No array fields are declared, so `arrays` is emptied rather than
-    /// resized.
+    /// Statics, then each array's items, in `read_boxes` order. The lengths
+    /// are the fixed operand-word and operand-ref arrays.
     fn export_virtualizable_boxes_into(
         &self,
         meta: &Self::Meta,
         virtualizable: &str,
         info: &majit_metainterp::virtualizable::VirtualizableInfo,
-        statics: &mut Vec<i64>,
-        arrays: &mut Vec<Vec<i64>>,
+        boxes: &mut Vec<i64>,
+        array_lengths: &mut Vec<usize>,
     ) -> bool {
         let _ = meta;
         if virtualizable != "frame" || self.vable_statics.len() != info.static_fields.len() {
             return false;
         }
-        statics.clear();
-        statics.extend_from_slice(&self.vable_statics);
-        arrays.clear();
+        boxes.clear();
+        boxes.extend_from_slice(&self.vable_statics);
         let mut words = self.operand_words.clone();
         words.resize(super::OPERAND_WORDS, 0);
-        arrays.push(words);
+        boxes.extend_from_slice(&words);
         let mut refs = self.operand_refs.clone();
         refs.resize(super::STACK_WORDS, 0);
-        arrays.push(refs);
+        boxes.extend_from_slice(&refs);
+        array_lengths.clear();
+        array_lengths.push(words.len());
+        array_lengths.push(refs.len());
         true
     }
 
