@@ -828,11 +828,6 @@ impl JitState for GrainJitState {
             Type::Int,
             core::mem::offset_of!(GrainFrame<'static, 'static>, operand_depth),
         );
-        info.add_field(
-            "operand_spare",
-            Type::Ref,
-            core::mem::offset_of!(GrainFrame<'static, 'static>, operand_spare),
-        );
         // The field is a `Box<Vec<i64>>`. The `Vec` behind it has len at 0
         // and the data pointer at 8.
         info.add_embedded_array_field(

@@ -1239,54 +1239,30 @@ pub struct Fault {
     pub slot: Option<u32>,
 }
 
-/// One operand-stack cell in the interpreter build selected for this crate.
+/// One operand-stack cell: a nullable box pointer.
 ///
-/// RPython's value stack is an array of object references.  Rust's `Dynamic`
-/// is instead a 16-byte inline enum, so exposing `Vec<Dynamic>` to majit makes
-/// `getarrayitem_gc_r` load only the first word of each value.  The JIT build
-/// gives every preallocated stack cell a stable box and mutates its contents;
-/// the vector then contains genuine pointer-width elements without allocating
-/// on push/pop.  The non-JIT Grain interpreter keeps its original inline
-/// representation and cost model.
-#[cfg(feature = "grain-jit")]
-type OperandSlot = Box<Dynamic>;
-#[cfg(not(feature = "grain-jit"))]
-type OperandSlot = Dynamic;
+/// `popvalue` reads the word and stores null. `pushvalue` stores the
+/// pointer. Empty is `None`.
+type OperandSlot = Option<Box<Dynamic>>;
 
 #[inline(always)]
 fn operand_slot(value: Dynamic) -> OperandSlot {
-    #[cfg(feature = "grain-jit")]
-    {
-        Box::new(value)
-    }
-    #[cfg(not(feature = "grain-jit"))]
-    {
-        value
-    }
+    Some(Box::new(value))
 }
 
 #[inline(always)]
 fn operand_ref(slot: &OperandSlot) -> &Dynamic {
-    #[cfg(feature = "grain-jit")]
-    {
-        slot.as_ref()
-    }
-    #[cfg(not(feature = "grain-jit"))]
-    {
-        slot
-    }
+    slot.as_deref().expect("empty operand slot")
 }
 
 #[inline(always)]
 fn operand_mut(slot: &mut OperandSlot) -> &mut Dynamic {
-    #[cfg(feature = "grain-jit")]
-    {
-        slot.as_mut()
-    }
-    #[cfg(not(feature = "grain-jit"))]
-    {
-        slot
-    }
+    slot.as_deref_mut().expect("empty operand slot")
+}
+
+#[inline(always)]
+fn take_operand(slot: &mut OperandSlot) -> Dynamic {
+    *slot.take().expect("empty operand slot")
 }
 
 #[inline(always)]
@@ -1296,20 +1272,7 @@ fn clone_operand(slot: &OperandSlot) -> Dynamic {
 
 #[inline(always)]
 fn set_operand(slot: &mut OperandSlot, value: Dynamic) {
-    // A scalar write goes through `store_tagged_word`. A non-scalar
-    // replaces the box pointer. `overwrite` is `mem::replace` of the
-    // whole `Dynamic`, and that write is what faults when the slot is
-    // a virtualizable array element.
-    #[cfg(feature = "grain-jit")]
-    {
-        // Replace the box pointer. Assigning `*slot = Box::new(...)` is a
-        // plain `Deref` store, which the lowering leaves as `__deref_write`.
-        let _old = mem::replace(slot, Box::new(value));
-    }
-    #[cfg(not(feature = "grain-jit"))]
-    {
-        overwrite(operand_mut(slot), value);
-    }
+    *slot = Some(Box::new(value));
 }
 
 #[inline(always)]
@@ -1372,39 +1335,10 @@ fn array_len(array: &Array) -> usize {
     }
 }
 
-/// `pyframe.py` `popvalue_maybe_none`: read the slot, then store unit.
-///
-/// The non-JIT build keeps the value inline, so this is a real move.
-/// The JIT build must not: `pop`/`peek` yield the box, and a value that
-/// leaves the operand array is [`detach_operand`] (a pointer swap).
+/// Move a `Dynamic` out of a place that is not an operand slot.
 #[inline(always)]
 pub(super) fn pop_slot(slot: &mut Dynamic) -> Dynamic {
     mem::replace(slot, unit_value())
-}
-
-/// Read a box that has already left the operand array.
-///
-/// The pointer swap is the traced move. This read is the interpreter
-/// taking the `Dynamic` out of that detached box, so it is not a
-/// field-wise copy of a virtualizable slot.
-#[cfg(feature = "grain-jit")]
-#[majit_macros::dont_look_inside_cannot_raise]
-fn take_detached(spare: &mut OperandSlot) -> Dynamic {
-    let taken = std::mem::replace(spare, operand_slot(unit_value()));
-    *taken
-}
-
-/// Move a non-scalar operand out of the virtualizable array by swapping
-/// its box with the frame's spare box. The `Dynamic` stays inside the
-/// box that leaves the array; only the two pointers move.
-#[cfg(feature = "grain-jit")]
-pub(super) fn detach_operand(
-    slots: &mut Vec<OperandSlot>,
-    spare: &mut OperandSlot,
-    index: usize,
-) -> Dynamic {
-    std::mem::swap(&mut slots[index], spare);
-    take_detached(spare)
 }
 
 /// A unit [`Dynamic`].
@@ -1702,7 +1636,7 @@ fn frame_local_step(
                 let cleared = 0i64;
                 frame.operand_words[top] = cleared;
                 if top < frame.operand_refs.len() {
-                    let _old = mem::replace(&mut frame.operand_refs[top], operand_slot(unit_value()));
+                    drop(frame.operand_refs[top].take());
                 }
             }
             Ok(Some(pc + width))
@@ -1811,11 +1745,6 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// One past the top operand. Resume writes this static field with the
     /// operand array; the dispatch loop reads it here.
     operand_depth: usize,
-    /// Spare box swapped with a popped non-scalar slot. The `Dynamic`
-    /// never moves inside the virtualizable array; this box is the one
-    /// that leaves. Not a second copy of a live operand.
-    #[cfg(feature = "grain-jit")]
-    operand_spare: OperandSlot,
     /// Scalar operand prefix. Item `i` is the payload at `operand_depth == i`.
     /// The `Box` is the container the virtualizable array descriptor loads:
     /// length at 0, data pointer at 8.
@@ -1845,7 +1774,7 @@ impl GrainFrame<'_, '_> {
     /// here instead of through those offsets keeps this module free of
     /// `unsafe`; what pairs the two is the order, which the export asserts the
     /// length of.
-    pub(super) fn jit_vable_words(&self) -> [i64; 11] {
+    pub(super) fn jit_vable_words(&self) -> [i64; 10] {
         [
             &*self.scope as *const Scope<'_> as usize as i64,
             self.base as i64,
@@ -1859,7 +1788,6 @@ impl GrainFrame<'_, '_> {
             self.local_sync,
             self.local_int_mask,
             self.operand_depth as i64,
-            (&*self.operand_spare as *const Dynamic) as usize as i64,
         ]
     }
 
@@ -1872,7 +1800,11 @@ impl GrainFrame<'_, '_> {
     pub(super) fn operand_ref_words(&self) -> Vec<i64> {
         self.operand_refs
             .iter()
-            .map(|slot| (&**slot as *const Dynamic) as usize as i64)
+            .map(|slot| {
+                slot.as_ref()
+                    .map(|boxed| (&**boxed as *const Dynamic) as usize as i64)
+                    .unwrap_or(0)
+            })
             .collect()
     }
 
@@ -1914,17 +1846,7 @@ fn operand_slots(n: usize) -> Vec<OperandSlot> {
     let mut cells = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
-        // The hot store is `dynamic_store_int` into a box that already
-        // has the integer variant. A unit seed would assign the whole
-        // enum on the first push.
-        #[cfg(feature = "grain-jit")]
-        cells.push(operand_slot(Dynamic(Union::Int(
-            0,
-            0,
-            AccessMode::ReadWrite,
-        ))));
-        #[cfg(not(feature = "grain-jit"))]
-        cells.push(operand_slot(unit_value()));
+        cells.push(None);
         i += 1;
     }
     cells
@@ -1955,11 +1877,6 @@ impl GrainFrame<'_, '_> {
     }
 
     fn write_cell(&mut self, index: usize, value: Dynamic) {
-        #[cfg(not(feature = "grain-jit"))]
-        if index >= self.operand_refs.len() {
-            self.operand_refs
-                .resize_with(index + 1, || operand_slot(unit_value()));
-        }
         #[cfg(feature = "grain-jit")]
         self.note_scalar(index, &value);
         set_operand(&mut self.operand_refs[index], value);
@@ -1977,9 +1894,8 @@ impl GrainFrame<'_, '_> {
         let depth = self.operand_depth.checked_sub(1).ok_or_else(|| {
             malformed("operand stack underflow".to_string())
         })?;
-        // Take first. An aborted trace stops inside `detach_operand`
-        // and resumes the interpreter on this frame; a depth store
-        // that already ran would skip the value the call never took.
+        // Take first. A depth store that already ran would skip the
+        // value the take never moved.
         let value = self.take_cell(depth);
         self.operand_depth = depth;
         Ok(value)
@@ -1991,17 +1907,12 @@ impl GrainFrame<'_, '_> {
             let tag = self.operand_tags[index];
             let word = self.operand_words[index];
             self.clear_scalar(index);
-            // Leave the integer box in place so the next store writes
-            // `__pos_0` instead of assigning the whole enum.
+            drop(self.operand_refs[index].take());
             return dynamic_from_word(tag, word);
         }
         #[cfg(feature = "grain-jit")]
-        {
-            self.clear_scalar(index);
-            return detach_operand(&mut self.operand_refs, &mut self.operand_spare, index);
-        }
-        #[cfg(not(feature = "grain-jit"))]
-        pop_slot(self.cell_mut(index))
+        self.clear_scalar(index);
+        take_operand(&mut self.operand_refs[index])
     }
 
     fn push_cell(&mut self, value: Dynamic) {
@@ -2017,16 +1928,8 @@ impl GrainFrame<'_, '_> {
         let mut slot = depth;
         while slot < self.operand_depth {
             #[cfg(feature = "grain-jit")]
-            {
-                // The box pointer stays in the virtualizable array. Freeing
-                // it hands the next allocator the same address, and a later
-                // store drops whatever reused that memory.
-                self.clear_scalar(slot);
-                let old = mem::replace(operand_mut(&mut self.operand_refs[slot]), unit_value());
-                drop(old);
-            }
-            #[cfg(not(feature = "grain-jit"))]
-            overwrite(self.cell_mut(slot), unit_value());
+            self.clear_scalar(slot);
+            drop(self.operand_refs[slot].take());
             slot += 1;
         }
         self.operand_depth = depth;
@@ -2486,7 +2389,10 @@ macro_rules! push_scalar {
             $frame.operand_words[depth] = value;
             $frame.operand_tags[depth] = tag;
         }
-        store_tagged_word(operand_mut(&mut $frame.operand_refs[depth]), tag, value);
+        set_operand(
+            &mut $frame.operand_refs[depth],
+            dynamic_from_word(tag, value),
+        );
         $frame.operand_depth = depth + 1;
     }};
 }
@@ -2541,21 +2447,7 @@ macro_rules! pop_word {
             depth,
             malformed("operand stack underflow".to_string())
         );
-        let value = if depth < STACK_WORDS && $frame.operand_tags[depth] != 0 {
-            let tag = $frame.operand_tags[depth];
-            let word = $frame.operand_words[depth];
-            let cleared = 0i64;
-            $frame.operand_tags[depth] = 0;
-            $frame.operand_words[depth] = cleared;
-            dynamic_from_word(tag, word)
-        } else {
-            if depth < STACK_WORDS {
-                let cleared = 0i64;
-                $frame.operand_tags[depth] = 0;
-                $frame.operand_words[depth] = cleared;
-            }
-            detach_operand(&mut $frame.operand_refs, &mut $frame.operand_spare, depth)
-        };
+        let value = $frame.take_cell(depth);
         $frame.operand_depth = depth;
         Ok::<Dynamic, Box<EvalAltResult>>(value)
     }};
@@ -2567,21 +2459,7 @@ macro_rules! pop_unit_word {
         let depth = $frame.operand_depth.checked_sub(1);
         match depth {
             Some(depth) => {
-                let value = if depth < STACK_WORDS && $frame.operand_tags[depth] != 0 {
-                    let tag = $frame.operand_tags[depth];
-                    let word = $frame.operand_words[depth];
-                    let cleared = 0i64;
-                    $frame.operand_tags[depth] = 0;
-                    $frame.operand_words[depth] = cleared;
-                    dynamic_from_word(tag, word)
-                } else {
-                    if depth < STACK_WORDS {
-                        let cleared = 0i64;
-                        $frame.operand_tags[depth] = 0;
-                        $frame.operand_words[depth] = cleared;
-                    }
-                    detach_operand(&mut $frame.operand_refs, &mut $frame.operand_spare, depth)
-                };
+                let value = $frame.take_cell(depth);
                 $frame.operand_depth = depth;
                 value
             }
@@ -5130,7 +5008,7 @@ impl<'e> Vm<'e> {
                 if argc != 1 {
                     return Err(EvalAltResult::ErrorFunctionNotFound(name.to_string(), pos).into());
                 }
-                let var_name = frame.operand_refs[first].as_immutable_string_ref().map_err(|typ| {
+                let var_name = operand_ref(&frame.operand_refs[first]).as_immutable_string_ref().map_err(|typ| {
                     self.engine
                         .make_type_mismatch_err::<ImmutableString>(typ, pos)
                 })?;
@@ -5140,7 +5018,7 @@ impl<'e> Vm<'e> {
             crate::engine::KEYWORD_IS_DEF_FN => {
                 let (this_type, fn_name, arity) = match argc {
                     2 => {
-                        let var_name = frame.operand_refs[first]
+                        let var_name = operand_ref(&frame.operand_refs[first])
                             .as_immutable_string_ref()
                             .as_deref()
                             .cloned()
@@ -5148,13 +5026,13 @@ impl<'e> Vm<'e> {
                                 self.engine
                                     .make_type_mismatch_err::<ImmutableString>(typ, pos)
                             })?;
-                        let arity = frame.operand_refs[first + 1]
+                        let arity = operand_ref(&frame.operand_refs[first + 1])
                             .as_int()
                             .map_err(|typ| self.engine.make_type_mismatch_err::<INT>(typ, pos))?;
                         (None, var_name, arity as usize)
                     }
                     3 => {
-                        let this_type = frame.operand_refs[first]
+                        let this_type = operand_ref(&frame.operand_refs[first])
                             .as_immutable_string_ref()
                             .as_deref()
                             .cloned()
@@ -5162,7 +5040,7 @@ impl<'e> Vm<'e> {
                                 self.engine
                                     .make_type_mismatch_err::<ImmutableString>(typ, pos)
                             })?;
-                        let var_name = frame.operand_refs[first + 1]
+                        let var_name = operand_ref(&frame.operand_refs[first + 1])
                             .as_immutable_string_ref()
                             .as_deref()
                             .cloned()
@@ -5170,7 +5048,7 @@ impl<'e> Vm<'e> {
                                 self.engine
                                     .make_type_mismatch_err::<ImmutableString>(typ, pos)
                             })?;
-                        let arity = frame.operand_refs[first + 2]
+                        let arity = operand_ref(&frame.operand_refs[first + 2])
                             .as_int()
                             .map_err(|typ| self.engine.make_type_mismatch_err::<INT>(typ, pos))?;
                         (Some(this_type), var_name, arity as usize)
@@ -5543,7 +5421,7 @@ impl<'e> Vm<'e> {
             // read-only precisely because it is a value and not a place. Asking
             // the resolver again to find that out would run it twice, which a
             // host can see.
-            Site::Name(..) if frame.operand_refs[first].is_read_only() => None,
+            Site::Name(..) if operand_ref(&frame.operand_refs[first]).is_read_only() => None,
             Site::Name(name) => frame.scope.get_mut(name),
         };
 
@@ -6107,8 +5985,6 @@ impl<'e> Vm<'e> {
             operand_tags: vec![0; OPERAND_WORDS],
             #[cfg(feature = "grain-jit")]
             operand_refs: Box::new(operand_slots(floor + chunk.max_stack() as usize)),
-            #[cfg(feature = "grain-jit")]
-            operand_spare: operand_slot(unit_value()),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: operand_slots(floor + chunk.max_stack() as usize),
         };
@@ -8123,10 +7999,7 @@ impl<'e> Vm<'e> {
                 // The opcode count is one, so the suffix is `to` and `top`.
                 // Swap those two boxes. A range of the operand array is a
                 // call on the virtualizable field.
-                let last = std::mem::replace(
-                    &mut frame.operand_refs[top],
-                    operand_slot(unit_value()),
-                );
+                let last = frame.operand_refs[top].take();
                 let prev = std::mem::replace(&mut frame.operand_refs[to], last);
                 frame.operand_refs[top] = prev;
             }
@@ -9274,8 +9147,8 @@ impl<'e> Vm<'e> {
             let memo = &mut self.operator_memo;
             let top = depth!();
             let (lhs, rhs) = frame.operand_refs[..top].split_at_mut(first + 1);
-            let lhs = &mut lhs[first];
-            let rhs = &mut rhs[0];
+            let lhs = operand_mut(&mut lhs[first]);
+            let rhs = operand_mut(&mut rhs[0]);
 
             // Custom types go to dispatch first, so a registered
             // function still wins for them.
@@ -11698,22 +11571,20 @@ mod tests {
     use crate::grain::program::{Function, Parts};
     use crate::{CallFnOptions, Engine, Scope, INT};
 
-    /// The meta-tracer's `getarrayitem_gc_r` works on an array of references,
-    /// just as PyPy's value stack does.  The boxes are allocated only when the
-    /// frame grows; replacing a live operand must keep the slot address stable.
+    /// One nullable word. `take` moves the box out and leaves null.
     #[test]
     #[cfg(feature = "grain-jit")]
-    fn jit_operand_slots_are_pointer_sized_and_reused() {
+    fn jit_operand_slots_are_nullable_pointers() {
         assert_eq!(
             core::mem::size_of::<OperandSlot>(),
             core::mem::size_of::<usize>()
         );
 
         let mut slot = operand_slot(Dynamic::from(1 as INT));
-        let address = operand_ref(&slot) as *const Dynamic;
+        let taken = take_operand(&mut slot);
+        assert!(slot.is_none());
+        assert_eq!(taken.as_int(), Ok(1));
         set_operand(&mut slot, Dynamic::from(2 as INT));
-
-        assert_eq!(address, operand_ref(&slot) as *const Dynamic);
         assert_eq!(operand_ref(&slot).as_int(), Ok(2));
     }
 
@@ -11745,8 +11616,6 @@ mod tests {
             operand_tags: vec![0; OPERAND_WORDS],
             #[cfg(feature = "grain-jit")]
             operand_refs: Box::new(Vec::new()),
-            #[cfg(feature = "grain-jit")]
-            operand_spare: operand_slot(unit_value()),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: Vec::new(),
         };

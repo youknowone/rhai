@@ -114,7 +114,7 @@ fn try_plain_add_stack(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  
     for slot in first..first + 2 {
         #[cfg(not(feature = "no_closure"))]
         if super::stack_ref(frame, slot).is_shared() {
-            let held = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, slot);
+            let held = frame.take_cell( slot);
             super::store_value(super::stack_mut(frame, slot), held.flatten());
         }
     }
@@ -1301,7 +1301,7 @@ pub(super) extern "C" fn declare_local_abi(
         majit_metainterp::request_walk_abort();
         return None;
     }
-    let value = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, depth).flatten();
+    let value = frame.take_cell( depth).flatten();
     if constant != 0 {
         frame.scope.push_constant_dynamic(name, value);
     } else {
@@ -1369,15 +1369,15 @@ pub(super) extern "C" fn operator_builtin_abi(
     for slot in first..frame.operand_depth {
         #[cfg(not(feature = "no_closure"))]
         if super::stack_ref(frame, slot).is_shared() {
-            let held = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, slot);
+            let held = frame.take_cell( slot);
             super::store_value(super::stack_mut(frame, slot), held.flatten());
         }
     }
     let memo = &mut vm.operator_memo;
     let top = frame.operand_depth;
     let (lhs, rhs) = frame.operand_refs[..top].split_at_mut(first + 1);
-    let lhs = &mut lhs[first];
-    let rhs = &mut rhs[0];
+    let lhs = super::operand_mut(&mut lhs[first]);
+    let rhs = super::operand_mut(&mut rhs[0]);
     if lhs.is_variant() || rhs.is_variant() {
         return None;
     }
@@ -2084,7 +2084,7 @@ pub(super) extern "C" fn operand_stack_take_cell(vm: &mut Vm<'_>, frame: &mut su
     if !live_stack_store(vm, frame, index) {
         return 0;
     }
-    vm.prepared_taken = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, index);
+    vm.prepared_taken = frame.take_cell( index);
     majit_metainterp::note_residual_committed();
     1
 }
@@ -2116,7 +2116,7 @@ pub(super) extern "C" fn reseat_top_to_floor(vm: &mut Vm<'_>, frame: &mut super:
     if dynamic_as_fast(super::operand_ref(&frame.operand_refs[top])) != 0 {
         return 0;
     }
-    let value = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, top);
+    let value = frame.take_cell( top);
     frame.truncate_cells(floor);
     frame.push_cell(value);
     majit_metainterp::note_residual_committed();
@@ -2138,7 +2138,7 @@ pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, frame: &mut super::
         majit_metainterp::request_walk_abort();
         return;
     }
-    *value = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, index);
+    *value = frame.take_cell( index);
 }
 
 /// Move one `Dynamic` into a pointer-stable operand slot.
