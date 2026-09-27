@@ -872,10 +872,10 @@ pub enum Op {
 
     /// Pop an iterable and start iterating it.
     ///
-    /// The iterator goes on a stack of the VM's own rather than the operand
-    /// stack, because it is not a `Dynamic`. Rhai's iterator functions take
-    /// the iterable **by value** and hand back something that cannot be
-    /// re-created, so it is made once here and lives until the loop ends.
+    /// The iterator replaces the iterable on the operand stack. Rhai's
+    /// iterator functions take the iterable **by value** and hand back
+    /// something that cannot be re-created, so it is made once here and
+    /// lives until the loop ends.
     ///
     /// Its table entry is the iterable's *start* position, which is what
     /// `ErrorFor` is reported against (`eval/stmt.rs:703`) — a different

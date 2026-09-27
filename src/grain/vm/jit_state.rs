@@ -184,7 +184,7 @@ pub fn grain_driver_descriptor() -> JitDriverStaticData {
     // `JitDriver::new` stamps this on MetaInterp before the
     // descriptor is registered; the registered clone must carry
     // the same info or `initialize_virtualizable` no-ops and JUMP
-    // drops `iter_depth`.
+    // drops `operand_depth`.
     sd.virtualizable_info = GrainJitState::__build_virtualizable_info();
     sd
 }
@@ -814,11 +814,6 @@ impl JitState for GrainJitState {
             core::mem::offset_of!(GrainFrame<'static, 'static>, jit_return_kind),
         );
         info.add_field(
-            "iter_depth",
-            Type::Int,
-            core::mem::offset_of!(GrainFrame<'static, 'static>, iter_depth),
-        );
-        info.add_field(
             "local_sync",
             Type::Int,
             core::mem::offset_of!(GrainFrame<'static, 'static>, local_sync),
@@ -832,6 +827,11 @@ impl JitState for GrainJitState {
             "operand_depth",
             Type::Int,
             core::mem::offset_of!(GrainFrame<'static, 'static>, operand_depth),
+        );
+        info.add_field(
+            "operand_spare",
+            Type::Ref,
+            core::mem::offset_of!(GrainFrame<'static, 'static>, operand_spare),
         );
         // The field is a `Box<Vec<i64>>`. The `Vec` behind it has len at 0
         // and the data pointer at 8.

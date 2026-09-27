@@ -327,7 +327,10 @@ fn verify_chunk(
             },
         };
         let next_depth = next_state.operands;
-        high_water = high_water.max(next_depth);
+        // `pyassem.py` `_do_stack_depth_walk`: the recorded depth is the
+        // maximum after every push the opcode performs, including a push
+        // that the next instruction never sees.
+        high_water = high_water.max(next_depth).max(stack_peak(&op, depth));
 
         let width = code::width(code, at).expect("decoded, so it has a width");
         let next = at + width;
@@ -408,7 +411,13 @@ fn verify_chunk(
                 work_list.push((
                     next,
                     State {
-                        operands: depth,
+                        operands: depth
+                            .checked_sub(1)
+                            .ok_or(VerifyError::Underflow {
+                                at,
+                                need: 1,
+                                have: depth,
+                            })?,
                         iters: state
                             .iters
                             .checked_sub(1)
@@ -431,7 +440,13 @@ fn verify_chunk(
                 work_list.push((
                     next,
                     State {
-                        operands: depth,
+                        operands: depth
+                            .checked_sub(1)
+                            .ok_or(VerifyError::Underflow {
+                                at,
+                                need: 1,
+                                have: depth,
+                            })?,
                         iters: state
                             .iters
                             .checked_sub(1)
@@ -570,7 +585,57 @@ fn required_caps(op: &Op, pools: &Pools) -> Caps {
     }
 }
 
-/// How many operands an instruction requires, consumes and produces.
+/// Depth while `op` is running, before its net effect.
+///
+/// `effect` is the depth at the successor. These opcodes push a value
+/// and then drop it before that successor, so the frame has to hold the
+/// intermediate depth. The count is the pushes the dispatch performs:
+/// `BinOpFrom` pushes both named operands (`mod.rs` the `NAMES_FROM`
+/// arm), a named right operand is one push, a local `CallRef` receiver
+/// is copied into the slot beside the arguments, and a call pushes its
+/// result before `deliver!` drops the arguments.
+/// Temporaries `op` pushes and then drops before its successor.
+///
+/// `effect` is the net. `co_stacksize` (`pyassem.py` `_do_stack_depth_walk`,
+/// `compile.c` `stackdepth`) records the depth after every push, including
+/// one the next instruction never sees. These are those pushes:
+/// `BinOpFrom` copies both named operands on, a named right operand is
+/// one copy, a local `CallRef` receiver is opened beside the arguments,
+/// a call pushes its result before the arguments are dropped, and
+/// `AssignLocalFrom` holds its source in a slot the successor does not see.
+fn opcode_temps(op: &Op) -> usize {
+    match op {
+        Op::BinOpFrom { .. } => 2,
+        Op::BinOp { rhs: Some(_), .. } => 1,
+        Op::CallRef {
+            receiver: Receiver::Local(_),
+            ..
+        } => 1,
+        Op::Call { .. } | Op::CallFnPtr { .. } => 1,
+        // A plain store holds the source. An op-assign also holds the
+        // current value of the local beside that source (`s += 1` is the
+        // two pushes the fused `LoadLocal` + `Const` used to do).
+        Op::AssignLocalFrom { op: Some(_), .. } => 2,
+        Op::AssignLocalFrom { op: None, .. } => 1,
+        // The index-set fallback pushes a named index and the value
+        // before the chain walk consumes them.
+        Op::IndexSet { index, value, .. } => {
+            let named = index.is_some();
+            let valued = value.is_some();
+            if named || valued {
+                usize::from(named) + 1
+            } else {
+                0
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn stack_peak(op: &Op, depth: usize) -> usize {
+    depth + opcode_temps(op)
+}
+
 fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
     match op {
         // A chain eats the indices and arguments its steps named, plus a root
@@ -725,10 +790,11 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // Pops the thrown value; nothing follows, so what it leaves is moot.
         Op::Throw | Op::StoreShared(..) => (1, 1, 0),
 
-        // The iterable goes onto the iterator stack, not back onto this one.
-        Op::IterInit => (1, 1, 0),
-        // Its two edges disagree, so the successor match does the work.
-        Op::IterNext { .. } | Op::IterNextStore { .. } | Op::IterDrop => (0, 0, 0),
+        // The iterable is replaced by the iterator (`GET_ITER`).
+        Op::IterInit => (1, 1, 1),
+        // Pop the iterator. `IterNext*` edges are spelled on the successors.
+        Op::IterDrop => (1, 1, 0),
+        Op::IterNext { .. } | Op::IterNextStore { .. } => (0, 0, 0),
 
         // Consumes whatever is left, so depth afterwards is not meaningful.
         Op::Return => (0, 0, 0),

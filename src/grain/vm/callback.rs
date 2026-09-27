@@ -433,11 +433,6 @@ mod tests {
     fn a_crossing_hands_on_no_values() {
         let source = "fn f(x) { let a = [x, x + 1]; let t = x; for i in a { t += i; } t }";
         let (.., warm) = crossings(source, "f", 3, true);
-        assert!(warm
-            .stack
-            .iter()
-            .all(|slot| super::super::operand_ref(slot).is_unit()));
-        assert!(warm.iterators.is_empty());
         assert!(warm.handlers.is_empty());
         assert!(warm.sizes.is_empty());
         assert!(warm.scopes.iter().all(Scope::is_empty));

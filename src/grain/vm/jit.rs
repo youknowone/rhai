@@ -36,7 +36,6 @@ use crate::{Dynamic, Position, Scope};
 
 thread_local! {
     static INT_MODULO_RESULT: Cell<crate::INT> = const { Cell::new(0) };
-    static ITER_NEXT_PRODUCED: Cell<i64> = const { Cell::new(0) };
     static SWITCH_TARGET: Cell<i64> = const { Cell::new(0) };
     static SWITCH_KIND: Cell<i64> = const { Cell::new(0) };
     static SWITCH_HASH: Cell<i64> = const { Cell::new(0) };
@@ -84,23 +83,23 @@ enum PlainFast {
 
 fn try_plain_add_ref(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     base: usize,
     slot: u16,
     first: usize,
 ) -> PlainFast {
     let at = base.saturating_add(slot as usize);
-    if at >= scope.len() || first >= vm.depth {
+    if at >= frame.scope.len() || first >= frame.operand_depth {
         return PlainFast::Miss;
     }
     match super::apply_binary(
         crate::grain::bytecode::BinOpKind::Add,
-        scope.get_mut_by_index(at),
-        super::stack_ref(vm, first),
+        frame.scope.get_mut_by_index(at),
+        super::operand_ref(&frame.operand_refs[first]),
     ) {
         Ok(Some(value)) => {
-            vm.truncate_stack(first);
-            vm.push_fast(value);
+            frame.truncate_cells(first);
+            frame.push_cell(value.into_dynamic());
             PlainFast::Did(None)
         }
         Ok(None) => PlainFast::Miss,
@@ -108,25 +107,25 @@ fn try_plain_add_ref(
     }
 }
 
-fn try_plain_add_stack(vm: &mut Vm<'_>, first: usize) -> PlainFast {
-    if first + 1 >= vm.depth {
+fn try_plain_add_stack(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  first: usize) -> PlainFast {
+    if first + 1 >= frame.operand_depth {
         return PlainFast::Miss;
     }
     for slot in first..first + 2 {
         #[cfg(not(feature = "no_closure"))]
-        if super::stack_ref(vm, slot).is_shared() {
-            let held = core::mem::replace(super::stack_mut(vm, slot), super::unit_value());
-            super::store_value(super::stack_mut(vm, slot), held.flatten());
+        if super::stack_ref(frame, slot).is_shared() {
+            let held = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, slot);
+            super::store_value(super::stack_mut(frame, slot), held.flatten());
         }
     }
     match super::apply_binary(
         crate::grain::bytecode::BinOpKind::Add,
-        super::stack_ref(vm, first),
-        super::stack_ref(vm, first + 1),
+        super::stack_ref(frame, first),
+        super::stack_ref(frame, first + 1),
     ) {
         Ok(Some(value)) => {
-            vm.truncate_stack(first);
-            vm.push_fast(value);
+            frame.truncate_cells(first);
+            frame.push_cell(value.into_dynamic());
             PlainFast::Did(None)
         }
         Ok(None) => PlainFast::Miss,
@@ -136,16 +135,16 @@ fn try_plain_add_stack(vm: &mut Vm<'_>, first: usize) -> PlainFast {
 
 fn try_plain_abs_ref(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     base: usize,
     slot: u16,
     position: i64,
 ) -> PlainFast {
     let at = base.saturating_add(slot as usize);
-    if at >= scope.len() {
+    if at >= frame.scope.len() {
         return PlainFast::Miss;
     }
-    let Ok(x) = scope.get_mut_by_index(at).as_int() else {
+    let Ok(x) = frame.scope.get_mut_by_index(at).as_int() else {
         return PlainFast::Miss;
     };
     let value = if cfg!(not(feature = "unchecked")) {
@@ -161,30 +160,30 @@ fn try_plain_abs_ref(
     } else {
         Dynamic::from(x.abs())
     };
-    vm.push(value);
+    frame.push_cell(value);
     PlainFast::Did(None)
 }
 
 fn try_plain_add_named(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     name: &str,
     first: usize,
 ) -> PlainFast {
-    if first >= vm.depth {
+    if first >= frame.operand_depth {
         return PlainFast::Miss;
     }
-    let Some(lhs) = scope.get_mut(name) else {
+    let Some(lhs) = frame.scope.get_mut(name) else {
         return PlainFast::Miss;
     };
     match super::apply_binary(
         crate::grain::bytecode::BinOpKind::Add,
         lhs,
-        super::stack_ref(vm, first),
+        super::operand_ref(&frame.operand_refs[first]),
     ) {
         Ok(Some(value)) => {
-            vm.truncate_stack(first);
-            vm.push_fast(value);
+            frame.truncate_cells(first);
+            frame.push_cell(value.into_dynamic());
             PlainFast::Did(None)
         }
         Ok(None) => PlainFast::Miss,
@@ -194,11 +193,11 @@ fn try_plain_add_named(
 
 fn try_plain_abs_named(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     name: &str,
     position: i64,
 ) -> PlainFast {
-    let Some(entry) = scope.get_mut(name) else {
+    let Some(entry) = frame.scope.get_mut(name) else {
         return PlainFast::Miss;
     };
     let Ok(x) = entry.as_int() else {
@@ -217,7 +216,7 @@ fn try_plain_abs_named(
     } else {
         Dynamic::from(x.abs())
     };
-    vm.push(value);
+    frame.push_cell(value);
     PlainFast::Did(None)
 }
 
@@ -230,30 +229,30 @@ fn int_as_float(x: crate::INT) -> super::arith::FastValue {
 #[cfg(not(feature = "no_float"))]
 fn try_plain_to_float_ref(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     base: usize,
     slot: u16,
 ) -> PlainFast {
     let at = base.saturating_add(slot as usize);
-    if at >= scope.len() {
+    if at >= frame.scope.len() {
         return PlainFast::Miss;
     }
-    let Ok(x) = scope.get_mut_by_index(at).as_int() else {
+    let Ok(x) = frame.scope.get_mut_by_index(at).as_int() else {
         return PlainFast::Miss;
     };
-    vm.push_fast(int_as_float(x));
+    frame.push_cell(int_as_float(x).into_dynamic());
     PlainFast::Did(None)
 }
 
 #[cfg(not(feature = "no_float"))]
-fn try_plain_to_float_named(vm: &mut Vm<'_>, scope: &mut Scope<'_>, name: &str) -> PlainFast {
-    let Some(entry) = scope.get_mut(name) else {
+fn try_plain_to_float_named(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>, name: &str) -> PlainFast {
+    let Some(entry) = frame.scope.get_mut(name) else {
         return PlainFast::Miss;
     };
     let Ok(x) = entry.as_int() else {
         return PlainFast::Miss;
     };
-    vm.push_fast(int_as_float(x));
+    frame.push_cell(int_as_float(x).into_dynamic());
     PlainFast::Did(None)
 }
 
@@ -264,6 +263,11 @@ fn try_plain_to_float_named(vm: &mut Vm<'_>, scope: &mut Scope<'_>, name: &str) 
 /// tag/access fields and avoids representing Rust's `&mut INT` as a JIT ref.
 #[inline(always)]
 pub(super) fn dynamic_store_int(target: &mut Dynamic, value: crate::INT) {
+    debug_assert!(
+        matches!(&target.0, Union::Int(..)),
+        "dynamic_store_int writes Int payload into {:?}",
+        std::mem::discriminant(&target.0)
+    );
     let Union::Int(held, ..) = &mut target.0 else {
         unreachable!("dynamic_store_int target changed variant")
     };
@@ -274,33 +278,15 @@ pub(super) fn dynamic_store_int(target: &mut Dynamic, value: crate::INT) {
 #[cfg(not(feature = "no_float"))]
 #[inline(always)]
 pub(super) fn dynamic_store_float(target: &mut Dynamic, value: crate::FLOAT) {
+    debug_assert!(
+        matches!(&target.0, Union::Float(..)),
+        "dynamic_store_float writes Float payload into {:?}",
+        std::mem::discriminant(&target.0)
+    );
     let Union::Float(held, ..) = &mut target.0 else {
         unreachable!("dynamic_store_float target changed variant")
     };
     **held = value;
-}
-
-/// Write `Items::IntRange.next` without a portal `&mut INT` borrow.
-///
-/// A portal `*next += 1` is `__deref_write`. Behind this boundary the
-/// write is a real field store on the live iterator, not a walk-local.
-#[majit_macros::dont_look_inside_cannot_raise]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn store_int_range_next(items: &mut super::Items, value: crate::INT) {
-    match items {
-        super::Items::IntRange { next, .. } | super::Items::IntStepRange { next, .. } => {
-            *next = value;
-        }
-        _ => {}
-    }
-}
-
-/// Write `Iteration.count` without a `&mut INT` borrow.
-///
-/// Twin of [`store_int_range_next`] for the overflow counter.
-#[inline(always)]
-pub(super) fn store_iteration_count(iteration: &mut super::Iteration, value: crate::INT) {
-    iteration.count = value;
 }
 
 pub(super) fn position_bits(position: Position) -> i64 {
@@ -579,23 +565,23 @@ pub(super) extern "C" fn program_function<'a>(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn run_chain_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     chain: &Chain,
     index: u32,
-    scope: &mut Scope<'_>,
     base: usize,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
     match vm.run_chain_inner(
+        frame,
         program,
         chain,
         index,
-        scope,
         base,
         position_from_bits(position),
     ) {
         Ok(result) => {
-            vm.push(result);
+            frame.push_cell(result);
             None
         }
         Err(err) => Some(err),
@@ -639,39 +625,6 @@ pub(super) extern "C" fn int_max(a: i64, b: i64) -> i64 {
     }
 }
 
-/// Advance a `for` loop that stores into a scope slot.
-///
-/// The produced/exhausted bit is a second one-word residual
-/// ([`iter_next_produced`]) so this can use the nullable exception word.
-#[majit_macros::dont_look_inside_cannot_raise]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn iter_next_store(
-    vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
-    index: usize,
-    position: i64,
-) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) || !live_count(index) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    match vm.iter_next_store(scope, index, position_from_bits(position)) {
-        Ok(produced) => {
-            // The iterator was advanced or popped. Replay of this
-            // opcode is no longer sound.
-            majit_metainterp::note_residual_committed();
-            ITER_NEXT_PRODUCED.with(|cell| cell.set(i64::from(produced)));
-            None
-        }
-        Err(err) => Some(err),
-    }
-}
-
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn iter_next_produced() -> i64 {
-    ITER_NEXT_PRODUCED.with(Cell::get)
-}
-
 /// Write an integer into a `for` loop slot without a walk-local `Dynamic`.
 ///
 /// A whole-value `*slot = Dynamic` is the synthetic `__deref_write` marker.
@@ -709,6 +662,7 @@ pub(super) extern "C" fn store_scope_int(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn store_shared_from_stack(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     scope: &mut Scope<'_>,
     index: usize,
     position: i64,
@@ -717,7 +671,7 @@ pub(super) extern "C" fn store_shared_from_stack(
         majit_metainterp::request_walk_abort();
         return None;
     }
-    match vm.pop() {
+    match frame.pop_result() {
         Ok(value) => {
             majit_metainterp::note_residual_committed();
             super::store_shared(
@@ -729,63 +683,6 @@ pub(super) extern "C" fn store_shared_from_stack(
         }
         Err(err) => Some(err),
     }
-}
-
-/// The innermost running `for` loop, without exposing `slice::last_mut`.
-///
-/// `inline(never)` is the same barrier [`program_switch`] uses: `extern "C"`
-/// is an ABI, not a same-crate inlining fence. An inlined `Vec::last_mut`
-/// leaves an interior `Items*` in the portal; compiled dest then treats
-/// `frame+0x28` (`GrainFrame.jit_finished`) as that pointer.
-#[majit_macros::dont_look_inside_cannot_raise]
-#[inline(never)]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn iterator_last_mut<'a>(
-    vm: &'a mut Vm<'_>,
-) -> Option<&'a mut super::Iteration> {
-    vm.iterators_last_mut()
-}
-
-/// Index the running `for` stack.
-///
-/// Dest peeks with the frame's reminted `iter_depth` (`FOR_ITER` /
-/// `peekvalue`), not [`iterator_last_mut`]. `dont_look_inside` (can
-/// raise) so the residual is not CSE-folded across an inner `pop` the
-/// way a `cannot_raise` last_mut of the same `vm` is.
-#[majit_macros::dont_look_inside]
-#[inline(never)]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn iteration_at<'a>(
-    vm: &'a mut Vm<'_>,
-    index: usize,
-) -> Option<&'a mut super::Iteration> {
-    if !live_vm_ptr(vm) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    vm.iterators.get_mut(index)
-}
-
-/// Dest peek: `vm` then `scope`, same order as [`pin_scope_with_vm`].
-///
-/// Putting `scope` first made dest's first Ref the Scope; the colourer
-/// then dumped a stack ConstPtr as dest's vm and fail 24 was
-/// `Items.__discriminant` on a Scope while the live iterator was still
-/// `IntRange`. Depth is a vable int, not a Ref.
-#[majit_macros::dont_look_inside]
-#[inline(never)]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn dest_iteration_at<'a>(
-    vm: &'a mut Vm<'_>,
-    scope: &Scope<'_>,
-    index: usize,
-) -> Option<&'a mut super::Iteration> {
-    let _ = scope.len();
-    if !live_vm_ptr(vm) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    vm.iterators.get_mut(index)
 }
 
 /// Pop one `switch` subject and classify it without exposing the hasher seed.
@@ -801,13 +698,14 @@ pub(super) extern "C" fn dest_iteration_at<'a>(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn switch_pop_subject(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     table: &Switch,
 ) -> Option<Box<crate::EvalAltResult>> {
     if !live_vm_ptr(vm) {
         majit_metainterp::request_walk_abort();
         return None;
     }
-    match vm.pop() {
+    match frame.pop_result() {
         Ok(subject) => {
             match subject.as_int() {
                 Ok(value) => {
@@ -833,13 +731,14 @@ pub(super) extern "C" fn switch_pop_subject(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn switch_dispatch(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     table: &Switch,
 ) -> Option<Box<crate::EvalAltResult>> {
     if !live_vm_ptr(vm) {
         majit_metainterp::request_walk_abort();
         return None;
     }
-    match vm.pop() {
+    match frame.pop_result() {
         Ok(subject) => {
             SWITCH_TARGET.with(|cell| cell.set(i64::from(table.dispatch(&subject))));
             None
@@ -1023,8 +922,8 @@ pub(super) extern "C" fn fast_float() -> crate::FLOAT {
 /// holds the pre-call depth, so it must read the real one back rather than
 /// adding one to a stale local.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn vm_depth(vm: &Vm<'_>) -> i64 {
-    vm.depth() as i64
+pub(super) extern "C" fn vm_depth(vm: &Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) -> i64 {
+    frame.operand_depth as i64
 }
 
 /// Array length without exposing `Vec::len` as a synthetic `__len` residual.
@@ -1053,6 +952,7 @@ pub(super) extern "C" fn stash_ok_result(frame: &mut GrainFrame<'_, '_>, value: 
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn prepare_compiled_call_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     name_index: u32,
     argc: usize,
@@ -1060,6 +960,7 @@ pub(super) extern "C" fn prepare_compiled_call_abi(
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
     match vm.prepare_compiled_call(
+        frame,
         program,
         name_index,
         argc,
@@ -1090,11 +991,11 @@ pub(super) extern "C" fn finish_compiled_call_abi(vm: &mut Vm<'_>) {
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn call_syntactic_or_stacked_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     name_index: u32,
     argc: usize,
     first: usize,
-    scope: &mut Scope<'_>,
     capture: i64,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
@@ -1103,7 +1004,7 @@ pub(super) extern "C" fn call_syntactic_or_stacked_abi(
         && vm.engine.fast_operators()
         && cached_plain_add(program, name_index, argc)
     {
-        match try_plain_add_stack(vm, first) {
+        match try_plain_add_stack(vm, frame, first) {
             PlainFast::Did(err) => return err,
             PlainFast::Miss => {}
         }
@@ -1120,13 +1021,13 @@ pub(super) extern "C" fn call_syntactic_or_stacked_abi(
         name_index,
         name,
         argc,
+        frame,
         first,
-        scope,
         capture != 0,
         position_from_bits(position),
     ) {
         Ok(result) => {
-            vm.push(result);
+            frame.push_cell(result);
             None
         }
         Err(err) => Some(err),
@@ -1138,12 +1039,12 @@ pub(super) extern "C" fn call_syntactic_or_stacked_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn call_by_reference_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     name_index: u32,
     argc: usize,
     receiver_kind: i64,
     receiver_payload: u32,
-    scope: &mut Scope<'_>,
     base: usize,
     capture: i64,
     position: i64,
@@ -1152,11 +1053,11 @@ pub(super) extern "C" fn call_by_reference_abi(
         // CallRef `add(s, i)` reports argc=2 (arity) with the receiver
         // in a local/name and only `i` on the stack.
         if (argc == 1 || argc == 2) && cached_plain_add(program, name_index, 2) {
-            if let Some(first) = vm.depth.checked_sub(1) {
+            if let Some(first) = frame.operand_depth.checked_sub(1) {
                 let hit = match receiver_kind {
-                    0 => try_plain_add_ref(vm, scope, base, receiver_payload as u16, first),
+                    0 => try_plain_add_ref(vm, frame, base, receiver_payload as u16, first),
                     1 => match program.name_plain(receiver_payload) {
-                        Some(name) => try_plain_add_named(vm, scope, name, first),
+                        Some(name) => try_plain_add_named(vm, frame, name, first),
                         None => PlainFast::Miss,
                     },
                     _ => PlainFast::Miss,
@@ -1169,13 +1070,13 @@ pub(super) extern "C" fn call_by_reference_abi(
         }
         // CallRef `abs(a)` reports argc=1 (arity) with the receiver in a
         // local/name and nothing on the stack.
-        if (argc == 0 || (argc == 1 && vm.depth == 0))
+        if (argc == 0 || (argc == 1 && frame.operand_depth == 0))
             && program.name_plain(name_index) == Some("abs")
         {
             let hit = match receiver_kind {
-                0 => try_plain_abs_ref(vm, scope, base, receiver_payload as u16, position),
+                0 => try_plain_abs_ref(vm, frame, base, receiver_payload as u16, position),
                 1 => match program.name_plain(receiver_payload) {
-                    Some(name) => try_plain_abs_named(vm, scope, name, position),
+                    Some(name) => try_plain_abs_named(vm, frame, name, position),
                     None => PlainFast::Miss,
                 },
                 _ => PlainFast::Miss,
@@ -1188,13 +1089,13 @@ pub(super) extern "C" fn call_by_reference_abi(
         // CallRef `i.to_float()` is the same arity/depth as `abs(a)`.
         // The builtin is `|x: INT| x as FLOAT` (`gen_conv_functions`).
         #[cfg(not(feature = "no_float"))]
-        if (argc == 0 || (argc == 1 && vm.depth == 0))
+        if (argc == 0 || (argc == 1 && frame.operand_depth == 0))
             && program.name_plain(name_index) == Some("to_float")
         {
             let hit = match receiver_kind {
-                0 => try_plain_to_float_ref(vm, scope, base, receiver_payload as u16),
+                0 => try_plain_to_float_ref(vm, frame, base, receiver_payload as u16),
                 1 => match program.name_plain(receiver_payload) {
-                    Some(name) => try_plain_to_float_named(vm, scope, name),
+                    Some(name) => try_plain_to_float_named(vm, frame, name),
                     None => PlainFast::Miss,
                 },
                 _ => PlainFast::Miss,
@@ -1218,18 +1119,18 @@ pub(super) extern "C" fn call_by_reference_abi(
         _ => crate::grain::bytecode::Receiver::This,
     };
     match vm.call_by_reference(
+        frame,
         program,
         name_index,
         name,
         argc,
         receiver,
-        scope,
         base,
         capture != 0,
         position_from_bits(position),
     ) {
         Ok(result) => {
-            vm.push(result);
+            frame.push_cell(result);
             None
         }
         Err(err) => Some(err),
@@ -1242,14 +1143,15 @@ pub(super) extern "C" fn call_by_reference_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn store_scope_slot(
     vm: &mut Vm<'_>,
-    entry: &mut Dynamic,
+    frame: &mut super::GrainFrame<'_, '_>,
+    index: usize,
     read_only: i64,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
-    if !live_dynamic_ptr(entry) {
+    if !live_vm_ptr(vm) || index >= frame.scope.len() {
         return None;
     }
-    let mut value = match vm.pop() {
+    let mut value = match frame.pop_result() {
         Ok(value) => value,
         Err(err) => return Some(err),
     };
@@ -1258,6 +1160,7 @@ pub(super) extern "C" fn store_scope_slot(
     } else {
         crate::types::dynamic::AccessMode::ReadWrite
     });
+    let entry = frame.scope.get_mut_by_index(index);
     match super::place(entry, "", position_from_bits(position)) {
         Ok(mut target) => {
             super::store_value(&mut target, value);
@@ -1276,8 +1179,8 @@ pub(super) extern "C" fn store_scope_slot(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn assign_local_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
-    scope: &mut Scope<'_>,
     base: usize,
     slot: usize,
     var_name: u32,
@@ -1286,7 +1189,7 @@ pub(super) extern "C" fn assign_local_abi(
     op: Option<&AssignOp>,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) || !live_count(base) || !live_count(slot) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) || !live_count(base) || !live_count(slot) {
         majit_metainterp::request_walk_abort();
         return None;
     }
@@ -1296,8 +1199,8 @@ pub(super) extern "C" fn assign_local_abi(
         _ => None,
     };
     match vm.assign_local(
+        frame,
         program,
-        scope,
         base,
         slot,
         var_name,
@@ -1315,13 +1218,13 @@ pub(super) extern "C" fn assign_local_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn load_named_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
-    scope: &mut Scope<'_>,
     name_index: u32,
     flatten: i64,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) {
         majit_metainterp::request_walk_abort();
         return None;
     }
@@ -1331,9 +1234,9 @@ pub(super) extern "C" fn load_named_abi(
             position_from_bits(position),
         )));
     };
-    match vm.load_named(name, scope, flatten != 0, position_from_bits(position)) {
+    match vm.load_named(name, frame.scope, flatten != 0, position_from_bits(position)) {
         Ok(value) => {
-            vm.push(value);
+            frame.push_cell(value);
             None
         }
         Err(err) => Some(err),
@@ -1345,13 +1248,13 @@ pub(super) extern "C" fn load_named_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn assign_named_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
-    scope: &mut Scope<'_>,
     name_index: u32,
     op: Option<&AssignOp>,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) {
         majit_metainterp::request_walk_abort();
         return None;
     }
@@ -1361,11 +1264,11 @@ pub(super) extern "C" fn assign_named_abi(
             position_from_bits(position),
         )));
     };
-    let rhs = match vm.pop() {
+    let rhs = match frame.pop_result() {
         Ok(value) => value.flatten(),
         Err(err) => return Some(err),
     };
-    vm.assign_named(program, op, name, rhs, scope, position_from_bits(position))
+    vm.assign_named(program, op, name, rhs, frame.scope, position_from_bits(position))
         .err()
 }
 
@@ -1374,13 +1277,13 @@ pub(super) extern "C" fn assign_named_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn declare_local_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
-    scope: &mut Scope<'_>,
     name_index: u32,
     constant: i64,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) {
         majit_metainterp::request_walk_abort();
         return None;
     }
@@ -1390,14 +1293,19 @@ pub(super) extern "C" fn declare_local_abi(
             position_from_bits(position),
         )));
     };
-    let value = match vm.pop() {
-        Ok(value) => value.flatten(),
-        Err(err) => return Some(err),
-    };
+    // The caller already stored `operand_depth` at the initializer's
+    // slot, the same way `iter_init_from_top` reads the iterable. Popping
+    // again here would be a second depth write the trace does not see.
+    let depth = frame.operand_depth;
+    if depth >= frame.operand_refs.len() {
+        majit_metainterp::request_walk_abort();
+        return None;
+    }
+    let value = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, depth).flatten();
     if constant != 0 {
-        scope.push_constant_dynamic(name, value);
+        frame.scope.push_constant_dynamic(name, value);
     } else {
-        scope.push_dynamic(name, value);
+        frame.scope.push_dynamic(name, value);
     }
     None
 }
@@ -1408,12 +1316,12 @@ pub(super) extern "C" fn declare_local_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn catch_bind_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
-    scope: &mut Scope<'_>,
     name_index: u32,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) {
         majit_metainterp::request_walk_abort();
         return None;
     }
@@ -1423,11 +1331,11 @@ pub(super) extern "C" fn catch_bind_abi(
             position_from_bits(position),
         )));
     };
-    let value = match vm.pop() {
+    let value = match frame.pop_result() {
         Ok(value) => value,
         Err(err) => return Some(err),
     };
-    scope.push_dynamic(name, value);
+    frame.scope.push_dynamic(name, value);
     None
 }
 
@@ -1439,6 +1347,7 @@ pub(super) extern "C" fn catch_bind_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn operator_builtin_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     token: &crate::tokenizer::Token,
     name_index: u32,
@@ -1457,16 +1366,16 @@ pub(super) extern "C" fn operator_builtin_abi(
     if !vm.engine.fast_operators() {
         return None;
     }
-    for slot in first..vm.depth {
+    for slot in first..frame.operand_depth {
         #[cfg(not(feature = "no_closure"))]
-        if super::stack_ref(vm, slot).is_shared() {
-            let held = core::mem::replace(super::stack_mut(vm, slot), super::unit_value());
-            super::store_value(super::stack_mut(vm, slot), held.flatten());
+        if super::stack_ref(frame, slot).is_shared() {
+            let held = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, slot);
+            super::store_value(super::stack_mut(frame, slot), held.flatten());
         }
     }
     let memo = &mut vm.operator_memo;
-    let top = vm.depth;
-    let (lhs, rhs) = vm.stack[..top].split_at_mut(first + 1);
+    let top = frame.operand_depth;
+    let (lhs, rhs) = frame.operand_refs[..top].split_at_mut(first + 1);
     let lhs = &mut lhs[first];
     let rhs = &mut rhs[0];
     if lhs.is_variant() || rhs.is_variant() {
@@ -1479,7 +1388,7 @@ pub(super) extern "C" fn operator_builtin_abi(
     let context = need_context.then(|| (vm.engine, name, None, &vm.global, pos).into());
     match func(context, &mut [lhs, rhs]) {
         Ok(value) => {
-            vm.push(value);
+            frame.push_cell(value);
             OPERATOR_BUILTIN_HANDLED.with(|cell| cell.set(1));
             None
         }
@@ -1570,20 +1479,21 @@ pub(super) extern "C" fn plain_add_handled() -> i64 {
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn call_plain_add_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     first: usize,
 ) -> Option<Box<crate::EvalAltResult>> {
     PLAIN_ADD_HANDLED.with(|cell| cell.set(0));
-    if !live_vm_ptr(vm) || first + 1 >= vm.depth {
+    if !live_vm_ptr(vm) || first + 1 >= frame.operand_depth {
         return None;
     }
     match super::apply_binary(
         crate::grain::bytecode::BinOpKind::Add,
-        super::stack_ref(vm, first),
-        super::stack_ref(vm, first + 1),
+        super::stack_ref(frame, first),
+        super::stack_ref(frame, first + 1),
     ) {
         Ok(Some(value)) => {
-            vm.truncate_stack(first);
-            vm.push_fast(value);
+            frame.truncate_cells(first);
+            frame.push_cell(value.into_dynamic());
             PLAIN_ADD_HANDLED.with(|cell| cell.set(1));
             None
         }
@@ -1597,27 +1507,27 @@ pub(super) extern "C" fn call_plain_add_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn call_plain_add_ref_abi(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     base: usize,
     slot: u16,
     first: usize,
 ) -> Option<Box<crate::EvalAltResult>> {
     PLAIN_ADD_HANDLED.with(|cell| cell.set(0));
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) {
         return None;
     }
     let at = base.saturating_add(slot as usize);
-    if at >= scope.len() || first >= vm.depth {
+    if at >= frame.scope.len() || first >= frame.operand_depth {
         return None;
     }
     match super::apply_binary(
         crate::grain::bytecode::BinOpKind::Add,
-        scope.get_mut_by_index(at),
-        super::stack_ref(vm, first),
+        frame.scope.get_mut_by_index(at),
+        super::operand_ref(&frame.operand_refs[first]),
     ) {
         Ok(Some(value)) => {
-            vm.truncate_stack(first);
-            vm.push_fast(value);
+            frame.truncate_cells(first);
+            frame.push_cell(value.into_dynamic());
             PLAIN_ADD_HANDLED.with(|cell| cell.set(1));
             None
         }
@@ -1631,20 +1541,20 @@ pub(super) extern "C" fn call_plain_add_ref_abi(
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn call_plain_abs_ref_abi(
     vm: &mut Vm<'_>,
-    scope: &mut Scope<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     base: usize,
     slot: u16,
     position: i64,
 ) -> Option<Box<crate::EvalAltResult>> {
     UNARY_BUILTIN_HANDLED.with(|cell| cell.set(0));
-    if !live_vm_ptr(vm) || !live_scope_ptr(scope) {
+    if !live_vm_ptr(vm) || !live_scope_ptr(frame.scope) {
         return None;
     }
     let at = base.saturating_add(slot as usize);
-    if at >= scope.len() {
+    if at >= frame.scope.len() {
         return None;
     }
-    let Ok(x) = scope.get_mut_by_index(at).as_int() else {
+    let Ok(x) = frame.scope.get_mut_by_index(at).as_int() else {
         return None;
     };
     let value = if cfg!(not(feature = "unchecked")) {
@@ -1660,7 +1570,7 @@ pub(super) extern "C" fn call_plain_abs_ref_abi(
     } else {
         Dynamic::from(x.abs())
     };
-    vm.push(value);
+    frame.push_cell(value);
     UNARY_BUILTIN_HANDLED.with(|cell| cell.set(1));
     None
 }
@@ -1681,6 +1591,7 @@ pub(super) extern "C" fn name_is_abs(program: &Program<'_>, name_index: u32) -> 
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn unary_builtin_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     name_index: u32,
     first: usize,
@@ -1698,7 +1609,7 @@ pub(super) extern "C" fn unary_builtin_abi(
     if name != "abs" {
         return None;
     }
-    let Ok(x) = super::stack_ref(vm, first).as_int() else {
+    let Ok(x) = super::stack_ref(frame, first).as_int() else {
         return None;
     };
     let value = if cfg!(not(feature = "unchecked")) {
@@ -1714,7 +1625,7 @@ pub(super) extern "C" fn unary_builtin_abi(
     } else {
         Dynamic::from(x.abs())
     };
-    vm.push(value);
+    frame.push_cell(value);
     UNARY_BUILTIN_HANDLED.with(|cell| cell.set(1));
     None
 }
@@ -1729,6 +1640,7 @@ pub(super) extern "C" fn unary_builtin_handled() -> i64 {
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn make_closure_abi(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     program: &Program<'_>,
     name_index: u32,
     position: i64,
@@ -1737,7 +1649,7 @@ pub(super) extern "C" fn make_closure_abi(
         majit_metainterp::request_walk_abort();
         return None;
     }
-    match vm.make_closure_fnptr(program, name_index, position_from_bits(position)) {
+    match vm.make_closure_fnptr(frame, program, name_index, position_from_bits(position)) {
         Ok(()) => None,
         Err(err) => Some(err),
     }
@@ -1879,28 +1791,29 @@ fn live_count(n: usize) -> bool {
     n < 0x1_0000
 }
 
-fn live_stack_store(vm: &Vm<'_>, index: usize) -> bool {
-    live_vm_ptr(vm) && index < vm.stack.len()
+fn live_stack_store(vm: &Vm<'_>, frame: &super::GrainFrame<'_, '_>, index: usize) -> bool {
+    live_vm_ptr(vm) && index < frame.operand_refs.len()
 }
 
 /// The slot exists and its `Box<Dynamic>` is a heap cell, not a walk-local
 /// small integer. Assigning through the latter is `drop_glue` at `0x2`.
-fn live_operand_box(vm: &Vm<'_>, index: usize) -> bool {
-    live_stack_store(vm, index) && live_dynamic_ptr(super::operand_ref(&vm.stack[index]))
+fn live_operand_box(vm: &Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize) -> bool {
+    live_stack_store(vm, frame, index) && live_dynamic_ptr(super::operand_ref(&frame.operand_refs[index]))
 }
 
 /// Grow if needed and refuse a walk-local destination. The caller writes the
 /// slot and advances [`Vm::depth`] only when this returns `Some`.
-fn prepare_fast_push(vm: &mut Vm<'_>) -> Option<usize> {
-    if !live_vm_ptr(vm) || !live_count(vm.depth) {
+fn prepare_fast_push(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) -> Option<usize> {
+    if !live_vm_ptr(vm) || !live_count(frame.operand_depth) {
         majit_metainterp::request_walk_abort();
         return None;
     }
-    let depth = vm.depth;
-    if depth == vm.stack.len() {
-        vm.grow_stack(1);
+    let depth = frame.operand_depth;
+    if depth >= frame.operand_refs.len() {
+        majit_metainterp::request_walk_abort();
+        return None;
     }
-    if !live_operand_box(vm, depth) {
+    if !live_operand_box(vm, frame, depth) {
         majit_metainterp::request_walk_abort();
         return None;
     }
@@ -1925,7 +1838,7 @@ fn dummy_unit() -> &'static Dynamic {
 }
 
 #[inline]
-pub(super) fn track_operation_error(vm: &mut Vm<'_>, program: &Program<'_>, at: usize) {
+pub(super) fn track_operation_error(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  program: &Program<'_>, at: usize) {
     track_operation_abi(vm, code_position_bits(program, at));
 }
 
@@ -1985,8 +1898,8 @@ pub(super) extern "C" fn scope_entry<'a>(
 /// accessors, this is execution state owned by the red `Vm`, so it remains an
 /// opaque, non-elidable residual call.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_len(vm: &Vm<'_>) -> i64 {
-    vm.stack.len() as i64
+pub(super) extern "C" fn operand_stack_len(vm: &Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) -> i64 {
+    frame.operand_refs.len() as i64
 }
 
 /// Native entry for the original `Vm::grow_stack` jitcode.
@@ -1999,13 +1912,19 @@ pub(super) extern "C" fn operand_stack_len(vm: &Vm<'_>) -> i64 {
 /// its exact `(Vm reference, extra count) -> void` signature as a C ABI.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[inline(never)]
-pub(super) extern "C" fn grow_stack_abi(vm: &mut Vm<'_>, extra: usize) {
+pub(super) extern "C" fn grow_stack_abi(
+    vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
+    extra: usize,
+) {
     if !live_vm_ptr(vm) || !live_count(extra) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    majit_metainterp::note_residual_committed();
-    vm.grow_stack(extra);
+    // The frame array is sized once from `chunk.max_stack`. A residual
+    // that still asks to grow is a trace of the old shape.
+    let _ = (frame, extra);
+    majit_metainterp::request_walk_abort();
 }
 
 /// Push one integer without exposing a walk-local `Box<Dynamic>`.
@@ -2014,57 +1933,57 @@ pub(super) extern "C" fn grow_stack_abi(vm: &mut Vm<'_>, extra: usize) {
 /// a walk-local destination drops `Union` at `0x2`, and incrementing depth
 /// after a refused store corrupts the live stack.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_int(vm: &mut Vm<'_>, value: crate::INT) {
-    let Some(depth) = prepare_fast_push(vm) else {
+pub(super) extern "C" fn push_fast_int(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  value: crate::INT) {
+    let Some(depth) = prepare_fast_push(vm, frame) else {
         return;
     };
-    *super::operand_mut(&mut vm.stack[depth]) =
+    *super::operand_mut(&mut frame.operand_refs[depth]) =
         Dynamic(Union::Int(value, 0, AccessMode::ReadWrite));
-    vm.depth = depth + 1;
+    frame.operand_depth = depth + 1;
 }
 
 /// Bool twin of [`push_fast_int`].
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_bool(vm: &mut Vm<'_>, value: i64) {
-    let Some(depth) = prepare_fast_push(vm) else {
+pub(super) extern "C" fn push_fast_bool(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  value: i64) {
+    let Some(depth) = prepare_fast_push(vm, frame) else {
         return;
     };
-    *super::operand_mut(&mut vm.stack[depth]) =
+    *super::operand_mut(&mut frame.operand_refs[depth]) =
         Dynamic(Union::Bool(value != 0, 0, AccessMode::ReadWrite));
-    vm.depth = depth + 1;
+    frame.operand_depth = depth + 1;
 }
 
 /// Float twin of [`push_fast_int`].
 #[cfg(not(feature = "no_float"))]
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_float(vm: &mut Vm<'_>, value: crate::FLOAT) {
-    let Some(depth) = prepare_fast_push(vm) else {
+pub(super) extern "C" fn push_fast_float(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  value: crate::FLOAT) {
+    let Some(depth) = prepare_fast_push(vm, frame) else {
         return;
     };
-    *super::operand_mut(&mut vm.stack[depth]) = Dynamic::from(value);
-    vm.depth = depth + 1;
+    *super::operand_mut(&mut frame.operand_refs[depth]) = Dynamic::from(value);
+    frame.operand_depth = depth + 1;
 }
 
 /// Unit twin of [`push_fast_int`].
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_unit(vm: &mut Vm<'_>) {
-    let Some(depth) = prepare_fast_push(vm) else {
+pub(super) extern "C" fn push_fast_unit(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) {
+    let Some(depth) = prepare_fast_push(vm, frame) else {
         return;
     };
-    *super::operand_mut(&mut vm.stack[depth]) = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
-    vm.depth = depth + 1;
+    *super::operand_mut(&mut frame.operand_refs[depth]) = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
+    frame.operand_depth = depth + 1;
 }
 
 /// Push a flatten-clone of a live cell. The cell is a scope or constant
 /// slot, never a walk local.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn push_from_cell(vm: &mut Vm<'_>, cell: &Dynamic) {
+pub(super) extern "C" fn push_from_cell(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  cell: &Dynamic) {
     if !live_vm_ptr(vm) || !live_dynamic_ptr(cell) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    vm.push(super::value::flatten_clone_value(cell));
+    frame.push_cell(super::value::flatten_clone_value(cell));
 }
 
 /// A walk-local `Dynamic` is not an ABI word. The walker still residual-calls
@@ -2086,19 +2005,20 @@ pub(super) extern "C" fn program_jit_identity_abi(program: &Program) -> u64 {
 /// Resolve one pointer-stable operand slot across the residual ABI.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn operand_stack_entry<'a>(vm: &'a Vm<'_>, index: usize) -> &'a Dynamic {
-    if !live_stack_store(vm, index) {
+pub(super) extern "C" fn operand_stack_entry<'a>(vm: &Vm<'_>, frame: &'a super::GrainFrame<'_, '_>, index: usize) -> &'a Dynamic {
+    if !live_stack_store(vm, frame, index) {
         majit_metainterp::request_walk_abort();
         return dummy_unit();
     }
-    super::operand_ref(&vm.stack[index])
+    super::operand_ref(&frame.operand_refs[index])
 }
 
 /// Resolve one pointer-stable mutable operand slot across the residual ABI.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
 pub(super) extern "C" fn operand_stack_entry_mut<'a>(
-    vm: &'a mut Vm<'_>,
+    vm: &mut Vm<'_>,
+    frame: &'a mut super::GrainFrame<'_, '_>,
     index: usize,
 ) -> &'a mut Dynamic {
     // A walk-local index cannot be turned into a dummy `&mut` without
@@ -2106,7 +2026,7 @@ pub(super) extern "C" fn operand_stack_entry_mut<'a>(
     // still have to return a place. Keep the bound path only for a live
     // slot; the walker aborts `ri` stores via `request_walk_abort` on
     // the take/store siblings.
-    super::operand_mut(&mut vm.stack[index])
+    super::operand_mut(&mut frame.operand_refs[index])
 }
 
 /// Resolve one array element across the residual ABI.
@@ -2127,12 +2047,12 @@ pub(super) extern "C" fn array_entry<'a>(array: &'a crate::Array, index: usize) 
 /// left in place). A walk-local `Dynamic` out-parameter is not an
 /// address; the payload is.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_take_fast(vm: &mut Vm<'_>, index: usize) -> i64 {
-    if !live_stack_store(vm, index) {
+pub(super) extern "C" fn operand_stack_take_fast(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize) -> i64 {
+    if !live_stack_store(vm, frame, index) {
         majit_metainterp::request_walk_abort();
         return 0;
     }
-    let slot = super::operand_mut(&mut vm.stack[index]);
+    let slot = super::operand_mut(&mut frame.operand_refs[index]);
     let tag = match &slot.0 {
         Union::Int(n, ..) => {
             FAST_INT.with(|cell| cell.set(*n));
@@ -2160,11 +2080,11 @@ pub(super) extern "C" fn operand_stack_take_fast(vm: &mut Vm<'_>, index: usize) 
 /// `1` when the slot is a live cell, `0` when it is not. The `Dynamic`
 /// stays on the `Vm` so a trace does not residualize an out-parameter.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_take_cell(vm: &mut Vm<'_>, index: usize) -> i64 {
-    if !live_stack_store(vm, index) {
+pub(super) extern "C" fn operand_stack_take_cell(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize) -> i64 {
+    if !live_stack_store(vm, frame, index) {
         return 0;
     }
-    vm.prepared_taken = core::mem::take(super::operand_mut(&mut vm.stack[index]));
+    vm.prepared_taken = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, index);
     majit_metainterp::note_residual_committed();
     1
 }
@@ -2183,22 +2103,22 @@ pub(super) extern "C" fn walk_is_recording() -> bool {
 /// fast path (`0`). `1` means this call did the move.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn reseat_top_to_floor(vm: &mut Vm<'_>, floor: usize) -> i64 {
+pub(super) extern "C" fn reseat_top_to_floor(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  floor: usize) -> i64 {
     if !live_vm_ptr(vm) || !live_count(floor) {
         return 0;
     }
-    let Some(top) = vm.depth.checked_sub(1) else {
+    let Some(top) = frame.operand_depth.checked_sub(1) else {
         return 0;
     };
-    if top < floor || top >= vm.stack.len() {
+    if top < floor || top >= frame.operand_refs.len() {
         return 0;
     }
-    if dynamic_as_fast(super::operand_ref(&vm.stack[top])) != 0 {
+    if dynamic_as_fast(super::operand_ref(&frame.operand_refs[top])) != 0 {
         return 0;
     }
-    let value = core::mem::take(super::operand_mut(&mut vm.stack[top]));
-    vm.truncate_stack(floor);
-    vm.push(value);
+    let value = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, top);
+    frame.truncate_cells(floor);
+    frame.push_cell(value);
     majit_metainterp::note_residual_committed();
     1
 }
@@ -2213,12 +2133,12 @@ pub(super) extern "C" fn reseat_top_to_floor(vm: &mut Vm<'_>, floor: usize) -> i
 /// pretending its translated Ref result is a native pointer return.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, index: usize, value: &mut Dynamic) {
-    if index >= vm.stack.len() || !live_dynamic_ptr(value) {
+pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize, value: &mut Dynamic) {
+    if index >= frame.operand_refs.len() || !live_dynamic_ptr(value) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    *value = core::mem::take(super::operand_mut(&mut vm.stack[index]));
+    *value = super::detach_operand(&mut frame.operand_refs, &mut frame.operand_spare, index);
 }
 
 /// Move one `Dynamic` into a pointer-stable operand slot.
@@ -2232,36 +2152,36 @@ pub(super) extern "C" fn operand_stack_take(vm: &mut Vm<'_>, index: usize, value
 /// lowered `Dynamic` as this source stores through null. Scalar siblings
 /// below take one-word payloads instead.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_store(vm: &mut Vm<'_>, index: usize, value: &mut Dynamic) {
-    if !live_stack_store(vm, index) || !live_dynamic_ptr(value) {
+pub(super) extern "C" fn operand_stack_store(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize, value: &mut Dynamic) {
+    if !live_stack_store(vm, frame, index) || !live_dynamic_ptr(value) {
         // A walk-local index is a pointer-sized word, not a depth. A
         // walk-local `Dynamic` is a small integer, not a cell. Refuse
         // rather than dropping `Union` at that address.
         majit_metainterp::request_walk_abort();
         return;
     }
-    dynamic_store(super::operand_mut(&mut vm.stack[index]), value);
+    dynamic_store(super::operand_mut(&mut frame.operand_refs[index]), value);
 }
 
 /// Store an integer into a pointer-stable operand slot.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_store_int(vm: &mut Vm<'_>, index: usize, value: crate::INT) {
-    if !live_operand_box(vm, index) {
+pub(super) extern "C" fn operand_stack_store_int(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize, value: crate::INT) {
+    if !live_operand_box(vm, frame, index) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    *super::operand_mut(&mut vm.stack[index]) =
+    *super::operand_mut(&mut frame.operand_refs[index]) =
         Dynamic(Union::Int(value, 0, AccessMode::ReadWrite));
 }
 
 /// Store a bool into a pointer-stable operand slot.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_store_bool(vm: &mut Vm<'_>, index: usize, value: i64) {
-    if !live_operand_box(vm, index) {
+pub(super) extern "C" fn operand_stack_store_bool(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize, value: i64) {
+    if !live_operand_box(vm, frame, index) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    *super::operand_mut(&mut vm.stack[index]) =
+    *super::operand_mut(&mut frame.operand_refs[index]) =
         Dynamic(Union::Bool(value != 0, 0, AccessMode::ReadWrite));
 }
 
@@ -2270,24 +2190,25 @@ pub(super) extern "C" fn operand_stack_store_bool(vm: &mut Vm<'_>, index: usize,
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn operand_stack_store_float(
     vm: &mut Vm<'_>,
+    frame: &mut super::GrainFrame<'_, '_>,
     index: usize,
     value: crate::FLOAT,
 ) {
-    if !live_operand_box(vm, index) {
+    if !live_operand_box(vm, frame, index) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    *super::operand_mut(&mut vm.stack[index]) = Dynamic::from(value);
+    *super::operand_mut(&mut frame.operand_refs[index]) = Dynamic::from(value);
 }
 
 /// Store unit into a pointer-stable operand slot.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn operand_stack_store_unit(vm: &mut Vm<'_>, index: usize) {
-    if !live_operand_box(vm, index) {
+pub(super) extern "C" fn operand_stack_store_unit(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: usize) {
+    if !live_operand_box(vm, frame, index) {
         majit_metainterp::request_walk_abort();
         return;
     }
-    *super::operand_mut(&mut vm.stack[index]) = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
+    *super::operand_mut(&mut frame.operand_refs[index]) = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
 }
 
 /// Move one whole [`Dynamic`] through an already-resolved mutable place.
@@ -2306,88 +2227,21 @@ pub(super) extern "C" fn dynamic_store(target: &mut Dynamic, value: &mut Dynamic
         majit_metainterp::request_walk_abort();
         return;
     }
-    *target = core::mem::take(value);
+    *target = super::pop_slot(value);
 }
 
 /// Drop every operand above `depth` and update the red VM's stack depth.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn truncate_stack(vm: &mut Vm<'_>, depth: usize) {
+pub(super) extern "C" fn truncate_stack(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  depth: usize) {
     if !live_vm_ptr(vm) || !live_count(depth) {
         majit_metainterp::request_walk_abort();
         return;
     }
     majit_metainterp::note_residual_committed();
-    vm.truncate_stack(depth);
+    frame.truncate_cells(depth);
 }
 
-/// `Vec::len` / `ThinVec::len` on the running `for` stack, as one ABI word.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn iterators_len(vm: &Vm<'_>) -> i64 {
-    vm.iterators_len() as i64
-}
-
-/// Pop the iterable and start the `for`, inside one residual.
-///
-/// Tracing `stack_take` of a range `Dynamic` reaches a `BC_ABORT` arm
-/// (`stack_take` at pos 57). The natural integer range only needs the
-/// two bounds on the iterator, which is what [`Vm::iter_init`] records.
-/// `Some` is the error; `None` means the iterator was pushed.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn iter_init_from_top(
-    vm: &mut Vm<'_>,
-    position: i64,
-) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    let Some(depth) = vm.depth.checked_sub(1) else {
-        return Some(Box::new(crate::EvalAltResult::ErrorRuntime(
-            "operand stack underflow".into(),
-            position_from_bits(position),
-        )));
-    };
-    if !live_count(depth) || depth >= vm.stack.len() {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    vm.depth = depth;
-    let iterable = core::mem::take(super::operand_mut(&mut vm.stack[depth]));
-    majit_metainterp::note_residual_committed();
-    vm.iter_init(iterable, position_from_bits(position)).err()
-}
-
-/// Drop the innermost `for` iterator without exposing `Vec::pop`.
-///
-/// Exhaust of a compiled range loop blackholes through this path to the
-/// next merge point. A walk-abort here becomes `LeaveFrame` (`usize::MAX`)
-/// and the native loop re-decodes the body, adding the last item twice.
-#[majit_macros::dont_look_inside_cannot_raise]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn iterators_pop(vm: &mut Vm<'_>) {
-    if !live_vm_ptr(vm) {
-        return;
-    }
-    let len = vm.iterators_len();
-    if len == 0 {
-        return;
-    }
-    majit_metainterp::note_residual_committed();
-    vm.iterators_truncate(len - 1);
-}
-
-/// `Vec::truncate` on the running `for` stack.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn iterators_truncate(vm: &mut Vm<'_>, len: usize) {
-    if !live_vm_ptr(vm) || !live_count(len) {
-        majit_metainterp::request_walk_abort();
-        return;
-    }
-    majit_metainterp::note_residual_committed();
-    vm.iterators_truncate(len);
-}
-
-/// Handler-stack twins of [`iterators_len`].
+/// Handler-stack length, as one ABI word.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn handlers_len(vm: &Vm<'_>) -> i64 {
     vm.handlers_len() as i64
@@ -2750,11 +2604,6 @@ impl GrainJitDriver {
         if RESIDUAL_NEST.with(Cell::get) != 0 {
             return;
         }
-        // `FOR_ITER` peeks TOS off the live stack depth. Dest-abort
-        // writeback can leave `iter_depth` at the inner nest (2) after
-        // that iterator is gone; remint from the live stack before the
-        // door publishes vable words or dest peeks.
-        frame.iter_depth = vm.iterators_len();
         STEP.with(|step| step.recording.set(true));
         struct RecordingGuard;
         impl Drop for RecordingGuard {
@@ -2863,7 +2712,7 @@ impl GrainJitDriver {
                     &env,
                     &frame.jit_vable_words(),
                     frame.operand_word_slice(),
-                    frame.operand_ref_slice(),
+                    &frame.operand_ref_words(),
                 );
 
             let was_tracing = runtime.driver.is_tracing();
@@ -3084,7 +2933,6 @@ impl GrainJitDriver {
         if !restored.is_empty() {
             frame.restore_from_jit(&restored, vm);
         }
-        frame.iter_depth = vm.iterators_len();
         // `ContinueRunningNormally`'s green pc is the next merge point.
         // `usize::MAX` is `DoneWithThisFrame*` / a bail with no forward pc:
         // the portal result is `jit_return_kind`, not a guessed header.

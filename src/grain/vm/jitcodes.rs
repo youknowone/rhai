@@ -369,32 +369,8 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::array_len as *const () as usize as i64,
         ),
         (
-            "rhai::grain::vm::jit::iterator_last_mut",
-            super::jit::iterator_last_mut as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::iteration_at",
-            super::jit::iteration_at as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::dest_iteration_at",
-            super::jit::dest_iteration_at as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::iter_next_store",
-            super::jit::iter_next_store as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::iter_next_produced",
-            super::jit::iter_next_produced as *const () as usize as i64,
-        ),
-        (
             "rhai::grain::vm::jit::store_scope_int",
             super::jit::store_scope_int as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::store_int_range_next",
-            super::jit::store_int_range_next as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::store_shared_from_stack",
@@ -504,10 +480,6 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::operand_stack_take_cell as *const () as usize as i64,
         ),
         (
-            "rhai::grain::vm::jit::iter_init_from_top",
-            super::jit::iter_init_from_top as *const () as usize as i64,
-        ),
-        (
             "rhai::grain::vm::jit::walk_is_recording",
             super::jit::walk_is_recording as *const () as usize as i64,
         ),
@@ -543,18 +515,6 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
         (
             "rhai::grain::vm::jit::truncate_stack",
             super::jit::truncate_stack as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::iterators_len",
-            super::jit::iterators_len as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::iterators_pop",
-            super::jit::iterators_pop as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::iterators_truncate",
-            super::jit::iterators_truncate as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::scope_rewind",

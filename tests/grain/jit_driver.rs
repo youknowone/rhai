@@ -104,6 +104,7 @@ fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
             ("local_sync", majit_ir::Type::Int),
             ("local_int_mask", majit_ir::Type::Int),
             ("operand_depth", majit_ir::Type::Int),
+            ("operand_spare", majit_ir::Type::Ref),
         ],
     );
 }
@@ -114,7 +115,7 @@ fn the_driver_descriptor_carries_the_frame_virtualizable() {
     assert_eq!(jd.virtualizable.as_deref(), Some("frame"));
     assert_eq!(jd.index_of_virtualizable, 0);
     let info = jd.virtualizable_info.as_ref().expect("initialize_virtualizable reads jd.virtualizable_info");
-    assert_eq!(info.static_fields.len(), 11);
+    assert_eq!(info.static_fields.len(), 12);
 }
 
 /// The compatibility gate checks the compiled red schema, not whether some
@@ -356,6 +357,37 @@ fn a_second_vm_runs_the_compiled_switch_loop() {
         after_second.compiled_entries < entries_after_first.saturating_add(64),
         "a second vm must reuse the compiled loop, not storm entries: first={entries_after_first} after={:?}",
         after_second.compiled_entries,
+    );
+}
+
+/// An aborted trace resumes at the state the tracer reached
+/// (`aborted_tracing` → `SwitchToBlackhole`). The sum is the interpreter's.
+#[test]
+#[cfg_attr(all(not(rhai_grain_jit_tables), not(rhai_grain_jit_require_tables)), ignore = "vacuous: no MAJIT_MIR_FRONTEND_LLBC tables were built")]
+fn aborted_trace_matches_the_walker() {
+    if no_tables() {
+        return;
+    }
+    jit_state::reset_stats();
+    const LIMIT: i64 = 2000;
+    const SOURCE: &str = "fn add(a, b) { a + b } let s = 0; for i in 0..2000 { s = add(s, i); } s";
+    let engine = Engine::new();
+    let ast = engine.compile(SOURCE).expect("the script parses");
+    let program = Compiler::new().compile(&ast);
+    let walker = engine
+        .eval_ast_with_scope::<rhai::Dynamic>(&mut Scope::new(), &ast)
+        .expect("the walker runs");
+    let result = Vm::new(&engine)
+        .eval_with_scope(&mut Scope::new(), &program)
+        .expect("the script runs");
+    let expected = LIMIT * (LIMIT - 1) / 2;
+    let stats = jit_state::stats();
+    eprintln!("abort-answer grain JIT stats: {stats:?}");
+    assert_eq!(format!("{walker:?}"), expected.to_string());
+    assert_eq!(
+        format!("{result:?}"),
+        expected.to_string(),
+        "an aborted trace must match the interpreter: {stats:?}"
     );
 }
 

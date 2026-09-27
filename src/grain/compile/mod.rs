@@ -1718,7 +1718,7 @@ impl Lowering {
                     // `loop_iters` counts from inside the loop and therefore
                     // already includes it.
                     self.pop_handlers(loop_handlers);
-                    self.drop_iterators(loop_iters - usize::from(owns_iterator));
+                    self.drop_iterators(loop_iters - usize::from(owns_iterator), true);
                     self.emit(Op::UnwindTo(break_depth));
                     let site = self.emit_jump();
                     self.loops.last_mut().expect("checked").breaks.push(site);
@@ -1726,7 +1726,7 @@ impl Lowering {
                     // Back into the same loop, so its iterator and its loop
                     // variable both have to survive.
                     self.pop_handlers(loop_handlers);
-                    self.drop_iterators(loop_iters);
+                    self.drop_iterators(loop_iters, false);
                     self.emit(Op::UnwindTo(continue_depth));
                     match continue_target {
                         // Above the body, so this is a back edge of its own
@@ -3058,8 +3058,15 @@ impl Lowering {
     }
 
     /// Emit an `IterDrop` for every iterator live above `floor`.
-    fn drop_iterators(&mut self, floor: usize) {
+    ///
+    /// `covered` means a value sits on top of those iterators (`break` with
+    /// its result). Each drop swaps that value under the iterator first, so
+    /// the pop takes the iterator.
+    fn drop_iterators(&mut self, floor: usize, covered: bool) {
         for _ in floor..self.iters {
+            if covered {
+                self.emit(Op::Rotate(1));
+            }
             self.emit(Op::IterDrop);
         }
     }
@@ -3487,6 +3494,29 @@ mod tests {
             order,
             [("alpha", 1), ("alpha", 2), ("mike", 0), ("zulu", 1)],
             "functions must be lowered by name and arity, not by hash",
+        );
+    }
+
+    #[test]
+    fn nested_for_records_the_assign_temporary() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("let s = 0; for i in 0..201 { for j in 0..2000 { s += 1; } } s")
+            .expect("parses");
+        let program = Compiler::new().compile(&ast);
+        let mut at = 0usize;
+        let code = program.code();
+        let mut ops = Vec::new();
+        while at < code.len() {
+            let op = crate::grain::bytecode::code::decode(code, at).expect("decodes");
+            let width = crate::grain::bytecode::code::width(code, at).expect("width");
+            ops.push(format!("{op:?}"));
+            at += width;
+        }
+        assert!(
+            program.main().max_stack() >= 2,
+            "max_stack={} ops={ops:?}",
+            program.main().max_stack(),
         );
     }
 
