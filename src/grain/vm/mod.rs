@@ -9386,7 +9386,6 @@ impl<'e> Vm<'e> {
                     #[cfg(feature = "grain-jit")]
                     {
                         let new_depth = $depth;
-                        let old_depth = depth!();
                         frame.operand_depth = depth!();
                         if jitted {
                             jit::truncate_stack(self, frame, new_depth);
