@@ -414,10 +414,10 @@ fn verify_chunk(
                     next,
                     State {
                         operands: depth
-                            .checked_sub(1)
+                            .checked_sub(2)
                             .ok_or(VerifyError::Underflow {
                                 at,
-                                need: 1,
+                                need: 2,
                                 have: depth,
                             })?,
                         iters: state
@@ -443,10 +443,10 @@ fn verify_chunk(
                     next,
                     State {
                         operands: depth
-                            .checked_sub(1)
+                            .checked_sub(2)
                             .ok_or(VerifyError::Underflow {
                                 at,
-                                need: 1,
+                                need: 2,
                                 have: depth,
                             })?,
                         iters: state
@@ -815,8 +815,11 @@ fn effect(op: &Op, pools: &Pools) -> (usize, usize, usize) {
         // Pops the thrown value; nothing follows, so what it leaves is moot.
         Op::Throw | Op::StoreShared(..) => (1, 1, 0),
 
-        // The iterable is replaced by the iterator (`GET_ITER`).
-        Op::IterInit => (1, 1, 1),
+        // The iterable becomes the iterator, and that iterator occupies a
+        // slot for the whole loop (`GET_ITER` keeps a value; `FOR_ITER`
+        // pushes the item on top of it). The extra slot lasts until the
+        // exhaust edge or `IterDrop` pops it.
+        Op::IterInit => (1, 1, 2),
         // Pop the iterator. `IterNext*` edges are spelled on the successors.
         Op::IterDrop => (1, 1, 0),
         Op::IterNext { .. } | Op::IterNextStore { .. } => (0, 0, 0),

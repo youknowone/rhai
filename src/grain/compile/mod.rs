@@ -3466,6 +3466,22 @@ mod tests {
     /// Checks the order itself rather than comparing two artifacts: the seed is
     /// per process, so two compiles in one process agree either way.
     #[test]
+    fn nested_for_counts_each_live_iterator_in_max_stack() {
+        let engine = crate::Engine::new();
+        let ast = engine
+            .compile("let n = 0; for p in 0..6 { n += 1; for i in 0..2000 { n += 0; } } n")
+            .expect("compiles");
+        let program = Compiler::new().compile(&ast);
+        let measured = program.verify().expect("the nested for verifies");
+        assert_eq!(measured, vec![program.max_stack()]);
+        assert_eq!(
+            program.max_stack(),
+            6,
+            "two live iterators, each held for its loop, on top of the body"
+        );
+    }
+
+    #[test]
     fn functions_are_lowered_in_a_stable_order() {
         let engine = crate::Engine::new();
         let ast = engine
