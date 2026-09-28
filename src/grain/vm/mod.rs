@@ -1854,31 +1854,7 @@ fn operand_slots(n: usize) -> Vec<OperandSlot> {
 
 impl GrainFrame<'_, '_> {
 
-    /// Record a scalar in the virtualizable word arrays. Non-scalars store
-    /// their slot index in `operand_refs`.
-    #[cfg(feature = "grain-jit")]
-    fn note_scalar(&mut self, index: usize, value: &Dynamic) {
-        if index >= STACK_WORDS {
-            return;
-        }
-        let (word, tag) = scalar_word(value);
-        self.operand_words[index] = word;
-        self.operand_tags[index] = tag;
-    }
-
-    #[cfg(feature = "grain-jit")]
-    fn clear_scalar(&mut self, index: usize) {
-        if index >= STACK_WORDS {
-            return;
-        }
-        let cleared = 0i64;
-        self.operand_words[index] = cleared;
-        self.operand_tags[index] = 0;
-    }
-
     fn write_cell(&mut self, index: usize, value: Dynamic) {
-        #[cfg(feature = "grain-jit")]
-        self.note_scalar(index, &value);
         set_operand(&mut self.operand_refs[index], value);
     }
 
@@ -1902,16 +1878,6 @@ impl GrainFrame<'_, '_> {
     }
 
     fn take_cell(&mut self, index: usize) -> Dynamic {
-        #[cfg(feature = "grain-jit")]
-        if index < STACK_WORDS && self.operand_tags[index] != 0 {
-            let tag = self.operand_tags[index];
-            let word = self.operand_words[index];
-            self.clear_scalar(index);
-            drop(self.operand_refs[index].take());
-            return dynamic_from_word(tag, word);
-        }
-        #[cfg(feature = "grain-jit")]
-        self.clear_scalar(index);
         take_operand(&mut self.operand_refs[index])
     }
 
@@ -1927,8 +1893,6 @@ impl GrainFrame<'_, '_> {
         }
         let mut slot = depth;
         while slot < self.operand_depth {
-            #[cfg(feature = "grain-jit")]
-            self.clear_scalar(slot);
             drop(self.operand_refs[slot].take());
             slot += 1;
         }
@@ -2375,67 +2339,28 @@ macro_rules! pop_unit_word {
     }};
 }
 #[cfg(feature = "grain-jit")]
-macro_rules! push_scalar {
-    ($me:tt, $frame:ident, $tag:expr, $value:expr) => {{
-        // `pyframe.py` `pushvalue`: one depth, the frame field, and one
-        // store into the virtualizable array at that index. Field writes
-        // only: a method on the whole frame aliases the scope borrow the
-        // dispatch loop is holding.
-        let _ = $me;
-        let depth = $frame.operand_depth;
-        let value = $value;
-        let tag = $tag;
-        if depth < STACK_WORDS {
-            $frame.operand_words[depth] = value;
-            $frame.operand_tags[depth] = tag;
-        }
-        set_operand(
-            &mut $frame.operand_refs[depth],
-            dynamic_from_word(tag, value),
-        );
-        $frame.operand_depth = depth + 1;
-    }};
-}
-#[cfg(feature = "grain-jit")]
 macro_rules! push_fast_word {
     ($me:tt, $frame:ident, $value:expr) => {{
-        match $value {
-            arith::FastValue::Int(held) => push_scalar!($me, $frame, 1, held as i64),
-            arith::FastValue::Bool(held) => push_scalar!($me, $frame, 2, i64::from(held)),
-            #[cfg(not(feature = "no_float"))]
-            arith::FastValue::Float(held) => push_scalar!($me, $frame, 3, held.to_bits() as i64),
-            arith::FastValue::Unit => {
-                let zero = 0i64;
-                push_scalar!($me, $frame, 4, zero)
+        let _ = $me;
+        let dynamic = match $value {
+            arith::FastValue::Int(held) => {
+                Dynamic(Union::Int(held, 0, AccessMode::ReadWrite))
             }
-        }
+            arith::FastValue::Bool(held) => {
+                Dynamic(Union::Bool(held, 0, AccessMode::ReadWrite))
+            }
+            #[cfg(not(feature = "no_float"))]
+            arith::FastValue::Float(held) => Dynamic::from(held),
+            arith::FastValue::Unit => Dynamic(Union::Unit((), 0, AccessMode::ReadWrite)),
+        };
+        $frame.push_cell(dynamic);
     }};
 }
 #[cfg(feature = "grain-jit")]
 macro_rules! push_word {
     ($me:tt, $frame:ident, $value:expr) => {{
-        let value = $value;
-        match jit::dynamic_as_fast(&value) {
-            1 => push_scalar!($me, $frame, 1, jit::fast_int() as i64),
-            2 => push_scalar!($me, $frame, 2, jit::fast_bool()),
-            #[cfg(not(feature = "no_float"))]
-            3 => push_scalar!($me, $frame, 3, jit::fast_float().to_bits() as i64),
-            4 => {
-                let zero = 0i64;
-                push_scalar!($me, $frame, 4, zero)
-            }
-            _ => {
-                let _ = $me;
-                let depth = $frame.operand_depth;
-                if depth < STACK_WORDS {
-                    let cleared = 0i64;
-                    $frame.operand_tags[depth] = 0;
-                    $frame.operand_words[depth] = cleared;
-                }
-                set_operand(&mut $frame.operand_refs[depth], value);
-                $frame.operand_depth = depth + 1;
-            }
-        }
+        let _ = $me;
+        $frame.push_cell($value);
     }};
 }
 #[cfg(feature = "grain-jit")]
@@ -6514,17 +6439,13 @@ impl<'e> Vm<'e> {
                     // The residual wrote `Vm.stack` and did not update the
                     // scalar tag. Popping through the tag would replay the
                     // previous word.
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     let depth = or_raise!(
                         depth!().checked_sub(1),
                         malformed("operand stack underflow".to_string())
                     );
                     depth!(depth);
-                    if depth < STACK_WORDS {
-                        frame.operand_tags[depth] = 0;
-                        let cleared = 0i64;
-                        frame.operand_words[depth] = cleared;
-                    }
+
                     stack_take(frame, depth)
                 }
                 #[cfg(not(feature = "grain-jit"))]
@@ -6547,7 +6468,7 @@ impl<'e> Vm<'e> {
                     ) {
                         return Err(err);
                     }
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     if !$keeps {
                         let floor = depth!().saturating_sub(1);
                         truncate_stack!(floor);
@@ -7350,17 +7271,13 @@ impl<'e> Vm<'e> {
                     // The residual wrote `Vm.stack` and did not update the
                     // scalar tag. Popping through the tag would replay the
                     // previous word.
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     let depth = or_raise!(
                         depth!().checked_sub(1),
                         malformed("operand stack underflow".to_string())
                     );
                     depth!(depth);
-                    if depth < STACK_WORDS {
-                        frame.operand_tags[depth] = 0;
-                        let cleared = 0i64;
-                        frame.operand_words[depth] = cleared;
-                    }
+
                     stack_take(frame, depth)
                 }
                 #[cfg(not(feature = "grain-jit"))]
@@ -7383,7 +7300,7 @@ impl<'e> Vm<'e> {
                     ) {
                         return Err(err);
                     }
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     if !$keeps {
                         let floor = depth!().saturating_sub(1);
                         truncate_stack!(floor);
@@ -8097,18 +8014,8 @@ impl<'e> Vm<'e> {
                     // is not a portal call. The new depth comes back as
                     // the getter's result and is written once, onto the
                     // frame field.
-                    if let Some(err) = jit::switch_pop_subject(self, frame, table) {
-                        return Err(err);
-                    }
-                    frame.operand_depth = jit::vm_depth(self, frame) as usize;
-                    let popped = frame.operand_depth;
-                    if popped < STACK_WORDS {
-                        frame.operand_tags[popped] = 0;
-                        let cleared = 0i64;
-                        frame.operand_words[popped] = cleared;
-                    }
-                    if jit::switch_subject_kind() == 1 {
-                        let value = jit::fast_int();
+                    let subject = frame.pop_result()?;
+                    if let Ok(value) = subject.as_int() {
                         let n = jit::switch_case_count(table);
                         let mut i = 0i64;
                         while i < n {
@@ -8147,7 +8054,7 @@ impl<'e> Vm<'e> {
                         transfer!(target);
                         return Ok((pc, true));
                     }
-                    let target = jit::switch_target() as usize;
+                    let target = table.dispatch(&subject) as usize;
                     let n = jit::switch_case_count(table);
                     let mut i = 0i64;
                     while i < n {
@@ -8691,17 +8598,13 @@ impl<'e> Vm<'e> {
                     // The residual wrote `Vm.stack` and did not update the
                     // scalar tag. Popping through the tag would replay the
                     // previous word.
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     let depth = or_raise!(
                         depth!().checked_sub(1),
                         malformed("operand stack underflow".to_string())
                     );
                     depth!(depth);
-                    if depth < STACK_WORDS {
-                        frame.operand_tags[depth] = 0;
-                        let cleared = 0i64;
-                        frame.operand_words[depth] = cleared;
-                    }
+
                     stack_take(frame, depth)
                 }
                 #[cfg(not(feature = "grain-jit"))]
@@ -8724,7 +8627,7 @@ impl<'e> Vm<'e> {
                     ) {
                         return Err(err);
                     }
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     if !$keeps {
                         let floor = depth!().saturating_sub(1);
                         truncate_stack!(floor);
@@ -9093,17 +8996,6 @@ impl<'e> Vm<'e> {
         // (`func/call.rs:1775-1799`).
         #[cfg(feature = "grain-jit")]
         if let (Some(token), 2) = (op, argc) {
-            frame.operand_depth = depth!();
-            let mut slot = first;
-            let top_slot = depth!().min(STACK_WORDS);
-            while slot < top_slot {
-                let tag = frame.operand_tags[slot];
-                if tag != 0 {
-                    let word = frame.operand_words[slot];
-                    store_tagged_word(operand_mut(&mut frame.operand_refs[slot]), tag, word);
-                }
-                slot += 1;
-            }
             if let Some(err) = jit::operator_builtin_abi(self, frame,
                 program,
                 token,
@@ -9209,9 +9101,9 @@ impl<'e> Vm<'e> {
                 ) {
                     return Err(err);
                 }
-                depth!(jit::vm_depth(self, frame) as usize);
+                depth!(frame.operand_depth);
                 if !branching && jit::reseat_top_to_floor(self, frame, first) != 0 {
-                    depth!(jit::vm_depth(self, frame) as usize);
+                    depth!(frame.operand_depth);
                     pc += width;
                     return Ok((pc, true));
                 }
@@ -9495,15 +9387,6 @@ impl<'e> Vm<'e> {
                     {
                         let new_depth = $depth;
                         let old_depth = depth!();
-                        if new_depth < old_depth {
-                            let end = old_depth.min(STACK_WORDS);
-                            let start = new_depth.min(end);
-                            let mut slot = start;
-                            while slot < end {
-                                frame.operand_tags[slot] = 0;
-                                slot += 1;
-                            }
-                        }
                         frame.operand_depth = depth!();
                         if jitted {
                             jit::truncate_stack(self, frame, new_depth);
@@ -9530,17 +9413,13 @@ impl<'e> Vm<'e> {
                         // The residual wrote `Vm.stack` and did not update the
                         // scalar tag. Popping through the tag would replay the
                         // previous word.
-                        depth!(jit::vm_depth(self, frame) as usize);
+                        depth!(frame.operand_depth);
                         let depth = or_raise!(
                             depth!().checked_sub(1),
                             malformed("operand stack underflow".to_string())
                         );
                         depth!(depth);
-                        if depth < STACK_WORDS {
-                            frame.operand_tags[depth] = 0;
-                            let cleared = 0i64;
-                            frame.operand_words[depth] = cleared;
-                        }
+
                         stack_take(frame, depth)
                     }
                     #[cfg(not(feature = "grain-jit"))]
@@ -9567,7 +9446,7 @@ impl<'e> Vm<'e> {
                         ) {
                             return Err(err);
                         }
-                        depth!(jit::vm_depth(self, frame) as usize);
+                        depth!(frame.operand_depth);
                         if !$keeps {
                             let floor = depth!().saturating_sub(1);
                             truncate_stack!(floor);
@@ -9996,14 +9875,9 @@ impl<'e> Vm<'e> {
                     } else {
                         #[cfg(feature = "grain-jit")]
                         {
-                            // A scalar push leaves a tag. A later non-scalar
-                            // at the same depth must not be popped as that tag.
-                            if depth!() < STACK_WORDS {
-                                frame.operand_tags[depth!()] = 0;
-                            }
                             frame.operand_depth = depth!();
                             jit::push_from_cell(self, frame, value);
-                            depth!(jit::vm_depth(self, frame) as usize);
+                            depth!(frame.operand_depth);
                         }
                         #[cfg(not(feature = "grain-jit"))]
                         push_word!(self, frame, clone_value(value));
@@ -10038,13 +9912,10 @@ impl<'e> Vm<'e> {
                     } else {
                         #[cfg(feature = "grain-jit")]
                         {
-                            if depth!() < STACK_WORDS {
-                                frame.operand_tags[depth!()] = 0;
-                            }
                             frame.operand_depth = depth!();
                             let owned = flatten_clone_value(cell);
                             jit::push_from_cell(self, frame, &owned);
-                            depth!(jit::vm_depth(self, frame) as usize);
+                            depth!(frame.operand_depth);
                         }
                         #[cfg(not(feature = "grain-jit"))]
                         {
@@ -10154,11 +10025,7 @@ impl<'e> Vm<'e> {
                             malformed("operand stack underflow".to_string())
                         );
                         frame.operand_depth = depth;
-                        if depth < STACK_WORDS {
-                            frame.operand_tags[depth] = 0;
-                            let cleared = 0i64;
-                            frame.operand_words[depth] = cleared;
-                        }
+
                         if let Some(err) = jit::declare_local_abi(self, frame,
                             program,
                             index,
@@ -10819,20 +10686,6 @@ impl<'e> Vm<'e> {
                         // and answers whatever it answers, which is what a
                         // verified program's byte can never make it do.
                         if let Some(kind) = BinOpKind::from_byte(byte!(3)) {
-                            #[cfg(feature = "grain-jit")]
-                            if under < STACK_WORDS
-                                && top - 1 < STACK_WORDS
-                                && frame.operand_tags[under] == 1
-                                && frame.operand_tags[top - 1] == 1
-                            {
-                                let x = frame.operand_words[under] as crate::INT;
-                                let y = frame.operand_words[top - 1] as crate::INT;
-                                if let Some(value) = arith::int_binary(kind, x, y)? {
-                                    deliver_fast!(under, value);
-                                    pc += width;
-                                    continue;
-                                }
-                            }
                             if let Some(value) = apply_binary(
                                 kind,
                                 stack_ref(frame, under),

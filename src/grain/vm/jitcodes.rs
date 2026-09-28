@@ -280,16 +280,8 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
             super::jit::int_max as *const () as usize as i64,
         ),
         (
-            "rhai::grain::vm::jit::vm_depth",
-            super::jit::vm_depth as *const () as usize as i64,
-        ),
-        (
             "rhai::grain::vm::jit::switch_dispatch",
             super::jit::switch_dispatch as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::switch_pop_subject",
-            super::jit::switch_pop_subject as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::switch_target",
@@ -437,23 +429,6 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
         (
             "rhai::grain::vm::jit::grow_stack_abi",
             super::jit::grow_stack_abi as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::push_fast_int",
-            super::jit::push_fast_int as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::push_fast_bool",
-            super::jit::push_fast_bool as *const () as usize as i64,
-        ),
-        #[cfg(not(feature = "no_float"))]
-        (
-            "rhai::grain::vm::jit::push_fast_float",
-            super::jit::push_fast_float as *const () as usize as i64,
-        ),
-        (
-            "rhai::grain::vm::jit::push_fast_unit",
-            super::jit::push_fast_unit as *const () as usize as i64,
         ),
         (
             "rhai::grain::vm::jit::push_from_cell",

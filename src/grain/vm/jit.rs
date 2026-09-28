@@ -685,44 +685,6 @@ pub(super) extern "C" fn store_shared_from_stack(
     }
 }
 
-/// Pop one `switch` subject and classify it without exposing the hasher seed.
-///
-/// The subject is popped inside this boundary: a walk local's address is not
-/// an ABI word, so handing `&Dynamic` out of the portal stores through null.
-///
-/// Kind `1` is an integer: [`fast_int`] holds the value so the portal can
-/// compare it against recovered case keys (and integer ranges) as in-loop
-/// guards. Hashing stays behind this boundary. Any other kind stores the
-/// table's target in [`switch_target`].
-#[majit_macros::dont_look_inside_cannot_raise]
-#[allow(improper_ctypes_definitions)]
-pub(super) extern "C" fn switch_pop_subject(
-    vm: &mut Vm<'_>,
-    frame: &mut super::GrainFrame<'_, '_>,
-    table: &Switch,
-) -> Option<Box<crate::EvalAltResult>> {
-    if !live_vm_ptr(vm) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    match frame.pop_result() {
-        Ok(subject) => {
-            match subject.as_int() {
-                Ok(value) => {
-                    FAST_INT.with(|cell| cell.set(value));
-                    SWITCH_KIND.with(|cell| cell.set(1));
-                }
-                Err(_) => {
-                    SWITCH_KIND.with(|cell| cell.set(0));
-                    SWITCH_TARGET.with(|cell| cell.set(i64::from(table.dispatch(&subject))));
-                }
-            }
-            None
-        }
-        Err(err) => Some(err),
-    }
-}
-
 /// Hash-dispatch one `switch` without exposing the hasher's seed static.
 ///
 /// Kept for subjects that are not integers. The subject is popped inside this
@@ -914,16 +876,6 @@ pub(super) extern "C" fn fast_bool() -> i64 {
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn fast_float() -> crate::FLOAT {
     FAST_FLOAT.with(Cell::get)
-}
-
-/// The live operand-stack depth, as one ABI word.
-///
-/// A residual that `push`es has already updated the real field. The walk still
-/// holds the pre-call depth, so it must read the real one back rather than
-/// adding one to a stale local.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn vm_depth(vm: &Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) -> i64 {
-    frame.operand_depth as i64
 }
 
 /// Array length without exposing `Vec::len` as a synthetic `__len` residual.
@@ -1801,25 +1753,6 @@ fn live_operand_box(vm: &Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  index: 
     live_stack_store(vm, frame, index) && live_dynamic_ptr(super::operand_ref(&frame.operand_refs[index]))
 }
 
-/// Grow if needed and refuse a walk-local destination. The caller writes the
-/// slot and advances [`Vm::depth`] only when this returns `Some`.
-fn prepare_fast_push(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) -> Option<usize> {
-    if !live_vm_ptr(vm) || !live_count(frame.operand_depth) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    let depth = frame.operand_depth;
-    if depth >= frame.operand_refs.len() {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    if !live_operand_box(vm, frame, depth) {
-        majit_metainterp::request_walk_abort();
-        return None;
-    }
-    Some(depth)
-}
-
 fn dummy_unit() -> &'static Dynamic {
     thread_local! {
         static UNIT: std::cell::Cell<Option<&'static Dynamic>> =
@@ -1925,53 +1858,6 @@ pub(super) extern "C" fn grow_stack_abi(
     // that still asks to grow is a trace of the old shape.
     let _ = (frame, extra);
     majit_metainterp::request_walk_abort();
-}
-
-/// Push one integer without exposing a walk-local `Box<Dynamic>`.
-///
-/// The portal must not inline `operand_stack_store_int` plus a depth bump:
-/// a walk-local destination drops `Union` at `0x2`, and incrementing depth
-/// after a refused store corrupts the live stack.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_int(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  value: crate::INT) {
-    let Some(depth) = prepare_fast_push(vm, frame) else {
-        return;
-    };
-    *super::operand_mut(&mut frame.operand_refs[depth]) =
-        Dynamic(Union::Int(value, 0, AccessMode::ReadWrite));
-    frame.operand_depth = depth + 1;
-}
-
-/// Bool twin of [`push_fast_int`].
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_bool(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  value: i64) {
-    let Some(depth) = prepare_fast_push(vm, frame) else {
-        return;
-    };
-    *super::operand_mut(&mut frame.operand_refs[depth]) =
-        Dynamic(Union::Bool(value != 0, 0, AccessMode::ReadWrite));
-    frame.operand_depth = depth + 1;
-}
-
-/// Float twin of [`push_fast_int`].
-#[cfg(not(feature = "no_float"))]
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_float(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,  value: crate::FLOAT) {
-    let Some(depth) = prepare_fast_push(vm, frame) else {
-        return;
-    };
-    *super::operand_mut(&mut frame.operand_refs[depth]) = Dynamic::from(value);
-    frame.operand_depth = depth + 1;
-}
-
-/// Unit twin of [`push_fast_int`].
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(super) extern "C" fn push_fast_unit(vm: &mut Vm<'_>, frame: &mut super::GrainFrame<'_, '_>,) {
-    let Some(depth) = prepare_fast_push(vm, frame) else {
-        return;
-    };
-    *super::operand_mut(&mut frame.operand_refs[depth]) = Dynamic(Union::Unit((), 0, AccessMode::ReadWrite));
-    frame.operand_depth = depth + 1;
 }
 
 /// Push a flatten-clone of a live cell. The cell is a scope or constant
