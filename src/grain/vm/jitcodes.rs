@@ -513,15 +513,17 @@ fn runtime_bindings() -> Vec<(&'static str, i64)> {
         ),
         (
             "majit_rlib::rffi::ll_raw_malloc_fixedsize",
-            majit_rlib::rffi::ll_raw_malloc_fixedsize as *const () as usize as i64,
+            majit_rlib::rffi::ll_raw_malloc_fixedsize as extern "C" fn(i64) -> i64 as *const ()
+                as usize as i64,
         ),
         (
             "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero",
-            majit_rlib::rffi::ll_raw_malloc_fixedsize_zero as *const () as usize as i64,
+            majit_rlib::rffi::ll_raw_malloc_fixedsize_zero as extern "C" fn(i64) -> i64 as *const ()
+                as usize as i64,
         ),
         (
             "majit_rlib::rffi::ll_raw_free",
-            majit_rlib::rffi::ll_raw_free as *const () as usize as i64,
+            majit_rlib::rffi::ll_raw_free as extern "C" fn(i64) as *const () as usize as i64,
         ),
     ]
 }
