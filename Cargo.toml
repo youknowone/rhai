@@ -47,6 +47,7 @@ majit-translate = { path = "../majit/majit-translate", optional = true, default-
 majit-metainterp = { path = "../majit/majit-metainterp", optional = true, default-features = false, features = ["dynasm"] }
 majit-ir = { path = "../majit/majit-ir", optional = true, default-features = false }
 majit-macros = { path = "../majit/majit-macros", optional = true }
+majit-rlib = { path = "../majit/majit-rlib", optional = true, default-features = false }
 # Only the front-end census examples read a `.ullbc` directly; the lowering
 # itself goes through `majit-translate`, which already depends on this.
 majit-charon-reader = { path = "../majit/majit-charon-reader", optional = true, default-features = false }
@@ -96,7 +97,7 @@ fuzz = ["arbitrary", "rust_decimal?/rust-fuzz", "serde", "grain"]
 grain = []
 ## Emit and consult the tracing-JIT merge point in the `grain` dispatch loop.
 ## Supported traces compile and enter machine code; unbound residual paths still abort.
-grain-jit = ["grain", "dep:majit-translate", "dep:majit-metainterp", "dep:majit-ir", "dep:majit-macros", "dep:majit-charon-reader", "dep:bincode"]
+grain-jit = ["grain", "dep:majit-translate", "dep:majit-metainterp", "dep:majit-ir", "dep:majit-macros", "dep:majit-rlib", "dep:majit-charon-reader", "dep:bincode"]
 
 #! ### System Configuration Features
 
