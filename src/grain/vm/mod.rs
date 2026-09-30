@@ -5891,7 +5891,7 @@ impl<'e> Vm<'e> {
         // One red frame per invocation, including non-portal callees inlined by
         // the meta-tracer.  Its address remains stable until this execute call
         // has completed or unwound.
-        let mut frame = GrainFrame {
+        let mut frame = frame_gc::GrainFrameBox::new(GrainFrame {
             scope,
             base,
             reached: chunk.entry() as usize,
@@ -5914,7 +5914,7 @@ impl<'e> Vm<'e> {
             operand_refs: Box::new(operand_slots(floor + chunk.max_stack() as usize)),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: operand_slots(floor + chunk.max_stack() as usize),
-        };
+        });
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
         // than being examined inside it. Catching therefore happens out here:
@@ -5925,7 +5925,7 @@ impl<'e> Vm<'e> {
         // path anything.
         let mut start = chunk.entry() as usize;
         let result = loop {
-            match self.run_frame(program, &mut frame, start) {
+            match self.run_frame(program, &mut *frame, start) {
                 Ok(value) => {
                     break Ok(value);
                 }
@@ -11448,7 +11448,7 @@ mod tests {
         let engine = Engine::new();
         let vm = Vm::new(&engine);
         let mut scope = Scope::new();
-        let mut frame = GrainFrame {
+        let mut frame = super::frame_gc::GrainFrameBox::new(GrainFrame {
             scope: &mut scope,
             base: 1,
             reached: 2,
@@ -11472,8 +11472,8 @@ mod tests {
             operand_refs: Box::new(Vec::new()),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: Vec::new(),
-        };
-        let frame_addr = &mut frame as *mut GrainFrame<'_, '_> as usize as i64;
+        });
+        let frame_addr = &mut *frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;
         let scope_addr = frame.scope as *mut Scope<'_> as usize as i64;
 
