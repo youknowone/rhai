@@ -87,7 +87,8 @@ fn the_frame_virtualizable_layout_is_registered_by_the_runtime_state() {
     let info = <jit_state::GrainJitState as JitState>::__build_virtualizable_info().expect("the frame red has runtime virtualizable metadata");
 
     assert_eq!(info.name, "frame");
-    assert!(!info.has_vable_token(), "a stack-resident GrainFrame has no force token");
+    assert!(info.has_vable_token());
+    assert_ne!(info.token_offset, 0);
     assert_eq!(info.identity_live_index, Some(0));
     assert_eq!(info.identity_ref_bank_index, Some(0));
     assert_eq!(

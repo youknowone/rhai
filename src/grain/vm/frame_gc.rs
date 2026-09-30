@@ -28,7 +28,11 @@ fn set_grain_frame_gc_type_id(id: u32) {
 
 /// Visit GC edges of a `GrainFrame`. Host-owned fields are not edges.
 #[cfg(feature = "grain-jit")]
-unsafe fn grain_frame_custom_trace(_obj_addr: usize, _visit: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+unsafe fn grain_frame_custom_trace(obj_addr: usize, visit: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    unsafe {
+        let frame = &mut *(obj_addr as *mut super::GrainFrame<'static, 'static>);
+        visit(&mut frame.vable_token as *mut usize as *mut majit_ir::GcRef);
+    }
 }
 
 #[cfg(feature = "grain-jit")]

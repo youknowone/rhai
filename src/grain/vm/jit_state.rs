@@ -771,9 +771,12 @@ impl JitState for GrainJitState {
         use super::GrainFrame;
         use majit_metainterp::virtualizable::VirtualizableInfo;
 
-        // `GrainFrame` is a stack-resident interpreter frame, so it has no
-        // heap force token.  Its identity is red #0 and ref-bank input #0.
-        let mut info = VirtualizableInfo::without_vable_token();
+        // `VirtualizableInfo::new` reads `vable_token`. Identity stays red #0
+        // and ref-bank input #0; the token is not a vable field.
+        let mut info = VirtualizableInfo::new(core::mem::offset_of!(
+            GrainFrame<'static, 'static>,
+            vable_token
+        ));
         info.name = "frame".to_string();
         info.identity_live_index = Some(0);
         info.identity_ref_bank_index = Some(0);

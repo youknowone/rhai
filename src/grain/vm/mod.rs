@@ -1764,6 +1764,9 @@ pub(super) struct GrainFrame<'a, 'scope> {
     /// Operand slots for the interpreter build. Same index as depth.
     #[cfg(not(feature = "grain-jit"))]
     operand_refs: Vec<OperandSlot>,
+    /// Force token `VirtualizableInfo` reads. Kept out of the vable field list.
+    #[cfg(feature = "grain-jit")]
+    vable_token: usize,
 }
 
 #[cfg(feature = "grain-jit")]
@@ -5914,6 +5917,8 @@ impl<'e> Vm<'e> {
             operand_refs: Box::new(operand_slots(floor + chunk.max_stack() as usize)),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: operand_slots(floor + chunk.max_stack() as usize),
+            #[cfg(feature = "grain-jit")]
+            vable_token: 0,
         });
 
         // The dispatch loop uses `?` throughout, so an error leaves it rather
@@ -11472,6 +11477,8 @@ mod tests {
             operand_refs: Box::new(Vec::new()),
             #[cfg(not(feature = "grain-jit"))]
             operand_refs: Vec::new(),
+            #[cfg(feature = "grain-jit")]
+            vable_token: 0,
         });
         let frame_addr = &mut *frame as *mut GrainFrame<'_, '_> as usize as i64;
         let vm_addr = &vm as *const Vm<'_> as usize as i64;
