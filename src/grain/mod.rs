@@ -137,8 +137,9 @@ assert_eq!(sites[1].unwrap().line, 2); // the call to it
 //! simply cannot be stopped.
 // A VM that runs untrusted bytecode has no business containing any, and saying
 // so here makes it the compiler's problem rather than a promise. `crates/
-// rhaigrain-pos` declares the same.
-#![forbid(unsafe_code)]
+// rhaigrain-pos` declares the same. `vm::frame_gc` allows it: that module
+// allocates the frame block through the collector.
+#![deny(unsafe_code)]
 
 pub mod bytecode;
 mod compile;

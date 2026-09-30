@@ -2237,6 +2237,7 @@ impl Runtime {
         // The build tables, liveness and dispatch identity have to be complete
         // before a trace clones staticdata. Keep them beside the state in one
         // thread-local owner because JitDriver is not a shared runtime object.
+        super::frame_gc::ensure_collector();
         jitcodes::install();
         let mut descriptor = jit_state::grain_driver_descriptor();
         // pypyjitdriver.is_recursive: script-fn CALL's recursive

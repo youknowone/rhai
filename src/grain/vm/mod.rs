@@ -44,6 +44,8 @@ mod jit;
 pub mod jit_state;
 #[cfg(feature = "grain-jit")]
 pub mod jitcodes;
+#[allow(unsafe_code)]
+mod frame_gc;
 mod value;
 
 use value::{clone_value, flatten_clone_value, release};
