@@ -25,8 +25,8 @@ use majit_metainterp::{
 
 /// The six register lists of a `jit_merge_point` op: green I/R/F then red I/R/F.
 ///
-/// Same payload `setup_frame_from_merge_point` decodes. Grain's two reds are
-/// both Ref, so the live frame is red-R[0] and the live Vm is red-R[1].
+/// Same payload `setup_frame_from_merge_point` decodes. The live frame is
+/// red-R[0] and the live Vm is red-I[0].
 fn merge_point_slot_regs(
     jitcode: &majit_metainterp::JitCode,
     header_pc: usize,
@@ -145,7 +145,7 @@ fn driver() -> &'static majit_translate::CompiledJitDriver {
 ///
 /// This is the list [`JitDriver::live_values_match_descriptor`] checks the live
 /// values against. Its default in [`JitState`] types every red `Int`, which for
-/// this VM would misdescribe both reference reds and make the driver decline to
+/// this VM would misdescribe the frame red and make the driver decline to
 /// trace without saying so.
 pub fn red_kinds() -> &'static [Type] {
     &driver().red_args_types
@@ -354,7 +354,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_point_red_r_names_two_ref_reds() {
+    fn merge_point_reds_name_frame_ref_and_vm_int() {
         let Some(header_pc) = jitcodes::portal_merge_point_offset() else {
             return;
         };
@@ -367,10 +367,16 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        assert!(
-            slots[4].len() >= 2,
-            "grain's two reds are both Ref: {:?}",
+        assert_eq!(
+            slots[4].len(),
+            1,
+            "the frame is the only Ref red: {:?}",
             slots[4]
+        );
+        assert!(
+            !slots[3].is_empty(),
+            "the Vm is the Int red: {:?}",
+            slots[3]
         );
     }
 
@@ -424,15 +430,15 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[4][1] as u32;
+        let vm_reg = slots[3][0] as u32;
         let mut state = GrainJitState::default();
         state.publish_live(&[0x1111_0000, 0x2222_0000], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let other = 0xBEEF_0000;
         let mk = |index, value| GuardResumeReg {
-            bank: Type::Ref,
+            bank: Type::Int,
             index,
-            opref: OpRef::input_arg_typed(index, Type::Ref),
+            opref: OpRef::input_arg_typed(index, Type::Int),
             value,
         };
         let mut frames = vec![GuardResumeFrame {
@@ -450,7 +456,7 @@ mod tests {
         assert_eq!(frames[0].regs[0].value, 0x2222_0000);
         assert_eq!(
             frames[0].regs[0].opref,
-            OpRef::input_arg_typed(vm_reg, Type::Ref),
+            OpRef::input_arg_typed(vm_reg, Type::Int),
             "without a live-Vm failarg the reserved slot keeps its InputArg",
         );
         assert_eq!(
@@ -476,14 +482,14 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[4][1] as u32;
+        let vm_reg = slots[3][0] as u32;
         let mut state = GrainJitState::default();
         let live = 0x2222_0000;
         state.publish_live(&[0x1111_0000, live], &[], &[], &[]);
         let stale = 0xDEAD_0000;
-        let vm_box = OpRef::input_arg_typed(3, Type::Ref);
+        let vm_box = OpRef::input_arg_typed(3, Type::Int);
         let mk = |index, opref, value| GuardResumeReg {
-            bank: Type::Ref,
+            bank: Type::Int,
             index,
             opref,
             value,
@@ -492,7 +498,7 @@ mod tests {
             jitcode: portal,
             pc: header_pc,
             regs: vec![
-                mk(vm_reg, OpRef::input_arg_typed(vm_reg, Type::Ref), stale),
+                mk(vm_reg, OpRef::input_arg_typed(vm_reg, Type::Int), stale),
                 mk(4, vm_box, live),
             ],
             result_slot: None,
@@ -522,15 +528,15 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[4][1] as u32;
+        let vm_reg = slots[3][0] as u32;
         let mut state = GrainJitState::default();
         let live = 0x2222_0000;
         state.publish_live(&[0x1111_0000, live], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let mk = |index, value| GuardResumeReg {
-            bank: Type::Ref,
+            bank: Type::Int,
             index,
-            opref: OpRef::input_arg_typed(6, Type::Ref),
+            opref: OpRef::input_arg_typed(6, Type::Int),
             value,
         };
         let mut frames = vec![GuardResumeFrame {
@@ -544,7 +550,7 @@ mod tests {
         assert_eq!(frames[0].regs[0].value, live);
         assert_eq!(
             frames[0].regs[0].opref,
-            OpRef::input_arg_typed(1, Type::Ref),
+            OpRef::input_arg_typed(1, Type::Int),
             "a live-Vm failarg that is not a portal register still names an InputArg",
         );
     }
@@ -565,18 +571,15 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        if slots[4].len() < 2 || slots[4][0] == slots[4][1] {
-            return;
-        }
-        let vm_reg = slots[4][1] as u32;
+        let vm_reg = slots[3][0] as u32;
         let mut state = GrainJitState::default();
         let frame = 0x1111_0000;
         let live = 0x2222_0000;
         state.publish_live(&[frame, live], &[], &[], &[]);
         let mk = |index, value| GuardResumeReg {
-            bank: Type::Ref,
+            bank: Type::Int,
             index,
-            opref: OpRef::input_arg_typed(index, Type::Ref),
+            opref: OpRef::input_arg_typed(index, Type::Int),
             value,
         };
         let mut frames = vec![GuardResumeFrame {
@@ -946,11 +949,11 @@ impl JitState for GrainJitState {
     }
 
     /// Generated `setup_bridge_sym` rebinds a missing identity register
-    /// from the live state. The LLBC portal now reserves merge-point
-    /// reds the way `ref_identity_base` reserves `#[jit_interp]`
-    /// identity slots, so red-R[1] is the Vm at every guard. Rewrite
-    /// only that reserved index — not every copy of its bits, which
-    /// is what SIGSEGV'd when the slot was still reusable.
+    /// from the live state. The LLBC portal reserves merge-point reds
+    /// the way `ref_identity_base` reserves `#[jit_interp]` identity
+    /// slots, so red-I[0] is the Vm at every guard. Rewrite only that
+    /// reserved index — not every copy of its bits, which is what
+    /// SIGSEGV'd when the slot was still reusable.
     fn rebind_bridge_reds(&self, frames: &mut [GuardResumeFrame]) {
         self.rebind_bridge_reds_from_fail(frames, &[]);
     }
@@ -960,9 +963,9 @@ impl JitState for GrainJitState {
             .reds
             .iter()
             .zip(red_kinds())
-            .filter(|(_, kind)| **kind == Type::Ref)
+            .filter(|(_, kind)| **kind == Type::Int)
             .map(|(bits, _)| *bits)
-            .nth(1)
+            .next()
         else {
             return;
         };
@@ -981,7 +984,7 @@ impl JitState for GrainJitState {
         let Some(slots) = merge_point_slot_regs(&root.jitcode, header_pc) else {
             return;
         };
-        let Some(&vm_reg) = slots[4].get(1) else {
+        let Some(&vm_reg) = slots[3].first() else {
             return;
         };
         if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
@@ -994,37 +997,27 @@ impl JitState for GrainJitState {
         let Some(slot) = root
             .regs
             .iter()
-            .find(|resume| resume.bank == Type::Ref && resume.index as usize == vm_reg)
+            .find(|resume| resume.bank == Type::Int && resume.index as usize == vm_reg)
         else {
             return;
         };
         let stale = slot.value;
-        // Same physical register as the frame identity: rewriting it
-        // would turn GETFIELD_VABLE into a Vm load. Distinct slots that
-        // merely hold frame bits still need the live Vm written back —
-        // that is compiled dest calling `iterator_last_mut` with
-        // `x19 == x20 == frame`.
-        let frame_reg = slots[4].first().copied();
-        if self.reds.first() == Some(&stale) && Some(vm_reg) == frame_reg {
-            return;
-        }
-        // The reserved slot may hold a reused colour (a Scope failarg
-        // at PC 6103) whose bits are not the Vm. Prefer a failarg that
-        // already names the live Vm: first a reconstructed portal
-        // register, then a compiled-loop failarg that is a livebox but
-        // not a portal-register occupant. If neither names it, keep
-        // the existing InputArg — do not bake this eval's stack
-        // pointer as ConstPtr.
+        // The reserved slot may hold a reused colour whose bits are not
+        // the Vm. Prefer a failarg that already names the live Vm: first
+        // a reconstructed portal register, then a compiled-loop failarg
+        // that is a livebox but not a portal-register occupant. If
+        // neither names it, keep the existing InputArg — do not bake
+        // this eval's stack pointer as ConstPtr.
         let vm_opref = root
             .regs
             .iter()
             .find_map(|resume| {
-                (resume.bank == Type::Ref && resume.value == live_vm && !resume.opref.is_constant())
+                (resume.bank == Type::Int && resume.value == live_vm && !resume.opref.is_constant())
                     .then_some(resume.opref)
             })
             .or_else(|| {
                 fail_values.iter().enumerate().find_map(|(n, &bits)| {
-                    (bits == live_vm).then_some(OpRef::input_arg_typed(n as u32, Type::Ref))
+                    (bits == live_vm).then_some(OpRef::input_arg_typed(n as u32, Type::Int))
                 })
             })
             .unwrap_or(slot.opref);
@@ -1035,16 +1028,11 @@ impl JitState for GrainJitState {
                 vm_opref.is_constant(),
             );
         }
-        // Only the reserved merge-point Vm slot. Nearby ConstPtr Refs are
-        // Scope / frame fields in the same stack neighbourhood; rewriting
-        // those as Vm made dest `iteration_at` take a Scope and panic
-        // `no iterator to advance`.
+        // Only the reserved merge-point Vm slot. The frame identity is
+        // red-R[0]; an equal index in that bank is a different register.
         for frame in frames {
             for reg in &mut frame.regs {
-                if reg.bank == Type::Ref && reg.index as usize == vm_reg {
-                    if Some(reg.index as usize) == frame_reg {
-                        continue;
-                    }
+                if reg.bank == Type::Int && reg.index as usize == vm_reg {
                     reg.value = live_vm;
                     reg.opref = vm_opref;
                 }

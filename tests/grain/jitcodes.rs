@@ -139,8 +139,8 @@ fn the_compiled_driver_describes_its_own_greens_and_reds() {
 
     assert_eq!(driver.greens, ["pc", "program_identity", "program"]);
     assert_eq!(driver.reds, ["frame", "vm"]);
-    assert_eq!(driver.green_args_spec, [majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Ref],);
-    assert_eq!(driver.red_args_types, [majit_ir::Type::Ref, majit_ir::Type::Ref]);
+    assert_eq!(driver.green_args_spec, [majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Int],);
+    assert_eq!(driver.red_args_types, [majit_ir::Type::Ref, majit_ir::Type::Int]);
     assert_eq!(driver.virtualizables, ["frame"]);
     eprintln!("driver names portal {} with {} greens and {} reds", driver.main_jitcode_index, driver.greens.len(), driver.reds.len(),);
 }

@@ -8,7 +8,7 @@
 //! portal's `BC_JIT_MERGE_POINT` payload, a liveness stream whose opcode
 //! numbering is not the one the bodies were assembled against, live values
 //! whose kinds do not match the declared reds. The last of those is the one
-//! this VM would hit first, because both reds are Ref and the `JitState`
+//! this VM would hit first, because the frame red is Ref and the `JitState`
 //! default types every red Int.
 
 use majit_metainterp::{JitDriver, JitState};
@@ -46,12 +46,12 @@ fn the_descriptor_is_the_shape_the_build_recorded() {
 
     let greens: Vec<_> = jd.greens().iter().map(|var| var.tp).collect();
     let reds: Vec<_> = jd.reds().iter().map(|var| var.tp).collect();
-    assert_eq!(greens, [majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Ref],);
-    assert_eq!(reds, [majit_ir::Type::Ref, majit_ir::Type::Ref]);
+    assert_eq!(greens, [majit_ir::Type::Int, majit_ir::Type::Int, majit_ir::Type::Int],);
+    assert_eq!(reds, [majit_ir::Type::Ref, majit_ir::Type::Int]);
     // `warmspot.py:664` derives one history-kind char per red; the descriptor
     // does the same, so this is the same list twice and disagreeing would mean
     // the descriptor's two accounts of its reds had diverged.
-    assert_eq!(jd.red_args_types, vec!['r', 'r']);
+    assert_eq!(jd.red_args_types, vec!['r', 'i']);
 }
 
 /// The gate that declines quietly.

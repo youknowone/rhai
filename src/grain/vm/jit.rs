@@ -1778,10 +1778,9 @@ pub(super) fn track_operation_error(vm: &mut Vm<'_>, frame: &mut super::GrainFra
 /// The frame's scope, with the Vm red kept live at the load.
 ///
 /// A plain `let scope = &mut *frame.scope` is a GETFIELD of the frame
-/// alone. Once the merge-point Vm copy dies, the colourer reuses that
-/// register for `scope`, and a mid-opcode guard snapshots the Scope
-/// under the reserved vm index. Taking both reds here makes the three
-/// refs interfere, so they keep distinct colours.
+/// alone. Once the merge-point Vm copy dies, a later guard can snapshot
+/// a reused register under the reserved vm index. Keeping the Vm operand
+/// live stops that reuse.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[inline(never)]
 #[allow(improper_ctypes_definitions)]
@@ -1796,9 +1795,9 @@ pub(super) extern "C" fn scope_from_frame<'a, 'f, 's>(
     &mut *frame.scope
 }
 
-/// Keep the merge-point Vm live past [`scope_from_frame`] so the two
-/// refs interfere in the portal. An unused field read of `vm` inside
-/// that helper is dropped before Charon sees the call.
+/// Keep the merge-point Vm live past [`scope_from_frame`]. An unused
+/// field read of `vm` inside that helper is dropped before Charon sees
+/// the call.
 #[majit_macros::dont_look_inside_cannot_raise]
 #[inline(never)]
 pub(super) extern "C" fn pin_scope_with_vm(vm: &Vm<'_>, scope: &Scope<'_>) -> i64 {
