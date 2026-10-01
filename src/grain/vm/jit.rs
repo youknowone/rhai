@@ -453,15 +453,10 @@ pub(super) extern "C" fn program_chain<'a>(
 
 /// A chain's tail, as the one scalar [`super::chain_tail`] defines.
 ///
-/// `Tail` is an inline enum inside `Chain`, so reading the field is an
-/// address-of rather than a load. A lowering that has no opcode for
-/// `base + offset` cannot say that, and this boundary is what keeps the
-/// distinction out of the trace: what crosses is the scalar, and the match
-/// stays behind it the way `WIDTHS` stays behind [`code_width`].
-///
-/// Opaque rather than elidable: an elidable body whose every operation the
-/// lowering can spell is inlined, and inlining this one puts the field read
-/// back in the caller.
+/// `Tail` is an inline enum inside `Chain`. Looking inside the match
+/// inlines the field read into `run_frame`, and that read still pairs an
+/// `Int` address with a `Ref` field op (`encode_regorconst_source`).
+/// The scalar stays behind this boundary until those two kinds agree.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn chain_tail(chain: &crate::grain::bytecode::Chain) -> i64 {
     super::chain_tail_plain(chain)
@@ -470,9 +465,9 @@ pub(super) extern "C" fn chain_tail(chain: &crate::grain::bytecode::Chain) -> i6
 /// An op-assignment's operator, as the one scalar [`super::assign_op_kind`]
 /// defines.
 ///
-/// `Option<BinOpKind>` is an inline enum inside `AssignOp`, and the same
-/// address-of-rather-than-load distinction [`chain_tail`] crosses applies to
-/// it. Opaque rather than elidable for the reason given there.
+/// `Option<BinOpKind>` is an inline enum inside `AssignOp`. Same boundary
+/// as [`chain_tail`]: inlining the match into `run_frame` mixes an `Int`
+/// address with a `Ref` field operand.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub(super) extern "C" fn assign_op_kind(op: &crate::grain::bytecode::AssignOp) -> i64 {
     super::assign_op_kind_plain(op)

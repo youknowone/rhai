@@ -83,9 +83,31 @@ pub struct Function {
 /// `jit_identity` is fixed at construction.  The tracing JIT reads it as a
 /// green on every back edge; marking it immutable lets that read fold to the
 /// constant instead of reloading a stack address that the next frame reuses.
+///
+/// The pools are fixed for the life of a traced run.  `Program` is a raw
+/// struct, so a pointer field is `getfield_raw_r`, which `rewrite_op_getfield`
+/// accepts only when the field is immutable (the pure load of a GC object
+/// out of raw storage).
 #[cfg_attr(
     feature = "grain-jit",
-    majit_macros::jit_immutable_fields("jit_identity")
+    majit_macros::jit_immutable_fields(
+        jit_identity,
+        caps,
+        code,
+        main,
+        functions,
+        positions,
+        debug_id,
+        residuals,
+        consts,
+        names,
+        tokens,
+        assign_ops,
+        chains,
+        switches,
+        lib,
+        resolver,
+    )
 )]
 pub struct Program<'a> {
     /// Process-unique identity used by the tracing JIT's green key.

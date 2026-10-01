@@ -23,10 +23,26 @@ use majit_metainterp::{
     JitCodeRuntime, JitCodeSym, JitDriverStaticData, JitState, TraceAction, TraceCtx,
 };
 
+/// Bank and index of the Vm red inside a decoded merge-point payload.
+///
+/// Reds are `(frame, vm)`. Both may be refs; the Vm is then red-R after
+/// the frame, not red-I.
+fn vm_merge_slot(slots: &[Vec<usize>; 6]) -> Option<(Type, usize)> {
+    let kind = *red_kinds().get(1)?;
+    let pos = red_kinds().iter().take(1).filter(|k| **k == kind).count();
+    let bank = match kind {
+        Type::Int => &slots[3],
+        Type::Ref => &slots[4],
+        Type::Float => &slots[5],
+        _ => return None,
+    };
+    Some((kind, *bank.get(pos)?))
+}
+
 /// The six register lists of a `jit_merge_point` op: green I/R/F then red I/R/F.
 ///
 /// Same payload `setup_frame_from_merge_point` decodes. The live frame is
-/// red-R[0] and the live Vm is red-I[0].
+/// the first red. The live Vm is the second; its bank follows `red_kinds`.
 fn merge_point_slot_regs(
     jitcode: &majit_metainterp::JitCode,
     header_pc: usize,
@@ -430,15 +446,16 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[3][0] as u32;
+        let (vm_kind, vm_reg) = vm_merge_slot(&slots).expect("the vm red is in the merge point");
+        let vm_reg = vm_reg as u32;
         let mut state = GrainJitState::default();
         state.publish_live(&[0x1111_0000, 0x2222_0000], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let other = 0xBEEF_0000;
         let mk = |index, value| GuardResumeReg {
-            bank: Type::Int,
+            bank: vm_kind,
             index,
-            opref: OpRef::input_arg_typed(index, Type::Int),
+            opref: OpRef::input_arg_typed(index, vm_kind),
             value,
         };
         let mut frames = vec![GuardResumeFrame {
@@ -456,7 +473,7 @@ mod tests {
         assert_eq!(frames[0].regs[0].value, 0x2222_0000);
         assert_eq!(
             frames[0].regs[0].opref,
-            OpRef::input_arg_typed(vm_reg, Type::Int),
+            OpRef::input_arg_typed(vm_reg, vm_kind),
             "without a live-Vm failarg the reserved slot keeps its InputArg",
         );
         assert_eq!(
@@ -482,14 +499,15 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[3][0] as u32;
+        let (vm_kind, vm_reg) = vm_merge_slot(&slots).expect("the vm red is in the merge point");
+        let vm_reg = vm_reg as u32;
         let mut state = GrainJitState::default();
         let live = 0x2222_0000;
         state.publish_live(&[0x1111_0000, live], &[], &[], &[]);
         let stale = 0xDEAD_0000;
-        let vm_box = OpRef::input_arg_typed(3, Type::Int);
+        let vm_box = OpRef::input_arg_typed(3, vm_kind);
         let mk = |index, opref, value| GuardResumeReg {
-            bank: Type::Int,
+            bank: vm_kind,
             index,
             opref,
             value,
@@ -498,7 +516,7 @@ mod tests {
             jitcode: portal,
             pc: header_pc,
             regs: vec![
-                mk(vm_reg, OpRef::input_arg_typed(vm_reg, Type::Int), stale),
+                mk(vm_reg, OpRef::input_arg_typed(vm_reg, vm_kind), stale),
                 mk(4, vm_box, live),
             ],
             result_slot: None,
@@ -528,15 +546,16 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[3][0] as u32;
+        let (vm_kind, vm_reg) = vm_merge_slot(&slots).expect("the vm red is in the merge point");
+        let vm_reg = vm_reg as u32;
         let mut state = GrainJitState::default();
         let live = 0x2222_0000;
         state.publish_live(&[0x1111_0000, live], &[], &[], &[]);
         let stale = 0xDEAD_0000;
         let mk = |index, value| GuardResumeReg {
-            bank: Type::Int,
+            bank: vm_kind,
             index,
-            opref: OpRef::input_arg_typed(6, Type::Int),
+            opref: OpRef::input_arg_typed(6, vm_kind),
             value,
         };
         let mut frames = vec![GuardResumeFrame {
@@ -550,7 +569,7 @@ mod tests {
         assert_eq!(frames[0].regs[0].value, live);
         assert_eq!(
             frames[0].regs[0].opref,
-            OpRef::input_arg_typed(1, Type::Int),
+            OpRef::input_arg_typed(1, vm_kind),
             "a live-Vm failarg that is not a portal register still names an InputArg",
         );
     }
@@ -571,15 +590,16 @@ mod tests {
         let Some(slots) = merge_point_slot_regs(&portal, header_pc) else {
             panic!("the portal merge point must decode");
         };
-        let vm_reg = slots[3][0] as u32;
+        let (vm_kind, vm_reg) = vm_merge_slot(&slots).expect("the vm red is in the merge point");
+        let vm_reg = vm_reg as u32;
         let mut state = GrainJitState::default();
         let frame = 0x1111_0000;
         let live = 0x2222_0000;
         state.publish_live(&[frame, live], &[], &[], &[]);
         let mk = |index, value| GuardResumeReg {
-            bank: Type::Int,
+            bank: vm_kind,
             index,
-            opref: OpRef::input_arg_typed(index, Type::Int),
+            opref: OpRef::input_arg_typed(index, vm_kind),
             value,
         };
         let mut frames = vec![GuardResumeFrame {
@@ -959,14 +979,10 @@ impl JitState for GrainJitState {
     }
 
     fn rebind_bridge_reds_from_fail(&self, frames: &mut [GuardResumeFrame], fail_values: &[i64]) {
-        let Some(live_vm) = self
-            .reds
-            .iter()
-            .zip(red_kinds())
-            .filter(|(_, kind)| **kind == Type::Int)
-            .map(|(bits, _)| *bits)
-            .next()
-        else {
+        let Some(&live_vm) = self.reds.get(1) else {
+            return;
+        };
+        let Some(vm_kind) = red_kinds().get(1).copied() else {
             return;
         };
         let Some(root) = frames.first() else {
@@ -984,9 +1000,12 @@ impl JitState for GrainJitState {
         let Some(slots) = merge_point_slot_regs(&root.jitcode, header_pc) else {
             return;
         };
-        let Some(&vm_reg) = slots[3].first() else {
+        let Some((kind, vm_reg)) = vm_merge_slot(&slots) else {
             return;
         };
+        if kind != vm_kind {
+            return;
+        }
         if std::env::var_os("MAJIT_BRIDGE_DEBUG").is_some() {
             eprintln!(
                 "[bridgeB] merge slots gI={:?} gR={:?} gF={:?} rI={:?} rR={:?} rF={:?} \
@@ -997,7 +1016,7 @@ impl JitState for GrainJitState {
         let Some(slot) = root
             .regs
             .iter()
-            .find(|resume| resume.bank == Type::Int && resume.index as usize == vm_reg)
+            .find(|resume| resume.bank == vm_kind && resume.index as usize == vm_reg)
         else {
             return;
         };
@@ -1012,12 +1031,12 @@ impl JitState for GrainJitState {
             .regs
             .iter()
             .find_map(|resume| {
-                (resume.bank == Type::Int && resume.value == live_vm && !resume.opref.is_constant())
+                (resume.bank == vm_kind && resume.value == live_vm && !resume.opref.is_constant())
                     .then_some(resume.opref)
             })
             .or_else(|| {
                 fail_values.iter().enumerate().find_map(|(n, &bits)| {
-                    (bits == live_vm).then_some(OpRef::input_arg_typed(n as u32, Type::Int))
+                    (bits == live_vm).then_some(OpRef::input_arg_typed(n as u32, vm_kind))
                 })
             })
             .unwrap_or(slot.opref);
@@ -1032,7 +1051,7 @@ impl JitState for GrainJitState {
         // red-R[0]; an equal index in that bank is a different register.
         for frame in frames {
             for reg in &mut frame.regs {
-                if reg.bank == Type::Int && reg.index as usize == vm_reg {
+                if reg.bank == vm_kind && reg.index as usize == vm_reg {
                     reg.value = live_vm;
                     reg.opref = vm_opref;
                 }

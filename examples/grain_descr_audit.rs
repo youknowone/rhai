@@ -75,9 +75,9 @@ fn main() {
                 green_kinds: vec![
                     majit_ir::Type::Int,
                     majit_ir::Type::Int,
-                    majit_ir::Type::Int,
+                    majit_ir::Type::Ref,
                 ],
-                red_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Int],
+                red_kinds: vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
                 autoreds: false,
                 virtualizables: vec!["frame".to_string()],
                 red_types: vec!["GrainFrame".to_string(), "Vm".to_string()],

@@ -1000,9 +1000,9 @@ const TAIL_ASSIGN: i64 = -2;
 /// of its op-assignment in the pool.
 ///
 /// The pool index is a `u32`, so no member of it collides with either
-/// sentinel. Nothing outside this pair of functions matches on `Tail`, which
-/// is what lets a lowering that cannot address an inline enum field still
-/// reach the answer.
+/// sentinel. Nothing outside this pair of functions matches on `Tail`.
+/// The match stays behind the JIT boundary: inlining it into `run_frame`
+/// pairs an `Int` address with a `Ref` field operand.
 fn chain_tail_plain(chain: &Chain) -> i64 {
     match chain.tail {
         Tail::Read => TAIL_READ,
@@ -1041,11 +1041,8 @@ fn assign_op_kind_plain(op: &AssignOp) -> i64 {
 /// The operator an op-assignment carries, through the JIT boundary where
 /// there is one.
 ///
-/// `Option<BinOpKind>` is an inline enum inside `AssignOp` — the whole value
-/// is its own tag, so reading the field is a byte at an offset rather than the
-/// pointer load the field's description names. The boundary [`chain_tail`]
-/// draws over `Tail` is drawn here for the same reason: what crosses is the
-/// scalar, and the match on it stays behind it.
+/// `Option<BinOpKind>` is an inline enum inside `AssignOp`. The match
+/// stays behind [`jit::assign_op_kind`] for the same reason as `Tail`.
 #[inline]
 fn assign_op_kind(op: &AssignOp) -> Option<BinOpKind> {
     #[cfg(feature = "grain-jit")]
